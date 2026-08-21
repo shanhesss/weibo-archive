@@ -77,9 +77,8 @@
           cursor:pointer; line-height:1.2;}
   .b-home:hover{color:var(--blue);}
   .b-del{font-size:11px; color:#fff; background:var(--red); border:none; border-radius:4px;
-         padding:1px 6px; cursor:pointer; line-height:1.5;}
+         padding:1px 6px; cursor:pointer; line-height:1.5; white-space:nowrap;}
   .b-del:hover{opacity:.85;}
-  .b-del.confirm{background:#c0392b; animation:pulse 1s infinite;}
   .b-main{flex:1; min-width:0;}
   .b-top{display:flex; align-items:center; gap:6px;}
   .b-name{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
@@ -282,7 +281,6 @@
 'use strict';
 var $ = function(id){ return document.getElementById(id); };
 var selUid = '';                  // 当前筛选的博主（空 = 全部）
-var deleting = {};                // 两步删除确认的计时器
 var prevState = {};               // 上次轮询时的博主状态，用于检测「拉取完成」
 var curPage = 1, curPages = 1, kwTimer = null;
 var lbList = [], lbIdx = 0;       // 灯箱图片列表与当前索引
@@ -417,8 +415,7 @@ function renderBloggers(list){
       + (b.avatar ? '<img src="'+esc(imgProxy(thumbUrl(b.avatar)))+'" onerror="this.style.visibility=\'hidden\'">'
                   : '<div class="light"></div>')
       + '<button class="b-home" data-act="home" data-uid="'+esc(b.uid)+'" data-home="'+esc(b.homepage)+'">复制主页</button>'
-      + '<button class="b-del'+(deleting[b.uid]?' confirm':'')+'" data-act="del" data-uid="'+esc(b.uid)+'" title="删除博主及其全部微博数据">'
-      + (deleting[b.uid] ? '⚠ 确认删除？不可恢复' : '⚠ 删除') + '</button>'
+      + '<button class="b-del" data-act="del" data-uid="'+esc(b.uid)+'" title="删除博主及其全部微博数据">⚠ 删除</button>'
       + '</div>';
     var noteCls = (b.state==='error') ? ' bad' : ((b.state==='paused') ? ' warn' : '');
     html += '<div class="b-item'+(selUid===b.uid?' sel':'')+'" data-uid="'+esc(b.uid)+'">'
@@ -462,18 +459,17 @@ $('bloggerList').addEventListener('click', function(e){
       toast('已复制主页链接');
     }
     else if(act === 'del'){
-      if(deleting[uid]){                                  // 第二次点击才真删
-        post('/api/blogger/delete', {uid: uid}).then(function(r){
-          deleting[uid] = undefined; clearTimeout(deleting['_t'+uid]);
-          toast(r.ok ? '已删除' : r.error);
-          if(selUid === uid) selUid = '';
-          loadState(); loadPosts();
-        });
-      }else{                                              // 第一次：变成「确认删除？」3 秒后还原
-        deleting[uid] = true;
-        deleting['_t'+uid] = setTimeout(function(){ deleting[uid] = undefined; loadState(); }, 3000);
-        loadState();
-      }
+      var name = btn.closest('.b-item').querySelector('.b-name').textContent;
+      showModal('删除博主「' + name + '」？\n\n将删除该博主及其全部微博数据，删除后无法恢复。', [
+        {text:'确认删除', cls:'danger', fn: function(){
+          post('/api/blogger/delete', {uid: uid}).then(function(r){
+            toast(r.ok ? '已删除' : r.error);
+            if(selUid === uid) selUid = '';
+            loadState(); loadPosts();
+          });
+        }},
+        {text:'取消', cls:'', fn: null}
+      ]);
     }
     return;
   }

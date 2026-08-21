@@ -20,7 +20,7 @@ if errorlevel 1 (
 
 rem 3. 重新打包
 echo [2/3] 开始打包（约 1-2 分钟，请稍候）...
-python -m PyInstaller --noconfirm --onefile --noconsole --name weibo_archive --add-data "weibo_web.html;." weibo_server.py
+python -m PyInstaller --noconfirm --onefile --noconsole --name weibo_archive --icon weibo_icon.ico --add-data "weibo_web.html;." weibo_server.py
 if errorlevel 1 (
   echo.
   echo *** 打包失败！请查看上方错误信息。***
