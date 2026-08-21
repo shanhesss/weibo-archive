@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微博存档</title>
+<link rel="icon" href="https://weibo.com/favicon.ico">
+<style>
+  :root{
+    --bg:#f5f6f7; --card:#fff; --line:#e5e6eb; --txt:#1f2329; --sub:#86909c;
+    --blue:#1d9bf0; --green:#67c23a; --amber:#e6a23c; --red:#f56c6c; --grey:#c0c4cc;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{background:var(--bg); color:var(--txt);
+       font:14px/1.6 "Microsoft YaHei","PingFang SC","Segoe UI",sans-serif;
+       display:flex; flex-direction:column; overflow:hidden;}
+  a{color:var(--blue); text-decoration:none;}
+  button{font:inherit; border:1px solid var(--line); background:#fff; color:var(--txt);
+         border-radius:6px; padding:4px 12px; cursor:pointer;}
+  button:hover{border-color:var(--blue); color:var(--blue);}
+  button.primary{background:var(--blue); border-color:var(--blue); color:#fff;}
+  button.primary:hover{opacity:.88;}
+  button.danger{background:var(--red); border-color:var(--red); color:#fff;}
+  button.danger:hover{opacity:.88;}
+  button.mini{padding:1px 8px; font-size:12px; color:var(--sub);}
+  button.mini.primary{color:#fff;}                 /* 修正蓝底白字对比度 */
+  button.mini.primary:hover{color:#fff;}
+  button.mini.danger{color:#fff;}
+  select,input[type=text],input[type=date],input[type=number]{font:inherit; border:1px solid var(--line);
+         border-radius:6px; padding:5px 8px; background:#fff; color:var(--txt);}
+  input:focus,select:focus{outline:none; border-color:var(--blue);}
+
+  /* ── 顶栏 ─────────────────────────────── */
+  header{height:52px; flex:none; background:var(--card); border-bottom:1px solid var(--line);
+         display:flex; align-items:center; gap:14px; padding:0 20px;}
+  header h1{font-size:17px; font-weight:600;}
+  #cookiePill{margin-left:auto; border-radius:999px; padding:3px 14px; font-size:12px;
+              border:1px solid var(--line); background:#fff; cursor:pointer;}
+  #cookiePill .dot{display:inline-block; width:8px; height:8px; border-radius:50%;
+                   margin-right:6px; background:var(--grey);}
+  #cookiePill.ok .dot{background:var(--green);} #cookiePill.none .dot{background:var(--grey);}
+  #cookiePill.expired .dot{background:var(--red);} #cookiePill.limited .dot{background:var(--amber);}
+  #cookiePill.unknown .dot{background:var(--amber);}
+
+  /* ── 登录引导条 ───────────────────────── */
+  #banner{flex:none; display:none; background:#fdf6ec; border-bottom:1px solid #faecd8;
+          color:#a1622a; padding:8px 20px; font-size:13px;}
+  #banner.show{display:block;}
+  #banner .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+  #banner input[type=text]{flex:1; min-width:260px;}
+  #banner .howto{color:#b58c5f; margin-bottom:5px;}
+  #banner .howto a{color:var(--blue); text-decoration:underline;}
+
+  /* ── 主体两栏 ─────────────────────────── */
+  #layout{flex:1; display:flex; min-height:0;}
+  aside{width:264px; flex:none; background:var(--card); border-right:1px solid var(--line);
+        padding:14px; display:flex; flex-direction:column; gap:10px; min-height:0;}
+  aside h2{font-size:13px; color:var(--sub); font-weight:400;}
+  #addRow{display:flex; gap:6px;}
+  #addInput{flex:1; min-width:0;}
+  #previewCard{display:none; border:1px solid var(--line); border-radius:8px; padding:10px;}
+  #previewCard.show{display:block;}
+  #previewCard .p-head{display:flex; gap:8px; align-items:center;}
+  #previewCard img{width:36px; height:36px; border-radius:50%; object-fit:cover;}
+  #previewCard .p-intro{color:var(--sub); font-size:12px; margin:6px 0 8px;
+                        overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  #previewCard .p-btns{display:flex; gap:6px;}
+  #bloggerList{flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px;}
+  .b-all{padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:600;}
+  .b-item{padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:8px;}
+  .b-item:hover,.b-all:hover{background:var(--bg);}
+  .b-item.sel,.b-all.sel{background:#e8f4fd;}
+  .b-item img{width:38px; height:38px; border-radius:50%; object-fit:cover; flex:none;}
+  .b-av{display:flex; flex-direction:column; align-items:center; gap:3px; flex:none;}
+  .b-home{font-size:11px; color:var(--sub); background:none; border:none; padding:0;
+          cursor:pointer; line-height:1.2;}
+  .b-home:hover{color:var(--blue);}
+  .b-main{flex:1; min-width:0;}
+  .b-top{display:flex; align-items:center; gap:6px;}
+  .b-name{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .b-count{color:var(--sub); font-size:12px;}
+  .light{width:8px; height:8px; border-radius:50%; flex:none; background:var(--grey);}
+  .light.queued{background:var(--amber);}
+  .light.fulling{background:var(--blue); animation:pulse 1s infinite;}
+  .light.paused{background:var(--amber);}
+  .light.done{background:var(--green);}
+  .light.error{background:var(--red);}
+  @keyframes pulse{50%{opacity:.25;}}
+  .b-note{color:var(--sub); font-size:12px; line-height:1.4; margin-top:1px;}
+  .b-early{color:var(--sub); font-size:12px; margin-top:1px;}
+  .b-note.warn{color:var(--amber);}
+  .b-note.bad{color:var(--red);}
+  .b-btns{display:flex; gap:4px; margin-top:4px; flex-wrap:wrap;}
+
+  main{flex:1; min-width:0; min-height:0; display:flex; flex-direction:column;
+       padding:10px 14px 12px; overflow:hidden;}
+  #filters{flex:none; display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;}
+  #kw{width:170px;}
+  #total{color:var(--sub); font-size:13px;}
+
+  /* ── 翻页条（与筛选同一行，位于总数左边）── */
+  #pager{display:flex; align-items:center; gap:6px; margin-left:auto;
+         color:var(--sub); font-size:12px;}
+  #pager input{width:52px; padding:2px 6px; text-align:center;}
+
+  /* ── 批量操作条 ───────────────────────── */
+  #batchBar{flex:none; display:none; align-items:center; gap:10px; margin-bottom:8px;
+            font-size:13px; color:var(--sub);}
+  #batchBar.show{display:flex;}
+  #selCount{color:var(--txt); font-weight:600;}
+  #refreshHint{color:var(--amber);}
+
+  /* ── 卡片网格 ─────────────────────────── */
+  #grid{flex:1; min-height:0; display:grid;
+        grid-template-columns:repeat(3,1fr); grid-auto-rows:1fr; gap:12px; overflow:hidden;}
+  @media (max-width:1100px){ #grid{grid-template-columns:repeat(2,1fr);} }
+  #empty{flex:1; display:none; align-items:center; justify-content:center; flex-direction:column;
+         color:var(--sub);}
+  #empty.show{display:flex;}
+  #empty .big{font-size:16px; margin-bottom:6px;}
+
+  .post{background:var(--card); border:1px solid var(--line); border-radius:10px;
+        padding:10px 12px; display:flex; flex-direction:column; overflow:hidden;
+        min-height:220px; position:relative;}
+  .chk{position:absolute; top:8px; left:8px; width:16px; height:16px; cursor:pointer; z-index:3;}
+  .p-head{flex:none; display:flex; align-items:center; gap:7px; margin:0 0 5px 22px;}
+  .p-head img{width:28px; height:28px; border-radius:50%; object-fit:cover;}
+  .p-who{font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .p-time{color:var(--sub); font-size:12px; flex:none;}
+  .p-src{margin-left:auto; font-size:12px; flex:none;}
+  .p-text{flex:1 1 auto; min-height:44px; overflow-y:auto; white-space:pre-wrap;
+          word-break:break-word; font-size:13px; margin-top:3px; padding-right:4px;}
+      /* flex:1 撑满剩余空间（纯文字微博不留白）；图片微博由图片区弹性占位，正文不再被压出滚动条 */
+  .p-retweeted{background:var(--bg); border-radius:6px; padding:6px 8px; margin-top:6px;
+               color:var(--sub); font-size:12px;}
+  .p-retweeted .r-who{color:var(--txt); font-weight:600;}
+  .wemoji{display:inline-block; width:1.25em; height:1.25em; vertical-align:-0.25em;}
+  .p-text .wemoji, .p-retweeted .wemoji{width:1.3em; height:1.3em;}
+  a.wlink{color:var(--blue); text-decoration:underline; word-break:break-all;}
+  .p-del{color:var(--red); font-size:12px; font-weight:600; margin-bottom:4px;}
+  .post-del .p-text{opacity:.55;}
+  .p-imgs{flex:none; display:grid; grid-template-columns:repeat(3,1fr); grid-auto-rows:minmax(0,1fr);
+          gap:4px; height:110px; overflow:hidden; margin-top:6px; padding:2px;}
+  .p-imgs img{min-width:0; min-height:0; width:100%; height:100%;
+              object-fit:contain; border-radius:4px; cursor:zoom-in;}
+  .p-imgs.n1{display:flex; align-items:center; justify-content:center; flex:1 1 auto;
+             min-height:115px; max-height:210px;}   /* 单图：图吃掉剩余空间（上限210），正文按内容自适应 */
+  .p-imgs.n1 img{width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain;}
+  .p-imgs.n2{grid-template-columns:repeat(2,1fr); height:120px;}
+  .post.mg-sm .p-imgs.n1{flex:0 0 auto; height:110px; max-height:110px; min-height:110px;}
+      /* 单图+长文：图固定小尺寸，正文优先占满 */
+  .p-video{flex:none; margin-top:6px; font-size:12px;}
+  .p-counts{flex:none; color:var(--sub); font-size:12px; margin-top:auto; padding-top:6px;
+            display:flex; align-items:center; gap:8px;}   /* margin-top:auto 把底部信息钉在卡片底 */
+  .p-counts .sp{flex:1;}
+  .p-counts button{margin-left:auto;}
+
+  /* ── 图片灯箱 ─────────────────────────── */
+  #lb{position:fixed; inset:0; background:rgba(0,0,0,.9); display:none;
+      align-items:center; justify-content:center; z-index:99;}
+  #lb.show{display:flex;}
+  #lb img{max-width:92vw; max-height:92vh; border-radius:4px; cursor:pointer; user-select:none;
+          transform-origin:center center;}
+  #lbInfo{position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
+          color:#fff; font-size:13px; background:rgba(0,0,0,.5); border-radius:999px;
+          padding:4px 14px; white-space:nowrap;}
+  #lbCtrl{position:fixed; top:16px; right:16px; display:flex; gap:8px; z-index:101;}
+  #lbCtrl button{width:36px; height:36px; border-radius:50%; background:rgba(255,255,255,.15);
+                 color:#fff; border:1px solid rgba(255,255,255,.35); font-size:18px; line-height:1;
+                 cursor:pointer;}
+  #lbCtrl button:hover{background:rgba(255,255,255,.3);}
+
+  /* ── 确认弹窗 ─────────────────────────── */
+  #modal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
+         align-items:center; justify-content:center; z-index:98;}
+  #modal.show{display:flex;}
+  #modalBox{background:#fff; border-radius:10px; padding:18px 20px; width:360px;
+            max-width:90vw; box-shadow:0 8px 30px rgba(0,0,0,.2);}
+  #modalMsg{font-size:14px; line-height:1.7; margin-bottom:16px; white-space:pre-wrap;}
+  #modalBtns{display:flex; gap:10px; justify-content:flex-end;}
+
+  /* ── 轻提示 ───────────────────────────── */
+  #toast{position:fixed; left:50%; bottom:36px; transform:translateX(-50%);
+         background:rgba(31,35,41,.92); color:#fff; border-radius:8px; padding:8px 18px;
+         font-size:13px; display:none; z-index:100;}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>微博存档</h1>
+  <button id="cookiePill"><span class="dot"></span><span id="cookiePillTxt">…</span></button>
+</header>
+
+<div id="banner">
+  <div class="howto" id="bannerHowto"></div>
+  <div class="row">
+    <input type="text" id="cookieInput" placeholder="把浏览器里复制的整串 Cookie 粘贴到这里">
+    <button class="primary" id="cookieSave">保存</button>
+  </div>
+</div>
+
+<div id="layout">
+  <aside>
+    <h2>添加博主</h2>
+    <div id="addRow">
+      <input type="text" id="addInput" placeholder="粘贴博主主页链接">
+      <button id="addBtn">查找</button>
+    </div>
+    <div id="addMsg" style="font-size:12px; display:none;"></div>
+    <div id="previewCard">
+      <div class="p-head"><img id="pvAvatar"><div><div id="pvName" style="font-weight:600"></div></div></div>
+      <div class="p-intro" id="pvIntro"></div>
+      <div class="p-btns">
+        <button class="primary" id="pvAdd">添加并拉取全部</button>
+        <button id="pvCancel">取消</button>
+      </div>
+    </div>
+    <h2 style="margin-top:8px;">我的博主</h2>
+    <div id="bloggerList">
+      <div class="b-all sel" data-uid="">📋 全部微博</div>
+    </div>
+  </aside>
+
+  <main>
+    <div id="filters">
+      <input type="text" id="kw" placeholder="搜索关键词">
+      <select id="yearSel"><option value="">全部年份</option></select>
+      <select id="presetSel">
+        <option value="">快捷时间</option>
+        <option value="today">今天</option>
+        <option value="yesterday">昨天</option>
+        <option value="7d">近7天</option>
+        <option value="30d">近30天</option>
+        <option value="year">今年</option>
+      </select>
+      <input type="date" id="from"> <span style="color:var(--sub)">至</span> <input type="date" id="to">
+      <select id="statusSel">
+        <option value="">全部微博</option>
+        <option value="0">正常</option>
+        <option value="1">已删除</option>
+      </select>
+      <button id="clearF" class="mini">清空筛选</button>
+      <div id="pager"></div>
+      <span id="total"></span>
+    </div>
+    <div id="batchBar">
+      <button id="selAllPage" class="mini">全选本页</button>
+      <button id="selAllFilter" class="mini">全选当前筛选结果</button>
+      <span id="selCount">已选 0 条</span>
+      <span id="refreshHint"></span>
+      <span style="flex:1"></span>
+      <button id="batchUpdate" class="mini primary">批量更新</button>
+      <button id="batchDelete" class="mini danger">批量删除</button>
+      <button id="selClear" class="mini">清空选择</button>
+    </div>
+    <div id="grid"></div>
+    <div id="empty">
+      <div class="big">还没有微博</div>
+    </div>
+  </main>
+</div>
+
+<div id="lb">
+  <img id="lbImg" alt="">
+  <div id="lbInfo"></div>
+  <div id="lbCtrl">
+    <button id="lbZoomIn" title="放大">＋</button>
+    <button id="lbZoomOut" title="缩小">－</button>
+    <button id="lbZoomReset" title="还原">⟳</button>
+  </div>
+</div>
+<div id="modal"><div id="modalBox"><div id="modalMsg"></div><div id="modalBtns"></div></div></div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+var $ = function(id){ return document.getElementById(id); };
+var selUid = '';                  // 当前筛选的博主（空 = 全部）
+var deleting = {};                // 两步删除确认的计时器
+var prevState = {};               // 上次轮询时的博主状态，用于检测「拉取完成」
+var curPage = 1, curPages = 1, kwTimer = null;
+var lbList = [], lbIdx = 0;       // 灯箱图片列表与当前索引
+var lbMap = {};                   // 微博 id -> 图片 URL 列表（渲染时填充）
+var selMode = 'manual';           // 勾选模式：manual 逐条 / all 全选当前筛选结果
+var selManual = {};               // 手动勾选的 id
+var selAllIds = [];               // 全选模式下获取的全部匹配 id
+var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
+
+function esc(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function imgProxy(u){ return '/img?u=' + encodeURIComponent(u); }
+function thumbUrl(u){             // 大图档位 → 缩略档，卡片加载更快（灯箱仍用原大图）
+  return u.replace(/\/(?:large|orj\d+|mw\d+|woriginal|thumb\d+|bmiddle)\//, '/bmiddle/');
+}
+function fmtTime(ts){
+  if(!ts) return '';
+  var d = new Date(ts * 1000), now = new Date();
+  var diff = (now - d) / 1000;
+  function hm(){ return ('0'+d.getHours()).slice(-2) + ':' + ('0'+d.getMinutes()).slice(-2); }
+  if(diff < 60) return '刚刚';
+  if(diff < 3600) return Math.floor(diff/60) + '分钟前';
+  if(d.toDateString() === now.toDateString()) return Math.floor(diff/3600) + '小时前';
+  var yst = new Date(now.getTime() - 86400000);
+  if(d.toDateString() === yst.toDateString()) return '昨天 ' + hm();
+  var p = function(n){ return ('0'+n).slice(-2); };
+  if(d.getFullYear() === now.getFullYear()) return (d.getMonth()+1) + '月' + d.getDate() + '日 ' + hm();
+  return d.getFullYear() + '年' + (d.getMonth()+1) + '月' + d.getDate() + '日';
+}
+function fmtDateShort(ts){        // 时间戳 → YYYY-MM-DD
+  if(!ts) return '';
+  var d = new Date(ts * 1000), p = function(n){ return ('0'+n).slice(-2); };
+  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate());
+}
+function toast(msg){
+  var t = $('toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 3000);
+}
+function copyText(text){
+  function fallback(){
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); }catch(e){}
+    document.body.removeChild(ta);
+  }
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text).then(null, fallback);
+  } else fallback();
+}
+function richText(t){                 // 正文：普通文本转义，微博表情与外部链接标签原样保留
+  return String(t == null ? '' : t)
+    .split(/(<img class="wemoji"[^>]*>|<a class="wlink"[^>]*>|<\/a>)/g)
+    .map(function(p){
+      if(/^(<img class="wemoji"|<a class="wlink"|<\/a>)/.test(p)) return p;
+      return esc(p);
+    }).join('');
+}
+function copyId(id, ev){
+  if(ev) ev.stopPropagation();
+  copyText(id);
+  toast('已复制博文 ID：' + id);
+}
+function post(url, body){
+  return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify(body || {})}).then(function(r){ return r.json(); });
+}
+
+/* ── 登录状态 ─────────────────────────────── */
+var COOKIE_TXT = {ok:'登录正常', none:'未填写登录信息', expired:'登录已过期，点此更新',
+                  limited:'访问受限', unknown:'登录待验证'};
+function renderCookie(st){
+  var pill = $('cookiePill');
+  pill.className = st;
+  $('cookiePillTxt').textContent = COOKIE_TXT[st] || st;
+  $('bannerHowto').innerHTML = (st === 'expired')
+    ? '这份登录信息无效或已过期：weibo.com 电脑版的登录信息对 <a href="https://m.weibo.cn" target="_blank">m.weibo.cn</a> 无效（两个域名登录态不通用）。请用同一个浏览器打开 <a href="https://m.weibo.cn" target="_blank">m.weibo.cn</a>（会自动登录同一账号）→ 按 F12 → 在「网络」里点任意一条 m.weibo.cn 请求 → 把请求头里 Cookie: 后面那一整串复制过来。'
+    : (st === 'none')
+      ? '第一次使用：用浏览器打开 <a href="https://m.weibo.cn" target="_blank">m.weibo.cn</a> 登录你的微博小号（<a href="https://weibo.com" target="_blank">weibo.com</a> 已登录的话这里会自动登录）→ 按 F12 打开开发者工具 → 在「网络」里点任意一条 m.weibo.cn 请求 → 把请求头里 Cookie: 后面那一整串复制出来，粘贴到下面。'
+      : (st === 'limited')
+        ? '微博暂时限制了访问频率，会自动恢复；可以先把工具放着，过段时间再来点「继续」。不用换登录信息。'
+        : $('bannerHowto').innerHTML;
+  // none / expired / limited 才弹引导条；unknown（已保存待验证）只亮小灯，不挡页面
+  $('banner').classList.toggle('show', st === 'none' || st === 'expired' || st === 'limited');
+}
+$('cookiePill').onclick = function(){ $('banner').classList.toggle('show'); };
+$('cookieSave').onclick = function(){
+  var v = $('cookieInput').value.trim();
+  if(!v){ toast('粘贴的内容是空的'); return; }
+  post('/api/cookie', {value: v}).then(function(r){
+    if(r.ok){
+      $('cookieInput').value = '';
+      toast(r.message || '已保存');
+      if(r.cookie_status) renderCookie(r.cookie_status);
+      loadState();
+    } else toast(r.error);
+  });
+};
+
+/* ── 博主列表 ─────────────────────────────── */
+function stateLabel(s){
+  return {idle:'未开始', queued:'排队中', fulling:'拉取中', paused:'已暂停',
+          done:'已完成', error:'出错了'}[s] || s;
+}
+function bloggerButtons(b){
+  var btns = '';
+  if(b.state === 'queued' || b.state === 'fulling'){
+    btns += '<button class="mini" data-act="pause" data-uid="'+b.uid+'">暂停</button>';
+    btns += '<button class="mini" data-act="cancel" data-uid="'+b.uid+'" title="取消本次拉取：保留已拉取数据，不再续拉">取消</button>';
+  }
+  else if(b.state === 'paused')
+    btns += '<button class="mini primary" data-act="sync" data-uid="'+b.uid+'">继续</button>';
+  else if(b.state === 'done')
+    btns += '<button class="mini primary" data-act="sync" data-uid="'+b.uid+'">拉取新的</button>';
+  else if(b.state === 'idle')
+    btns += '<button class="mini primary" data-act="sync" data-uid="'+b.uid+'">开始拉取</button>';
+  else if(b.state === 'error')
+    btns += '<button class="mini primary" data-act="sync" data-uid="'+b.uid+'">重试</button>';
+  if(b.state !== 'queued' && b.state !== 'fulling')
+    btns += '<button class="mini" data-act="refull" data-uid="'+b.uid+'" title="从头全量重拉并覆盖，微博已删的会标记">重拉全量</button>';
+  var delTxt = deleting[b.uid] ? '确认删除？' : '删除';
+  btns += '<button class="mini" data-act="del" data-uid="'+b.uid+'">'+delTxt+'</button>';
+  return btns;
+}
+function renderBloggers(list){
+  var html = '<div class="b-all'+(selUid===''?' sel':'')+'" data-uid="">📋 全部微博</div>';
+  for(var i=0;i<list.length;i++){
+    var b = list[i];
+    var av = '<div class="b-av">'
+      + (b.avatar ? '<img src="'+esc(imgProxy(thumbUrl(b.avatar)))+'" onerror="this.style.visibility=\'hidden\'">'
+                  : '<div class="light"></div>')
+      + '<button class="b-home" data-act="home" data-uid="'+esc(b.uid)+'" data-home="'+esc(b.homepage)+'">复制主页</button>'
+      + '</div>';
+    var noteCls = (b.state==='error') ? ' bad' : ((b.state==='paused') ? ' warn' : '');
+    html += '<div class="b-item'+(selUid===b.uid?' sel':'')+'" data-uid="'+esc(b.uid)+'">'
+      + av
+      + '<div class="b-main">'
+      +   '<div class="b-top"><span class="light '+b.state+'"></span>'
+      +     '<span class="b-name">'+esc(b.nickname)+'</span>'
+      +     '<span class="b-count">'+b.count+'条</span></div>'
+      +   (b.earliest ? '<div class="b-early">最早 ' + fmtDateShort(b.earliest) + '</div>' : '')
+      +   '<div class="b-note'+noteCls+'">'+esc(b.note || stateLabel(b.state))
+      +     (b.last_synced_at ? ' · 上次同步 '+esc(b.last_synced_at.slice(5,16)) : '')+'</div>'
+      +   '<div class="b-btns">'+bloggerButtons(b)+'</div>'
+      + '</div></div>';
+  }
+  $('bloggerList').innerHTML = html;
+}
+$('bloggerList').addEventListener('click', function(e){
+  var btn = e.target.closest('button');
+  if(btn){
+    var uid = btn.dataset.uid, act = btn.dataset.act;
+    if(act === 'pause') post('/api/pause', {uid: uid}).then(loadState);
+    else if(act === 'cancel') post('/api/cancel', {uid: uid}).then(loadState);
+    else if(act === 'sync') post('/api/sync', {uid: uid}).then(function(r){
+      if(!r.ok) toast(r.error); loadState();
+    });
+    else if(act === 'refull'){
+      var name = btn.closest('.b-item').querySelector('.b-name').textContent;
+      showModal('重拉全量「' + name + '」：将从第一条重新全量拉取并覆盖（不删除数据），拉到底后把微博上已删除的博文标记为【博主已删除】。可能需要较长时间，可随时暂停。', [
+        {text:'开始重拉', cls:'primary', fn: function(){
+          post('/api/refull', {uid: uid}).then(function(r){
+            if(!r.ok) toast(r.error);
+            loadState();
+          });
+        }},
+        {text:'取消', cls:'', fn: null}
+      ]);
+    }
+    else if(act === 'home'){
+      copyText(btn.dataset.home);
+      toast('已复制主页链接');
+    }
+    else if(act === 'del'){
+      if(deleting[uid]){                                  // 第二次点击才真删
+        post('/api/blogger/delete', {uid: uid}).then(function(r){
+          deleting[uid] = undefined; clearTimeout(deleting['_t'+uid]);
+          toast(r.ok ? '已删除' : r.error);
+          if(selUid === uid) selUid = '';
+          loadState(); loadPosts();
+        });
+      }else{                                              // 第一次：变成「确认删除？」3 秒后还原
+        deleting[uid] = true;
+        deleting['_t'+uid] = setTimeout(function(){ deleting[uid] = undefined; loadState(); }, 3000);
+        loadState();
+      }
+    }
+    return;
+  }
+  var item = e.target.closest('[data-uid]');
+  if(item){
+    selUid = item.dataset.uid;
+    loadState(); loadPosts();
+  }
+});
+
+/* ── 添加博主 ─────────────────────────────── */
+$('addBtn').onclick = function(){
+  var input = $('addInput').value.trim();
+  if(!input){ toast('先把博主主页链接粘贴进来'); return; }
+  showAddMsg('');
+  post('/api/blogger/preview', {input: input}).then(function(r){
+    if(!r.ok){
+      showAddMsg(r.error, true);
+      if(r.need_cookie){ $('banner').classList.add('show'); }
+      return;
+    }
+    $('pvAvatar').src = r.profile.avatar ? imgProxy(r.profile.avatar) : '';
+    $('pvAvatar').onerror = function(){ this.style.visibility = 'hidden'; };
+    $('pvName').textContent = r.profile.nickname;
+    $('pvIntro').textContent = r.profile.intro || '这个博主没有简介';
+    $('pvAdd').disabled = !!r.profile.exists;
+    $('pvAdd').textContent = r.profile.exists ? '已在列表中' : '添加并拉取全部';
+    $('previewCard').classList.add('show');
+    $('previewCard').dataset.input = input;
+  });
+};
+$('addInput').addEventListener('keydown', function(e){ if(e.key === 'Enter') $('addBtn').click(); });
+$('pvCancel').onclick = function(){ $('previewCard').classList.remove('show'); };
+$('pvAdd').onclick = function(){
+  post('/api/blogger/add', {input: $('previewCard').dataset.input}).then(function(r){
+    if(r.ok){
+      $('previewCard').classList.remove('show');
+      $('addInput').value = '';
+      toast('已添加，开始拉取全部历史（后台慢慢跑，可以关掉页面）');
+      loadState();
+    }else showAddMsg(r.error, true);
+  });
+};
+function showAddMsg(msg, bad){
+  var el = $('addMsg');
+  el.textContent = msg; el.style.display = msg ? 'block' : 'none';
+  el.style.color = bad ? 'var(--red)' : 'var(--sub)';
+}
+
+/* ── 勾选 ─────────────────────────────────── */
+function currentSelected(){
+  var s = new Set();
+  if(selMode === 'all'){ for(var i=0;i<selAllIds.length;i++) s.add(selAllIds[i]); }
+  else { for(var k in selManual) s.add(k); }
+  return s;
+}
+function isSel(id){
+  return selMode === 'all' ? selAllIds.indexOf(id) >= 0 : !!selManual[id];
+}
+function clearSelection(){
+  selMode = 'manual'; selManual = {}; selAllIds = [];
+  syncSelection();
+}
+function syncSelection(){
+  var ids = currentSelected();
+  var chks = document.querySelectorAll('.chk');
+  for(var i=0;i<chks.length;i++) chks[i].checked = ids.has(chks[i].dataset.id);
+  $('selCount').textContent = '已选 ' + ids.size + ' 条';
+  $('batchBar').classList.toggle('show', ids.size > 0 || $('refreshHint').textContent !== '');
+}
+$('grid').addEventListener('change', function(e){
+  var cb = e.target.closest('.chk');
+  if(!cb) return;
+  var id = cb.dataset.id;
+  if(selMode === 'all'){                 // 从「全选当前筛选结果」里取消一条 → 退回手动
+    selMode = 'manual'; selManual = {};
+    for(var i=0;i<selAllIds.length;i++) selManual[selAllIds[i]] = true;
+    delete selManual[id];
+  } else if(cb.checked){
+    selManual[id] = true;
+  } else {
+    delete selManual[id];
+  }
+  syncSelection();
+});
+$('selAllPage').onclick = function(){
+  var chks = document.querySelectorAll('.chk');
+  if(!chks.length){ toast('当前页没有微博'); return; }
+  for(var i=0;i<chks.length;i++) selManual[chks[i].dataset.id] = true;
+  syncSelection();
+};
+$('selAllFilter').onclick = function(){
+  fetch(postsQuery(1, true)).then(function(r){ return r.json(); }).then(function(r){
+    if(!r.ok || !r.ids){ toast(r.error || '查询失败'); return; }
+    if(!r.ids.length){ toast('当前筛选结果没有微博'); return; }
+    selMode = 'all'; selAllIds = r.ids; selManual = {};
+    syncSelection();
+    toast('已全选 ' + r.ids.length + ' 条');
+  });
+};
+$('selClear').onclick = function(){ clearSelection(); };
+
+/* ── 批量删除 / 批量更新 ─────────────────── */
+function doBatchDelete(ids){
+  post('/api/batch/delete', {ids: ids}).then(function(r){
+    toast(r.ok ? '已删除 ' + r.deleted + ' 条' : r.error);
+    if(r.ok){ clearSelection(); loadPosts(); loadState(); }
+  });
+}
+function doBatchUpdate(ids){
+  post('/api/batch/update', {ids: ids}).then(function(r){
+    toast(r.ok ? '已加入更新队列（' + r.queued + ' 条，后台逐条刷新）' : r.error);
+  });
+}
+$('batchDelete').onclick = function(){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  showModal('删除选中的 ' + ids.length + ' 条微博？删除后不可恢复。\n\n也可以改为「覆盖更新」——重新从微博拉取最新内容覆盖（长文截断也能修复）。', [
+    {text:'删除', cls:'danger', fn: function(){ doBatchDelete(ids); }},
+    {text:'改为更新', cls:'primary', fn: function(){ doBatchUpdate(ids); }},
+    {text:'取消', cls:'', fn: null}
+  ]);
+};
+$('batchUpdate').onclick = function(){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  showModal('更新选中的 ' + ids.length + ' 条微博？将从微博重新拉取覆盖（正文 / 长文全文 / 互动数 / 图片），未选中的不受影响。', [
+    {text:'确认更新', cls:'primary', fn: function(){ doBatchUpdate(ids); }},
+    {text:'取消', cls:'', fn: null}
+  ]);
+};
+
+/* ── 确认弹窗 ─────────────────────────────── */
+function showModal(msg, buttons){
+  $('modalMsg').textContent = msg;
+  $('modalBtns').innerHTML = '';
+  for(var i=0;i<buttons.length;i++){
+    (function(b){
+      var el = document.createElement('button');
+      el.textContent = b.text;
+      if(b.cls) el.className = b.cls;
+      el.onclick = function(){ hideModal(); if(b.fn) b.fn(); };
+      $('modalBtns').appendChild(el);
+    })(buttons[i]);
+  }
+  $('modal').classList.add('show');
+}
+function hideModal(){ $('modal').classList.remove('show'); }
+$('modal').onclick = function(e){ if(e.target === $('modal')) hideModal(); };
+
+/* ── 状态轮询 ─────────────────────────────── */
+function loadState(){
+  fetch('/api/state').then(function(r){ return r.json(); }).then(function(st){
+    renderCookie(st.cookie_status);
+    renderBloggers(st.bloggers);
+    for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒
+      var b = st.bloggers[i];
+      var old = prevState[b.uid];
+      if(old && (old === 'fulling' || old === 'queued') && b.state === 'done'){
+        toast('「'+b.nickname+'」'+b.note);
+        loadPosts();
+      }
+      prevState[b.uid] = b.state;
+    }
+    var rt = st.refresh_total || 0, rd = st.refresh_done || 0;
+    var updating = rt > rd;
+    if(prevUpdating && !updating){                         // 批量更新完成
+      toast('批量更新完成');
+      loadPosts();
+    }
+    prevUpdating = updating;
+    $('refreshHint').textContent = updating
+      ? '更新中：已更新 ' + rd + ' 条 / 待更新 ' + (rt - rd) + ' 条' : '';
+    if(!updating) syncSelection();
+  });
+}
+
+/* ── 查询与卡片网格 ───────────────────────── */
+function postsQuery(page, allIds){
+  var q = '/api/posts?page=' + page + '&page_size=6'
+        + (allIds ? '&all_ids=1' : '')
+        + (selUid ? '&uid=' + encodeURIComponent(selUid) : '')
+        + ($('kw').value.trim() ? '&kw=' + encodeURIComponent($('kw').value.trim()) : '')
+        + ($('yearSel').value ? '&year=' + $('yearSel').value : '')
+        + ($('from').value ? '&from=' + $('from').value : '')
+        + ($('to').value ? '&to=' + $('to').value : '')
+        + ($('statusSel').value ? '&deleted=' + $('statusSel').value : '');
+  return q;
+}
+function loadPosts(){
+  fetch(postsQuery(curPage, false)).then(function(r){ return r.json(); }).then(renderPosts);
+}
+function buildYears(years){
+  var sel = $('yearSel'), cur = sel.value;
+  var key = (years || []).join(',');
+  if(!key || sel.dataset.key === key) return;
+  var opts = '<option value="">全部年份</option>';
+  for(var i=0;i<years.length;i++)
+    opts += '<option value="'+years[i]+'">'+years[i]+'年</option>';
+  sel.innerHTML = opts;
+  sel.value = cur;
+  sel.dataset.key = key;
+}
+function renderPosts(r){
+  buildYears(r.years);
+  $('total').textContent = r.total ? ('共 ' + r.total + ' 条') : '';
+  var grid = $('grid'), empty = $('empty');
+  if(!r.items.length){
+    grid.innerHTML = '';
+    empty.innerHTML = (document.querySelectorAll('.b-item').length === 0)
+      ? '<div class="big">还没有添加博主</div>在左侧粘贴博主主页链接，添加后自动开始拉取全部历史微博'
+      : '<div class="big">没有符合条件的微博</div>换个关键词或放宽日期范围试试';
+    empty.classList.add('show');
+    renderPager(1, 1);
+    syncSelection();
+    return;
+  }
+  empty.classList.remove('show');
+  var html = '';
+  lbMap = {};
+  for(var i=0;i<r.items.length;i++){
+    var p = r.items[i];
+    var imgs = (p.media && p.media.imgs) || [];
+    lbMap[p.id] = imgs;
+    var textLen = (p.text || '').length;
+    var mgCls = imgs.length === 1 ? (textLen <= 120 ? ' mg-lg' : ' mg-sm') : '';
+    var gridCls = imgs.length ? ' n'+Math.min(imgs.length,3) : '';
+    var media = imgs.length
+      ? '<div class="p-imgs'+gridCls+'"'
+        + (imgs.length > 3 ? ' style="grid-template-columns:repeat('+imgs.length+',1fr)"' : '')
+        + ' onclick="openLightbox(\''+esc(p.id)+'\',0)" title="点击查看大图">'
+        + imgs.map(function(u, k){
+            return '<img src="'+esc(imgProxy(thumbUrl(u)))+'" loading="lazy" '
+                 + 'onclick="event.stopPropagation(); openLightbox(\''+esc(p.id)+'\','+k+')" '
+                 + 'onerror="this.parentNode.removeChild(this)">';
+          }).join('')
+        + '</div>'
+      : '';
+    var video = (p.media && p.media.video)
+      ? '<div class="p-video"><a href="'+esc(p.media.video)+'" target="_blank">▶ 播放视频</a></div>' : '';
+    var rt = p.retweeted
+      ? '<div class="p-retweeted"><span class="r-who">@'+esc(p.retweeted.nickname)+'：</span>'
+        + richText(p.retweeted.text).replace(/\n/g,'<br>')
+        + (p.retweeted.imgs && p.retweeted.imgs.length
+            ? '<div style="color:var(--blue);font-size:12px;margin-top:2px">（含图片 '+p.retweeted.imgs.length+' 张）</div>' : '')
+        + '</div>'
+      : '';
+    var delBadge = (p.deleted === 1) ? '<div class="p-del">【博主已删除】</div>' : '';
+    html += '<div class="post'+mgCls+(p.deleted === 1 ? ' post-del' : '')+'">'
+      + '<input type="checkbox" class="chk" data-id="'+esc(p.id)+'"'
+        + (isSel(p.id) ? ' checked' : '') + ' title="选择这条">'
+      + '<div class="p-head">'
+      +   (p.avatar ? '<img src="'+esc(imgProxy(thumbUrl(p.avatar)))+'" onerror="this.style.visibility=\'hidden\'">' : '')
+      +   '<span class="p-who">'+esc(p.nickname)+'</span>'
+      +   '<span class="p-time">'+fmtTime(p.created_ts)+'</span>'
+      +   '<a class="p-src" href="https://m.weibo.cn/detail/'+esc(p.bid)+'" target="_blank">原文</a>'
+      + '</div>'
+      + delBadge + '<div class="p-text">'+richText(p.text)+rt+'</div>'
+      + media + video
+      + '<div class="p-counts">转发 '+p.reposts+' · 评论 '+p.comments+' · 赞 '+p.atts
+      +   '<span class="sp"></span>'
+      +   '<button class="mini" onclick="copyId(\''+esc(p.id)+'\', event)">复制ID</button>'
+      + '</div>'
+      + '</div>';
+  }
+  grid.innerHTML = html;
+  renderPager(r.page, r.pages);
+  syncSelection();
+}
+
+/* ── 翻页条（事件委托，杜绝内联绑定失效）── */
+function renderPager(page, pages){
+  curPages = pages;
+  var pg = $('pager');
+  if(pages <= 1){ pg.innerHTML = ''; return; }
+  pg.innerHTML =
+      '<button class="mini" data-pg="first">首页</button>'
+    + '<button class="mini" data-pg="prev">上一页</button>'
+    + '<span id="pgInfo">第 ' + page + ' / ' + pages + ' 页</span>'
+    + '<input id="pgJump" type="number" min="1" max="'+pages+'" value="'+page+'">'
+    + '<button class="mini" data-pg="go">跳转</button>'
+    + '<button class="mini" data-pg="next">下一页</button>'
+    + '<button class="mini" data-pg="last">末页</button>';
+}
+$('filters').addEventListener('click', function(e){
+  var btn = e.target.closest('[data-pg]');
+  if(!btn) return;
+  var act = btn.dataset.pg, n;
+  if(act === 'first') n = 1;
+  else if(act === 'prev') n = curPage - 1;
+  else if(act === 'next') n = curPage + 1;
+  else if(act === 'last') n = curPages;
+  else if(act === 'go') n = parseInt($('pgJump').value, 10);
+  gotoPage(n);
+});
+$('filters').addEventListener('keydown', function(e){
+  if(e.target && e.target.id === 'pgJump' && e.key === 'Enter'){
+    gotoPage(parseInt($('pgJump').value, 10));
+  }
+});
+function gotoPage(n){
+  if(!n || isNaN(n)) return;
+  n = Math.min(curPages || 1, Math.max(1, n));
+  if(n !== curPage && selMode === 'manual') clearSelection();   // 本页勾选翻页即清
+  curPage = n;
+  loadPosts();
+}
+
+/* ── 图片灯箱 ─────────────────────────────── */
+var lbScale = 1, lbTx = 0, lbTy = 0;          // 缩放与平移状态
+var lbDrag = false, lbDragMoved = false;      // 拖拽平移
+var lbSX = 0, lbSY = 0, lbSTX = 0, lbSTY = 0;
+
+function applyLbTransform(){
+  var img = $('lbImg');
+  img.style.transform = 'translate(' + lbTx + 'px,' + lbTy + 'px) scale(' + lbScale + ')';
+  var r = img.getBoundingClientRect();                  // 限制平移不把图拖出视野
+  var mx = Math.max(200, (r.width - window.innerWidth) / 2);
+  var my = Math.max(200, (r.height - window.innerHeight) / 2);
+  lbTx = Math.max(-mx, Math.min(mx, lbTx));
+  lbTy = Math.max(-my, Math.min(my, lbTy));
+  img.style.transform = 'translate(' + lbTx + 'px,' + lbTy + 'px) scale(' + lbScale + ')';
+}
+function resetLbView(){ lbScale = 1; lbTx = 0; lbTy = 0; applyLbTransform(); }
+function zoomLb(dir){
+  lbScale = Math.min(6, Math.max(0.2, lbScale * (dir > 0 ? 1.25 : 0.8)));
+  applyLbTransform();
+}
+function openLightbox(pid, idx){
+  var urls = lbMap[pid];
+  if(!urls || !urls.length) return;
+  lbList = urls;
+  lbIdx = Math.min(idx, urls.length - 1);
+  renderLb();
+  $('lb').classList.add('show');
+}
+function renderLb(){
+  $('lbImg').src = imgProxy(lbList[lbIdx]);
+  $('lbInfo').textContent = (lbIdx + 1) + ' / ' + lbList.length
+    + ' · 点击切换 · 滚轮缩放 · 拖拽移动 · 双击还原 · ESC 关闭';
+  resetLbView();
+}
+function closeLb(){
+  $('lb').classList.remove('show');
+  $('lbImg').src = '';
+  lbList = [];
+  resetLbView();
+}
+$('lb').onclick = function(e){
+  if(lbDragMoved){ lbDragMoved = false; return; }       // 刚拖动过，不当作点击
+  var t = e.target;
+  if(t && t.tagName === 'IMG'){                         // 点图片 → 切下一张
+    if(lbList.length > 1){ lbIdx = (lbIdx + 1) % lbList.length; renderLb(); }
+  } else if(t && /^lbZoom/.test(t.id)){ return; }       // 缩放按钮不关闭
+  else closeLb();                                       // 点遮罩 → 关闭
+};
+$('lbZoomIn').onclick = function(){ zoomLb(1); };
+$('lbZoomOut').onclick = function(){ zoomLb(-1); };
+$('lbZoomReset').onclick = function(){ resetLbView(); };
+$('lb').addEventListener('wheel', function(e){
+  if(e.target === $('lbImg')){
+    e.preventDefault();
+    zoomLb(e.deltaY < 0 ? 1 : -1);
+  }
+}, {passive:false});
+$('lbImg').addEventListener('mousedown', function(e){
+  if(e.button !== 0) return;
+  lbDrag = true; lbDragMoved = false;
+  lbSX = e.clientX; lbSY = e.clientY;
+  lbSTX = lbTx; lbSTY = lbTy;
+  e.preventDefault();
+});
+document.addEventListener('mousemove', function(e){
+  if(!lbDrag) return;
+  var dx = e.clientX - lbSX, dy = e.clientY - lbSY;
+  if(Math.abs(dx) + Math.abs(dy) > 4) lbDragMoved = true;
+  if(lbDragMoved){ lbTx = lbSTX + dx; lbTy = lbSTY + dy; applyLbTransform(); }
+});
+document.addEventListener('mouseup', function(){ lbDrag = false; });
+$('lbImg').addEventListener('dblclick', function(e){
+  e.stopPropagation();
+  if(lbScale > 1.01) resetLbView(); else zoomLb(1);
+});
+document.addEventListener('keydown', function(e){
+  if(!$('lb').classList.contains('show')) return;
+  if(e.key === 'Escape') closeLb();
+  else if(e.key === 'ArrowRight'){ if(lbList.length>1){ lbIdx=(lbIdx+1)%lbList.length; renderLb(); } }
+  else if(e.key === 'ArrowLeft'){ if(lbList.length>1){ lbIdx=(lbIdx-1+lbList.length)%lbList.length; renderLb(); } }
+  else if(e.key === '+' || e.key === '='){ zoomLb(1); }
+  else if(e.key === '-'){ zoomLb(-1); }
+});
+
+/* ── 筛选与快捷时间 ───────────────────────── */
+function fmtDate(d){
+  var p = function(n){ return ('0'+n).slice(-2); };
+  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate());
+}
+function resetAndLoad(){
+  clearSelection();
+  curPage = 1;
+  loadPosts();
+}
+$('presetSel').onchange = function(){
+  var v = this.value;
+  if(!v) return;
+  var today = new Date(), yst = new Date(today.getTime() - 86400000);
+  if(v === 'today'){ $('from').value = fmtDate(today); $('to').value = fmtDate(today); }
+  else if(v === 'yesterday'){ $('from').value = fmtDate(yst); $('to').value = fmtDate(yst); }
+  else if(v === '7d'){ $('from').value = fmtDate(new Date(today.getTime()-6*86400000)); $('to').value = fmtDate(today); }
+  else if(v === '30d'){ $('from').value = fmtDate(new Date(today.getTime()-29*86400000)); $('to').value = fmtDate(today); }
+  else if(v === 'year'){ $('from').value = today.getFullYear() + '-01-01'; $('to').value = fmtDate(today); }
+  this.value = '';                                          // 还原占位，下次还能再选同一项
+  resetAndLoad();
+};
+$('kw').addEventListener('input', function(){
+  clearTimeout(kwTimer);
+  kwTimer = setTimeout(resetAndLoad, 400);
+});
+$('yearSel').addEventListener('change', resetAndLoad);
+$('from').addEventListener('change', resetAndLoad);
+$('to').addEventListener('change', resetAndLoad);
+$('statusSel').addEventListener('change', resetAndLoad);
+$('clearF').onclick = function(){
+  $('kw').value = '';
+  $('yearSel').value = '';
+  $('presetSel').value = '';
+  $('from').value = '';
+  $('to').value = '';
+  $('statusSel').value = '';
+  resetAndLoad();
+};
+
+/* ── 启动 ────────────────────────────────── */
+loadState();
+loadPosts();
+setInterval(loadState, 2500);
+</script>
+</body>
+</html>

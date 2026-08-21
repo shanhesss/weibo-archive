@@ -1,0 +1,8 @@
+# 运行时产物：数据文件含登录 Cookie，严禁入库
+weibo.db
+weibo.db-wal
+weibo.db-shm
+weibo-backup-*.db
+weibo-backup-*.db-wal
+weibo_server.log
+__pycache__/
