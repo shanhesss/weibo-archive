@@ -33,9 +33,15 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):            # 打包为 exe 时
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))   # 数据/日志/备份写到 exe 同目录
+    BUNDLE_DIR = getattr(sys, '_MEIPASS', APP_DIR)               # HTML 等资源在打包内
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = APP_DIR
+BASE_DIR = APP_DIR
 DB_PATH = os.environ.get('WEIBO_DB') or os.path.join(BASE_DIR, 'weibo.db')
-HTML_PATH = os.path.join(BASE_DIR, 'weibo_web.html')
+HTML_PATH = os.path.join(BUNDLE_DIR, 'weibo_web.html')
 
 API_BASE = 'https://m.weibo.cn'
 PAGE_COUNT = 50                 # 列表接口每页条数（上限 100）
@@ -710,6 +716,7 @@ def sync_worker():
 def blogger_rows():
     counts = {r['uid']: r['c'] for r in db('SELECT uid, COUNT(*) c FROM posts GROUP BY uid').fetchall()}
     earliest = {r['uid']: r['t'] for r in db('SELECT uid, MIN(created_ts) t FROM posts GROUP BY uid').fetchall()}
+    latest = {r['uid']: r['t'] for r in db('SELECT uid, MAX(created_ts) t FROM posts GROUP BY uid').fetchall()}
     rows = db('SELECT * FROM bloggers ORDER BY created_at').fetchall()
     out = []
     for r in rows:
@@ -718,7 +725,7 @@ def blogger_rows():
             'homepage': r['homepage'] or 'https://weibo.com/u/%s' % r['uid'],
             'state': r['state'], 'note': r['note'], 'next_page': r['next_page'],
             'last_synced_at': r['last_synced_at'], 'count': counts.get(r['uid'], 0),
-            'earliest': earliest.get(r['uid']),
+            'earliest': earliest.get(r['uid']), 'latest': latest.get(r['uid']),
         })
     return out
 
@@ -1110,14 +1117,15 @@ def main():
         srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     except OSError:
         msg = ('端口 %d 已被占用，微博存档工具可能已在后台运行。\n\n'
-               '浏览器直接打开 http://127.0.0.1:%d/ 即可使用；\n'
-               '如需重启，请先用启动菜单里的「停止」再启动。' % (port, port))
+               '浏览器直接打开 http://127.0.0.1:%d/ 即可使用。' % (port, port))
         print(msg)
         try:
             import ctypes
             ctypes.windll.user32.MessageBoxW(0, msg, '微博存档工具', 0x40)
         except Exception:
             pass
+        if not os.environ.get('WEIBO_NO_BROWSER'):
+            webbrowser.open(url)          # 已运行则直接打开页面
         return
     url = 'http://127.0.0.1:%d/' % port
     print('=' * 56)

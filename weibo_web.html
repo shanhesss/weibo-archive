@@ -76,6 +76,10 @@
   .b-home{font-size:11px; color:var(--sub); background:none; border:none; padding:0;
           cursor:pointer; line-height:1.2;}
   .b-home:hover{color:var(--blue);}
+  .b-del{font-size:11px; color:#fff; background:var(--red); border:none; border-radius:4px;
+         padding:1px 6px; cursor:pointer; line-height:1.5;}
+  .b-del:hover{opacity:.85;}
+  .b-del.confirm{background:#c0392b; animation:pulse 1s infinite;}
   .b-main{flex:1; min-width:0;}
   .b-top{display:flex; align-items:center; gap:6px;}
   .b-name{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
@@ -403,8 +407,6 @@ function bloggerButtons(b){
     btns += '<button class="mini primary" data-act="sync" data-uid="'+b.uid+'">重试</button>';
   if(b.state !== 'queued' && b.state !== 'fulling')
     btns += '<button class="mini" data-act="refull" data-uid="'+b.uid+'" title="从头全量重拉并覆盖，微博已删的会标记">重拉全量</button>';
-  var delTxt = deleting[b.uid] ? '确认删除？' : '删除';
-  btns += '<button class="mini" data-act="del" data-uid="'+b.uid+'">'+delTxt+'</button>';
   return btns;
 }
 function renderBloggers(list){
@@ -415,6 +417,8 @@ function renderBloggers(list){
       + (b.avatar ? '<img src="'+esc(imgProxy(thumbUrl(b.avatar)))+'" onerror="this.style.visibility=\'hidden\'">'
                   : '<div class="light"></div>')
       + '<button class="b-home" data-act="home" data-uid="'+esc(b.uid)+'" data-home="'+esc(b.homepage)+'">复制主页</button>'
+      + '<button class="b-del'+(deleting[b.uid]?' confirm':'')+'" data-act="del" data-uid="'+esc(b.uid)+'" title="删除博主及其全部微博数据">'
+      + (deleting[b.uid] ? '⚠ 确认删除？不可恢复' : '⚠ 删除') + '</button>'
       + '</div>';
     var noteCls = (b.state==='error') ? ' bad' : ((b.state==='paused') ? ' warn' : '');
     html += '<div class="b-item'+(selUid===b.uid?' sel':'')+'" data-uid="'+esc(b.uid)+'">'
@@ -423,7 +427,8 @@ function renderBloggers(list){
       +   '<div class="b-top"><span class="light '+b.state+'"></span>'
       +     '<span class="b-name">'+esc(b.nickname)+'</span>'
       +     '<span class="b-count">'+b.count+'条</span></div>'
-      +   (b.earliest ? '<div class="b-early">最早 ' + fmtDateShort(b.earliest) + '</div>' : '')
+      +   (b.earliest ? '<div class="b-early">最早 ' + fmtDateShort(b.earliest)
+        + (b.latest ? ' · 最新 ' + fmtDateShort(b.latest) : '') + '</div>' : '')
       +   '<div class="b-note'+noteCls+'">'+esc(b.note || stateLabel(b.state))
       +     (b.last_synced_at ? ' · 上次同步 '+esc(b.last_synced_at.slice(5,16)) : '')+'</div>'
       +   '<div class="b-btns">'+bloggerButtons(b)+'</div>'
