@@ -212,13 +212,45 @@ ws.SYNC['done'] = 0
 ws.SYNC['msg'] = ''
 
 # 21. 归档筛选 + 状态字段
-ws.db("UPDATE posts SET archived=1, yuque_doc_url='https://www.yuque.com/aaa/bbb/doc' WHERE id='a4'")
-check('已归档筛选1条', q({'archived': '1'})['total'] == 1)
-check('未归档筛选1条(a2未归档)', q({'archived': '0'})['total'] == 1)
+ws.db("UPDATE posts SET archived=1, yuque_doc_url='https://www.yuque.com/aaa/bbb/doc', arch_fail='', arch_skip=0, arch_state='' WHERE id='a4'")
+check('已归档筛选1条', q({'arch': 'done'})['total'] == 1)
+check('待归档筛选1条(a2待归档)', q({'arch': 'pending'})['total'] == 1)
 r = q({'page': '1'})
 it = {i['id']: i for i in r['items']}
 check('返回归档字段', it['a4']['archived'] == 1 and it['a4']['yuque_doc_url'].endswith('/doc'))
 check('state 带归档进度', ws.api_state()['yuque_total'] == 0)
+
+# 22. 已归档可再同步（瞬态标记 updating + 入队）
+r = ws.api_yuque_sync({'ids': ['a4']})
+check('已归档可再同步入队', r['ok'] is True and r['updated'] == 1 and r['created'] == 0)
+check('瞬态标记 updating', ws.db("SELECT arch_state FROM posts WHERE id='a4'").fetchone()['arch_state'] == 'updating')
+ws.SYNC_QUEUE.clear()
+ws.SYNC['total'] = 0
+ws.SYNC['done'] = 0
+ws.SYNC['msg'] = ''
+ws.db("UPDATE posts SET arch_state='' WHERE id='a4'")
+
+# 23. 失败状态筛选 + 原因返回
+ws.db("UPDATE posts SET arch_fail='目录不存在' WHERE id='a4'")
+ws.db("UPDATE posts SET arch_fail='超时', arch_skip=0, archived=0 WHERE id='a2'")
+check('更新失败筛选1条', q({'arch': 'update_fail'})['total'] == 1)
+check('同步失败筛选1条', q({'arch': 'sync_fail'})['total'] == 1)
+r = q({'page': '1'})
+it = {i['id']: i for i in r['items']}
+check('返回失败原因', it['a4']['arch_fail'] == '目录不存在' and it['a2']['arch_fail'] == '超时')
+ws.db("UPDATE posts SET arch_fail='' WHERE id='a2'")
+ws.db("UPDATE posts SET arch_fail='', archived=1 WHERE id='a4'")
+
+# 24. 批量改为无需归档 / 改回待归档
+r = ws.api_yuque_mark({'ids': ['a2', 'a4'], 'to': 'skip'})
+check('批量改为无需归档', r['ok'] is True and r['updated'] == 2)
+check('无需归档筛选2条', q({'arch': 'skip'})['total'] == 2)
+r = ws.api_yuque_mark({'ids': ['a2'], 'to': 'pending'})
+check('改回待归档', r['ok'] is True)
+check('待归档筛选1条', q({'arch': 'pending'})['total'] == 1)
+check('无需归档剩1条', q({'arch': 'skip'})['total'] == 1)
+r = ws.api_yuque_mark({'ids': [], 'to': 'skip'})
+check('mark 空ids拒绝', r['ok'] is False)
 
 print('---- RESULT: %s ----' % ('ALL PASS' if ok else 'HAS FAILURES'))
 sys.exit(0 if ok else 1)

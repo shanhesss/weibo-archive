@@ -110,10 +110,9 @@
 
   /* ── 批量操作条 ───────────────────────── */
   #batchBar{flex:none; display:none; align-items:center; gap:10px; margin-bottom:8px;
-            font-size:13px; color:var(--sub);}
+            font-size:13px; color:var(--sub); flex-wrap:wrap;}
   #batchBar.show{display:flex;}
   #selCount{color:var(--txt); font-weight:600;}
-  #refreshHint{color:var(--amber);}
 
   /* ── 卡片网格 ─────────────────────────── */
   #grid{flex:1; min-height:0; display:grid;
@@ -133,12 +132,18 @@
   .p-who{font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   .p-time{color:var(--sub); font-size:12px; flex:none;}
   .p-src{margin-left:auto; font-size:12px; flex:none;}
+  .arch-st{flex:none; font-size:12px; margin-left:4px;}
+  .arch-st.err{color:var(--red); cursor:pointer;}
+  .arch-st.warn{color:var(--amber); cursor:pointer;}
+  .arch-st.skip{color:var(--grey);}
   .yuque-btn{flex:none; font-size:12px; padding:1px 8px; background:var(--yuque); border-color:var(--yuque);}
   button.mini.yuque-btn{color:#fff;}
   button.mini.yuque-btn:hover{opacity:.88; color:#fff;}
   button.mini.yuque-btn[disabled]{opacity:.5; cursor:not-allowed; background:var(--grey); border-color:var(--grey); color:#fff;}
   button.mini.yuque-btn.yq-off{background:var(--grey); border-color:var(--grey); color:#fff; cursor:pointer;}
   button.mini.yuque-btn.yq-off:hover{opacity:.88; color:#fff;}
+  button.mini.yuque-btn.yq-update{background:#fff; color:var(--yuque); border-color:var(--yuque);}
+  button.mini.yuque-btn.yq-update:hover{opacity:.88; color:var(--yuque);}
   .yuque-ok{flex:none; color:var(--yuque); font-size:12px; margin-left:4px; cursor:pointer;}
   .b-yuque{color:var(--sub); font-size:12px; margin-top:2px; display:flex; align-items:center; gap:6px; min-width:0;}
   .b-yuque .yq-ok{color:var(--yuque); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;}
@@ -147,6 +152,13 @@
   .btn-yuque{background:var(--yuque); border-color:var(--yuque);}
   button.mini.btn-yuque{color:#fff;}
   button.mini.btn-yuque:hover{opacity:.88; color:#fff;}
+  .btn-skip{background:#f2f3f5; border-color:#d0d7de; color:#57606a;}
+  .btn-skip:hover{color:#57606a; border-color:#aab4c0;}
+  .btn-pending{background:#e8f4fd; border-color:#b7dff7; color:#1d6fb8;}
+  .btn-pending:hover{color:#1d6fb8; border-color:#8cc4ee;}
+  #taskHints{flex:1; text-align:center; min-width:0;}
+  #taskHints .busy{display:inline-block; padding:3px 14px; border-radius:999px; background:#fdf6ec;
+                   color:#a1622a; border:1px solid #faecd8; font-size:13px; font-weight:600;}
   #yuqueEdit{flex:none; display:none; align-items:center; gap:8px; margin-bottom:8px; padding:8px 12px;
              background:var(--card); border:1px solid var(--line); border-radius:8px; flex-wrap:wrap;}
   #yuqueEdit.show{display:flex;}
@@ -214,6 +226,7 @@
 
 <header>
   <h1>微博存档</h1>
+  <div id="taskHints"></div>
   <button id="cookiePill"><span class="dot"></span><span id="cookiePillTxt">…</span></button>
 </header>
 
@@ -275,8 +288,11 @@
       </select>
       <select id="archSel">
         <option value="">全部归档</option>
-        <option value="0">未归档</option>
-        <option value="1">已归档</option>
+        <option value="pending">待归档</option>
+        <option value="done">已归档</option>
+        <option value="sync_fail">同步失败</option>
+        <option value="update_fail">更新失败</option>
+        <option value="skip">无需归档</option>
       </select>
       <button id="clearF" class="mini">清空筛选</button>
       <div id="pager"></div>
@@ -286,12 +302,12 @@
       <button id="selAllPage" class="mini">全选本页</button>
       <button id="selAllFilter" class="mini">全选当前筛选结果</button>
       <span id="selCount">已选 0 条</span>
-      <span id="refreshHint"></span>
-      <span id="yuqueHint"></span>
       <span style="flex:1"></span>
       <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀（单次最多 6 条）">同步到语雀</button>
       <button id="batchUpdate" class="mini primary">批量更新</button>
       <button id="batchDelete" class="mini danger">批量删除</button>
+      <button id="batchMarkSkip" class="mini btn-skip" title="选中微博转为无需归档，不再参与语雀同步">转无需归档</button>
+      <button id="batchMarkPending" class="mini btn-pending" title="选中微博转回待归档">转待归档</button>
       <button id="selClear" class="mini">清空选择</button>
     </div>
     <div id="grid"></div>
@@ -325,7 +341,6 @@ var selMode = 'manual';           // 勾选模式：manual 逐条 / all 全选�
 var selManual = {};               // 手动勾选的 id
 var selAllIds = [];               // 全选模式下获取的全部匹配 id
 var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
-var syncingIds = [];              // 正在归档的微博 id（用于按钮「同步中…」）
 var prevYuqueBusy = false;        // 归档批次是否在进行中，用于完成检测
 
 function esc(s){
@@ -382,16 +397,25 @@ function richText(t){                 // 正文：普通文本转义，微博表
     }).join('');
 }
 function syncBtnHtml(p){
+  if(p.arch_state === 'syncing') return '<button class="mini yuque-btn" disabled>同步中…</button>';
+  if(p.arch_state === 'updating') return '<button class="mini yuque-btn" disabled>更新中…</button>';
   if(p.archived){
-    return p.yuque_doc_url
-      ? '<a class="yuque-ok" href="'+esc(p.yuque_doc_url)+'" target="_blank" title="已同步到语雀，点击打开">已归档</a>'
-      : '<span class="yuque-ok">已归档</span>';
+    var s = p.arch_fail
+      ? '<span class="arch-st warn" title="'+esc(p.arch_fail)+'">更新失败</span>'
+      : (p.yuque_doc_url
+          ? '<a class="yuque-ok" href="'+esc(p.yuque_doc_url)+'" target="_blank" title="已同步到语雀，点击打开">已归档</a>'
+          : '<span class="yuque-ok">已归档</span>');
+    return s + '<button class="mini yuque-btn yq-update" data-sync="'+esc(p.id)+'" title="按最新模板更新语雀文档">更新</button>';
+  }
+  if(p.arch_skip){
+    return '<span class="arch-st skip">无需归档</span>';
+  }
+  if(p.arch_fail){
+    return '<span class="arch-st err" title="'+esc(p.arch_fail)+'">同步失败</span>'
+      + '<button class="mini yuque-btn" data-sync="'+esc(p.id)+'" title="重试同步">同步</button>';
   }
   if(p.retweeted){
     return '<button class="mini yuque-btn yq-off" data-rt="1" title="转发微博不支持同步">同步</button>';
-  }
-  if(syncingIds.indexOf(p.id) >= 0){
-    return '<button class="mini yuque-btn" disabled>同步中…</button>';
   }
   return '<button class="mini yuque-btn" data-sync="'+esc(p.id)+'" title="AI 总结后同步到语雀">同步</button>';
 }
@@ -639,8 +663,7 @@ function syncSelection(){
   var chks = document.querySelectorAll('.chk');
   for(var i=0;i<chks.length;i++) chks[i].checked = ids.has(chks[i].dataset.id);
   $('selCount').textContent = '已选 ' + ids.size + ' 条';
-  $('batchBar').classList.toggle('show', ids.size > 0
-    || $('refreshHint').textContent !== '' || $('yuqueHint').textContent !== '');
+  $('batchBar').classList.toggle('show', ids.size > 0);
 }
 $('grid').addEventListener('change', function(e){
   var cb = e.target.closest('.chk');
@@ -664,7 +687,6 @@ $('grid').addEventListener('click', function(e){
   var id = btn.dataset.sync;
   post('/api/yuque/sync', {ids: [id]}).then(function(r){
     if(!r.ok){ showAlert(r.error); return; }
-    syncingIds = [id];
     toast('已开始归档，正在 AI 总结并同步到语雀');
     loadPosts(); loadState();
   });
@@ -720,11 +742,31 @@ $('batchYuque').onclick = function(){
   if(!ids.length){ toast('没有选中微博'); return; }
   post('/api/yuque/sync', {ids: ids}).then(function(r){
     if(!r.ok){ showAlert(r.error); return; }
-    syncingIds = ids;
-    toast('已加入同步队列（' + r.queued + ' 条，后台逐条归档）');
+    var parts = [];
+    if(r.created) parts.push('新增 ' + r.created + ' 条');
+    if(r.updated) parts.push('更新 ' + r.updated + ' 条');
+    toast('已加入同步队列（' + (parts.join('、') || (r.queued + ' 条')) + '，后台逐条处理）');
     loadPosts(); loadState();
   });
 };
+function doBatchMark(to, okMsg){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  showModal(to === 'skip' ? '把选中的 ' + ids.length + ' 条微博标记为「无需归档」？它们将不再参与语雀同步。'
+                          : '把选中的 ' + ids.length + ' 条微博改回「待归档」？', [
+    {text:'确定', cls:'primary', fn: function(){
+      post('/api/yuque/mark', {ids: ids, to: to}).then(function(r){
+        if(!r.ok){ showAlert(r.error); return; }
+        toast(okMsg);
+        clearSelection();
+        loadPosts(); loadState();
+      });
+    }},
+    {text:'取消', cls:'', fn: null}
+  ]);
+}
+$('batchMarkSkip').onclick = function(){ doBatchMark('skip', '已标记为无需归档'); };
+$('batchMarkPending').onclick = function(){ doBatchMark('pending', '已改回待归档'); };
 
 /* ── 确认弹窗 ─────────────────────────────── */
 function showModal(msg, buttons){
@@ -748,6 +790,12 @@ function showAlert(msg){                    // 居中醒目提示（单按钮确
 $('modal').onclick = function(e){ if(e.target === $('modal')) hideModal(); };
 
 /* ── 状态轮询 ─────────────────────────────── */
+function renderTaskHints(updating, rd, rt, ybusy, yd, yt){
+  var h = [];
+  if(updating) h.push('批量更新中：已更新 ' + rd + ' / ' + rt);
+  if(ybusy) h.push('语雀同步中：已处理 ' + yd + ' / ' + yt);
+  $('taskHints').innerHTML = h.length ? '<span class="busy">' + h.join(' · ') + '</span>' : '';
+}
 function loadState(){
   fetch('/api/state').then(function(r){ return r.json(); }).then(function(st){
     renderCookie(st.cookie_status);
@@ -768,17 +816,15 @@ function loadState(){
       loadPosts();
     }
     prevUpdating = updating;
-    $('refreshHint').textContent = updating
-      ? '更新中：已更新 ' + rd + ' 条 / 待更新 ' + (rt - rd) + ' 条' : '';
     var yt = st.yuque_total || 0, yd = st.yuque_done || 0;
     var ybusy = yt > yd;
     if(prevYuqueBusy && !ybusy && yt > 0){                 // 归档批次完成 → 提示结果并刷新卡片
       if(st.yuque_msg) toast(st.yuque_msg);
-      syncingIds = [];
       loadPosts();
     }
     prevYuqueBusy = ybusy;
-    $('yuqueHint').textContent = ybusy ? '归档中：已归档 ' + yd + ' / ' + yt : '';
+    renderTaskHints(updating, rd, rt, ybusy, yd, yt);
+    $('batchYuque').disabled = ybusy;
     if(!updating && !ybusy) syncSelection();
   });
 }
@@ -793,7 +839,7 @@ function postsQuery(page, allIds){
         + ($('from').value ? '&from=' + $('from').value : '')
         + ($('to').value ? '&to=' + $('to').value : '')
         + ($('statusSel').value ? '&deleted=' + $('statusSel').value : '')
-        + ($('archSel').value ? '&archived=' + $('archSel').value : '');
+        + ($('archSel').value ? '&arch=' + $('archSel').value : '');
   return q;
 }
 function loadPosts(){
