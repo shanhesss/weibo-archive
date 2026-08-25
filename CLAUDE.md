@@ -1,0 +1,55 @@
+# weibo 项目规则
+
+微博拉取 + 查询 + 语雀归档工具。以下是开发、打包、协作的统一约定。
+
+## 命名
+
+- **文件名一律用英文**（代码 snake_case，文档 kebab-case）：如 `weibo_server.py`、`yuque-sync-template.md`、`docs/adr/0008-yuque-archive.md`。不新增中文文件名。
+- 界面与用户可见文案用中文，且「零术语」人话（见易用性硬承诺）。
+
+## 领域词汇与决策
+
+- 术语表：`CONTEXT.md`；技术决策：`docs/adr/`（编号递增）。新术语 / 新决策先落在这两处再动手。
+- 常用术语：博主 / 博文 / 增量拉取 / 重拉全量 / 语雀归档 / 归档目录 / 归档状态 / 同步模板 / 断点续爬 / 432。完整见 CONTEXT.md。
+
+## 架构约束
+
+- `weibo_server.py` 保持**纯标准库**（http.server + sqlite3），尽量零第三方依赖；PyInstaller 打包 `weibo_archive.exe`。
+- 数据全部在 `weibo.db`（SQLite 单文件）；接口原始 JSON 留底（ADR-0003）。
+- 拉取走 m.weibo.cn 非官方接口 + 小号 cookie（ADR-0002）；432 退避、断点续爬、增量 / 全量 / 重拉语义见 ADR-0006 / 0007。
+- 语雀归档 = 无头 claude CLI + yuque MCP（ADR-0008）：weibo_server spawn `claude -p`，AI 总结 + 建语雀文档一体完成；语雀 token 不入库、不入 git。
+- 新增功能的全部产出（代码 / 文档 / 数据）放 weibo/ 内，后续相关文件也只往里加。
+
+## 易用性（五条硬承诺）
+
+1. **单页单屏、无 Tab 无弹窗**：所有功能一屏可达
+2. **零术语**：界面不出现 432、containerid、uid 等字眼，状态全部人话
+3. **常用操作 ≤2 次点击**
+4. **默认即可用**：无必填配置，登录信息未填只出一条引导
+5. **进度一屏可见**
+
+**兜底原则：任何时刻页面出现用户看不懂的状态，视为 bug。**
+
+## 语雀归档规则（ADR-0008）
+
+- 卡片【同步】→ AI 总结 + 建语雀文档到博主「归档目录」；一博主一目录、一微博一文档
+- 归档目录不存在报错提示，不自动创建；已归档不可再同步；转发微博不支持；不放完整正文
+- 单次批量 ≤6 条、串行，显示「已同步 x/6」；文档格式由 `yuque-sync-template.md` 模板驱动
+- 错误必须提示具体原因：未配置目录 / 本机没 claude / 未配置 yuque MCP / MCP 连接失败
+
+## 已知推迟项（不要再主动做）
+
+定时增量、导出、评论、图片本地化、PC 备份通道、FTS、部署。
+
+## 开发与打包
+
+- 开发：`python weibo_server.py [端口]`（默认 8766）；`weibo_start.vbs` 启动 / `weibo_stop.vbs` 停止
+- 冒烟测试：`python smoke_test.py`
+- 重新打包：双击 `rebuild.bat`（停旧进程 → 重新打包 → 清理中间文件）
+- `weibo_archive.spec` 的 datas 包含运行时资源（`weibo_web.html`、`yuque-sync-template.md`），新增资源记得同步 spec
+
+## Git
+
+- 本仓库用专用 GitHub 提交身份（匿名邮箱 + 专用 SSH 密钥），与内网 GitLab 的全局身份分开；具体账号与密钥不写进本仓库文件（个人隐私不入库），配置由会话记忆持有
+- 提交信息用中文
+- 运行时产物不入库：`weibo.db`、备份库、日志、`__pycache__`、`dist/`（`.gitignore` 已排除）

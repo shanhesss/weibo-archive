@@ -17,12 +17,15 @@
 """
 import datetime
 import email.utils
+import glob
 import html as html_mod
 import json
 import os
 import random
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +45,11 @@ else:
 BASE_DIR = APP_DIR
 DB_PATH = os.environ.get('WEIBO_DB') or os.path.join(BASE_DIR, 'weibo.db')
 HTML_PATH = os.path.join(BUNDLE_DIR, 'weibo_web.html')
+
+TEMPLATE_PATH = os.path.join(BUNDLE_DIR, 'yuque-sync-template.md')
+YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:/[^\s/?#]+)*)/?$')
+SYNC_MAX = 6                     # 单次归档最多条数
+SYNC_TIMEOUT = 180               # 单条 claude 调用超时（秒）
 
 API_BASE = 'https://m.weibo.cn'
 PAGE_COUNT = 50                 # 列表接口每页条数（上限 100）
@@ -90,6 +98,7 @@ def init_db():
       avatar TEXT DEFAULT '',
       intro TEXT DEFAULT '',
       homepage TEXT DEFAULT '',       -- 博主主页 https://weibo.com/u/{uid}
+      yuque_dir TEXT DEFAULT '',      -- 语雀归档目录链接（可为空，ADR-0008）
       state TEXT DEFAULT 'idle',
       next_page INTEGER,              -- 全量拉取的断点页码（NULL=没有未完成的全量）
       note TEXT DEFAULT '',           -- 人话进度/错误说明，直接展示给用户
@@ -110,7 +119,10 @@ def init_db():
       raw_json TEXT,                  -- 接口原始 JSON 留底（ADR-0003）
       fetched_at TEXT,
       counts_updated_at TEXT,
-      deleted INTEGER DEFAULT 0);     -- 1=全量拉到底后微博上已不存在（ADR-0007）
+      deleted INTEGER DEFAULT 0,      -- 1=全量拉到底后微博上已不存在（ADR-0007）
+      archived INTEGER DEFAULT 0,     -- 1=已同步到语雀（ADR-0008）
+      yuque_doc_url TEXT DEFAULT '',
+      archived_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_posts_uid_ts ON posts(uid, created_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_posts_ts ON posts(created_ts DESC);
     CREATE TABLE IF NOT EXISTS pull_seen (
@@ -119,7 +131,11 @@ def init_db():
     ''')
     # 旧库迁移：补列（新库直接建表已含）
     for table, col, decl in (('bloggers', 'homepage', "TEXT DEFAULT ''"),
-                             ('posts', 'deleted', 'INTEGER DEFAULT 0')):
+                             ('bloggers', 'yuque_dir', "TEXT DEFAULT ''"),
+                             ('posts', 'deleted', 'INTEGER DEFAULT 0'),
+                             ('posts', 'archived', 'INTEGER DEFAULT 0'),
+                             ('posts', 'yuque_doc_url', "TEXT DEFAULT ''"),
+                             ('posts', 'archived_at', "TEXT DEFAULT ''")):
         cols = [r[1] for r in CONN.execute('PRAGMA table_info(%s)' % table).fetchall()]
         if col not in cols:
             CONN.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
@@ -699,6 +715,200 @@ def refresh_worker():
             REFRESH['done'] = REFRESH['total']
 
 
+# ----------------------------------------------------------- 语雀归档 ----
+SYNC = {'total': 0, 'done': 0, 'msg': ''}     # 归档进度与结果消息（供前端展示）
+SYNC_QUEUE = deque()
+SYNC_COND = threading.Condition()
+
+
+def find_claude():
+    """找本机可调用的 claude CLI：PATH → VSCode 扩展内置二进制 → 常见安装位置"""
+    p = shutil.which('claude')
+    if p:
+        return p
+    home = os.path.expanduser('~')
+    cands = []
+    for pat in (os.path.join(home, '.claude', 'local', 'bin', 'claude*'),
+                os.path.join(home, '.vscode', 'extensions', 'anthropic.claude-code-*',
+                             'resources', 'native-binary', 'claude*'),
+                os.path.join(home, '.vscode-insiders', 'extensions', 'anthropic.claude-code-*',
+                             'resources', 'native-binary', 'claude*'),
+                os.path.join(os.environ.get('APPDATA', ''), 'npm', 'claude*'),
+                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs',
+                             'claude-code', 'claude*')):
+        cands += glob.glob(pat)
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def find_yuque_mcp():
+    """检查全局 claude 配置里是否注册了 yuque MCP（headless claude 会自动加载）"""
+    for path in (os.path.join(os.path.expanduser('~'), '.claude', 'settings.json'),
+                 os.path.join(os.path.expanduser('~'), '.claude.json'),
+                 os.path.join(BASE_DIR, '.mcp.json')):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        servers = cfg.get('mcpServers') or {}
+        if any('yuque' in name.lower() for name in servers):
+            return True
+    return False
+
+
+def validate_yuque_dir(url):
+    """校验语雀目录链接格式，返回 (账号, 知识库slug, 目录路径) 或 None"""
+    url = (url or '').strip()
+    m = YUQUE_URL_RE.match(url)
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3).strip('/')
+
+
+MCP_NOT_READY_KW = ('未就绪', '未连接', 'MCP 未', '没有加载', '不可用', '无法使用 yuque')
+
+
+def _spawn_claude(prompt, attempts=2):
+    """调用无头 claude CLI（AI 总结 + 语雀 MCP 建文档），返回 (ok, 输出文本)。
+    yuque MCP 是 npx 冷启动、可能比模型慢，首次调用若提示 MCP 未就绪则重试一次。"""
+    exe = find_claude()
+    if not exe:
+        return False, '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'
+    last = (False, 'claude 未返回结果')
+    for i in range(attempts):
+        try:
+            proc = subprocess.Popen(
+                [exe, '-p', '-', '--output-format', 'json',
+                 '--allowedTools', 'mcp__yuque__*'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, cwd=BASE_DIR,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            out, _ = proc.communicate(prompt.encode('utf-8'), timeout=SYNC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False, '同步超时（claude 调用超过 %d 秒）' % SYNC_TIMEOUT
+        except Exception as e:
+            return False, '调用 claude 失败：%s' % e
+        text = out.decode('utf-8', 'replace')
+        res = None
+        for line in text.splitlines():      # 解析最后的 type=result 事件，取 result 文本
+            line = line.strip()
+            if not line.startswith('{'):
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get('type') == 'result':
+                res = str(ev.get('result') or '')
+        if res is None:
+            return False, 'claude 返回无法解析：%s' % text[:300]
+        if i < attempts - 1 and any(kw in res for kw in MCP_NOT_READY_KW):
+            last = (False, '语雀 MCP 未就绪，重试后仍失败：%s' % res[:150])
+            continue
+        return True, res
+    return last
+
+
+def _build_archive_prompt(row, template):
+    """组装单条微博的归档提示词：目标目录 + 模板 + 微博内容"""
+    acc, book, folder = validate_yuque_dir(row['yuque_dir'])
+    target = '语雀目录链接：%s（账号 %s，知识库 %s，文档要放进目录 %s）' % (
+        row['yuque_dir'], acc, book, folder or '知识库根目录')
+    media = json.loads(row['media_json'] or '{}')
+    nimgs = len(media.get('imgs') or [])
+    ts = row['created_ts']
+    when = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else ''
+    return (
+        '你是一个「微博 → 语雀归档」助手。把下面这条微博按模板格式总结并同步到语雀。\n\n'
+        '【目标】%s\n'
+        '步骤：\n'
+        '0. 如果 yuque MCP 的工具（yuque_get_toc 等）还没就绪，先调用 WaitForMcpServers 等待所有 MCP 服务器连接完成，然后再用。\n'
+        '1. 调用 yuque_get_toc 查看该知识库的目录树，确认目标目录节点是否存在。\n'
+        '2. 如果目标目录不存在，最终输出 SYNC_ERR|目录不存在，不要创建任何内容。\n'
+        '3. 如果目录存在，调用 yuque_create_doc 创建文档（标题按模板）；若该工具无法指定目录，创建后用 yuque_update_toc 把文档移到目标目录节点下。\n'
+        '4. 文档内容严格按模板生成，微博ID 必须保留。\n'
+        '5. 最终输出必须只有一行：SYNC_OK|文档URL 或 SYNC_ERR|原因。禁止输出任何其他文字或解释。\n\n'
+        '【模板】\n%s\n\n'
+        '【微博信息】\n'
+        '微博ID：%s\n博主：%s\n发布时间：%s\n原文链接：https://m.weibo.cn/detail/%s\n'
+        '互动：转发 %s · 评论 %s · 赞 %s\n图片：%s 张\n\n'
+        '【微博正文】\n%s'
+        % (target, template, row['id'], row['nickname'], when, row['bid'],
+           row['reposts'], row['comments'], row['atts'], nimgs, row['text']))
+
+
+def _extract_sync_result(out):
+    """从 claude 结果里提取结果：优先 SYNC_OK|url / SYNC_ERR|原因，散文输出做关键词容错"""
+    m = re.search(r'SYNC_OK\|\s*(\S+)', out)
+    if m:
+        return m.group(1).strip()
+    if 'SYNC_ERR|' in out:
+        m = re.search(r'SYNC_ERR\|\s*([^\n]*)', out)
+        raise ApiError(m.group(1).strip() if m and m.group(1).strip() else '归档被拒绝')
+    if '目录不存在' in out:
+        raise ApiError('目录不存在')
+    m = re.search(r'https://www\.yuque\.com/\S+', out)
+    if m:
+        return m.group(0).strip(').，,；;')
+    raise ApiError('claude 未返回文档链接：%s' % out[:150])
+
+
+def run_archive(ids):
+    """逐条归档：读模板 → 调 claude（AI 总结 + 建语雀文档）→ 写回归档状态"""
+    try:
+        with open(TEMPLATE_PATH, 'r', encoding='utf-8') as f:
+            template = f.read()
+    except Exception as e:
+        SYNC['msg'] = '读取同步模板失败：%s' % e
+        SYNC['done'] = SYNC['total']
+        return
+    succ = fail = 0
+    reasons = []
+    for pid in ids:
+        try:
+            row = db('SELECT p.*, b.nickname, b.yuque_dir FROM posts p '
+                     'LEFT JOIN bloggers b ON b.uid=p.uid WHERE p.id=?', (pid,)).fetchone()
+            if not row:
+                raise ApiError('微博不存在')
+            if not row['yuque_dir']:
+                raise ApiError('博主未配置语雀同步目录')
+            ok, out = _spawn_claude(_build_archive_prompt(row, template))
+            if not ok:
+                raise ApiError(out)
+            url = _extract_sync_result(out)
+            db('UPDATE posts SET archived=1, yuque_doc_url=?, archived_at=? WHERE id=?',
+               (url, now_str(), pid))
+            succ += 1
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            reasons.append('%s：%s' % (pid, e))
+        finally:
+            SYNC['done'] += 1
+    SYNC['msg'] = ('同步完成：成功 %d 条，失败 %d 条（%s）' % (succ, fail, '；'.join(reasons[:5]))
+                   if fail else '同步完成：成功 %d 条' % succ)
+
+
+def archive_worker():
+    """归档 worker：串行处理归档批次（单次最多 SYNC_MAX 条，ADR-0008）"""
+    while True:
+        with SYNC_COND:
+            while not SYNC_QUEUE:
+                SYNC_COND.wait()
+            ids = SYNC_QUEUE.popleft()
+        try:
+            run_archive(ids)
+        except Exception as e:  # noqa: BLE001 —— 兜底，不能卡死归档通道
+            SYNC['msg'] = '同步出错：%s' % e
+            SYNC['done'] = SYNC['total']
+
+
 def sync_worker():
     """拉取 worker：一次处理一个博主（多个 worker 并发，最多同时 2 路）"""
     while True:
@@ -723,6 +933,7 @@ def blogger_rows():
         out.append({
             'uid': r['uid'], 'nickname': r['nickname'], 'avatar': r['avatar'], 'intro': r['intro'],
             'homepage': r['homepage'] or 'https://weibo.com/u/%s' % r['uid'],
+            'yuque_dir': r['yuque_dir'],
             'state': r['state'], 'note': r['note'], 'next_page': r['next_page'],
             'last_synced_at': r['last_synced_at'], 'count': counts.get(r['uid'], 0),
             'earliest': earliest.get(r['uid']), 'latest': latest.get(r['uid']),
@@ -735,7 +946,8 @@ def api_state():
     busy = any(b['state'] in ('queued', 'fulling') for b in blogger_rows())
     return {'ok': True, 'cookie_status': cookie_status, 'cookie_set': bool(kv_get('cookie')),
             'bloggers': blogger_rows(), 'busy': busy,
-            'refresh_total': REFRESH['total'], 'refresh_done': REFRESH['done']}
+            'refresh_total': REFRESH['total'], 'refresh_done': REFRESH['done'],
+            'yuque_total': SYNC['total'], 'yuque_done': SYNC['done'], 'yuque_msg': SYNC['msg']}
 
 
 COOKIE_EXPIRED_MSG = '已保存，但这份登录信息无效或已过期：请用浏览器登录 m.weibo.cn 小号，把请求头里 Cookie: 后面那一整串复制过来'
@@ -912,6 +1124,57 @@ def api_batch_update(body):
     return {'ok': True, 'queued': len(ids)}
 
 
+def api_blogger_yuque_dir(body):
+    """设置博主语雀归档目录链接（可留空）；格式不符合给出提示"""
+    uid = str(body.get('uid') or '')
+    url = str(body.get('dir') or '').strip()
+    if not db('SELECT uid FROM bloggers WHERE uid=?', (uid,)).fetchone():
+        return {'ok': False, 'error': '博主不存在'}
+    if url and not validate_yuque_dir(url):
+        return {'ok': False, 'error': '语雀目录链接格式不对，示例：https://www.yuque.com/账号/知识库/目录'}
+    db('UPDATE bloggers SET yuque_dir=? WHERE uid=?', (url, uid))
+    return {'ok': True}
+
+
+def api_yuque_sync(body):
+    """归档勾选的微博到语雀：≤6 条、串行；预检各类失败原因并给出人话提示"""
+    ids = _clean_ids(body)
+    if not ids:
+        return {'ok': False, 'error': '没有选中要同步的微博'}
+    if SYNC['total'] > SYNC['done']:
+        return {'ok': False, 'error': '上一批同步还在进行，请稍候'}
+    rows = db('SELECT p.id, p.retweeted_json, p.archived, b.nickname, b.yuque_dir '
+              'FROM posts p LEFT JOIN bloggers b ON b.uid=p.uid '
+              'WHERE p.id IN (%s)' % ','.join('?' * len(ids)), tuple(ids)).fetchall()
+    todo, no_dir = [], set()
+    for r in rows:
+        if r['archived']:
+            continue
+        if r['retweeted_json']:
+            continue
+        if not r['yuque_dir']:
+            no_dir.add(r['nickname'] or r['uid'])
+            continue
+        todo.append(r['id'])
+    if no_dir:
+        return {'ok': False, 'error': '博主「%s」还没配置语雀同步目录，请先在左侧博主行设置' % '、'.join(sorted(no_dir))}
+    if not todo:
+        return {'ok': False, 'error': '勾选的微博都已归档或都是转发微博'}
+    if len(todo) > SYNC_MAX:
+        return {'ok': False, 'error': '单次最多同步 %d 条，当前待同步 %d 条，请减少勾选' % (SYNC_MAX, len(todo))}
+    if not find_claude():
+        return {'ok': False, 'error': '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'}
+    if not find_yuque_mcp():
+        return {'ok': False, 'error': '未配置语雀 MCP，请先用 claude mcp add 注册 yuque 服务'}
+    with SYNC_COND:
+        SYNC_QUEUE.append(todo)
+        SYNC['total'] = len(todo)
+        SYNC['done'] = 0
+        SYNC['msg'] = ''
+        SYNC_COND.notify()
+    return {'ok': True, 'queued': len(todo)}
+
+
 def api_posts(query):
     try:
         page = max(1, int(query.get('page', ['1'])[0]))
@@ -950,6 +1213,11 @@ def api_posts(query):
         where.append('p.deleted=1')
     elif st == '0':
         where.append('p.deleted=0')
+    arch = query.get('archived', [''])[0].strip()
+    if arch == '1':
+        where.append('p.archived=1')
+    elif arch == '0':
+        where.append('p.archived=0')
     w = ('WHERE ' + ' AND '.join(where)) if where else ''
     total = db('SELECT COUNT(*) c FROM posts p %s' % w, tuple(params)).fetchone()['c']
     rows = db('SELECT p.*, b.nickname, b.avatar FROM posts p '
@@ -965,6 +1233,7 @@ def api_posts(query):
             'media': json.loads(r['media_json'] or '{}'),
             'retweeted': json.loads(r['retweeted_json']) if r['retweeted_json'] else None,
             'deleted': r['deleted'],
+            'archived': r['archived'], 'yuque_doc_url': r['yuque_doc_url'],
         })
     years = [r[0] for r in db("SELECT DISTINCT strftime('%Y', created_ts, 'unixepoch') y "
                               'FROM posts ORDER BY y DESC').fetchall()]
@@ -1059,6 +1328,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_refull(body))
             elif path == '/api/cancel':
                 self._json(api_cancel(body))
+            elif path == '/api/blogger/yuque_dir':
+                self._json(api_blogger_yuque_dir(body))
+            elif path == '/api/yuque/sync':
+                self._json(api_yuque_sync(body))
             else:
                 self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:  # noqa: BLE001
@@ -1103,6 +1376,7 @@ def main():
     for _ in range(2):                                  # 最多 2 路同时拉博主
         threading.Thread(target=sync_worker, daemon=True).start()
     threading.Thread(target=refresh_worker, daemon=True).start()   # 专职批量更新通道
+    threading.Thread(target=archive_worker, daemon=True).start()   # 专职语雀归档通道
     threading.Thread(target=cookie_watcher, daemon=True).start()
 
     # pythonw 后台运行时没有控制台（stdout 为 None），print 全部丢失：日志转写到文件

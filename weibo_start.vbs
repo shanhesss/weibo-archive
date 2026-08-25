@@ -53,14 +53,28 @@ Sub StopServer()
   End If
 End Sub
 
+' 重启服务
+Sub RestartServer()
+  Dim objWMIService, col, p
+  Set objWMIService = GetObject("winmgmts:\\.\root\cimv2")
+  Set col = objWMIService.ExecQuery("SELECT ProcessId,CommandLine FROM Win32_Process WHERE Name='pythonw.exe' OR Name='python.exe'")
+  For Each p In col
+    If IsServerProcess(p.CommandLine) Then p.Terminate()
+  Next
+  WScript.Sleep 1500
+  StartServer
+End Sub
+
 ' 弹菜单
 Dim choice
-choice = InputBox("微博存档工具" & vbCrLf & vbCrLf & "输入 1：启动服务" & vbCrLf & "输入 2：关闭服务", "微博存档", "1")
+choice = InputBox("微博存档工具" & vbCrLf & vbCrLf & "输入 1：启动服务" & vbCrLf & "输入 2：关闭服务" & vbCrLf & "输入 3：重启服务", "微博存档", "1")
 If choice = "" Then WScript.Quit
 If choice = "1" Then
   StartServer
 ElseIf choice = "2" Then
   StopServer
+ElseIf choice = "3" Then
+  RestartServer
 Else
-  MsgBox "无效输入，请输入 1 或 2。", vbExclamation, "微博存档"
+  MsgBox "无效输入，请输入 1、2 或 3。", vbExclamation, "微博存档"
 End If

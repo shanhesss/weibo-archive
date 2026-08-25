@@ -177,5 +177,48 @@ ev = ws.STOP.setdefault('1234567890', ws.threading.Event())
 ev.clear()
 ws.db("UPDATE bloggers SET state='paused', next_page=NULL WHERE uid='1234567890'")
 
+# 18. 语雀归档：目录链接格式校验
+check('目录格式 账号/库/目录', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb/ddd') == ('aaa', 'bbb', 'ddd'))
+check('目录格式 多层路径', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb/1/2/ddd') == ('aaa', 'bbb', '1/2/ddd'))
+check('目录格式 仅知识库', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb') == ('aaa', 'bbb', ''))
+check('目录格式 非法协议', ws.validate_yuque_dir('http://yuque.com/aaa/bbb') is None)
+check('目录格式 缺知识库', ws.validate_yuque_dir('https://www.yuque.com/aaa') is None)
+check('目录格式 中文目录名', ws.validate_yuque_dir('https://www.yuque.com/shanhesss/study/其他') == ('shanhesss', 'study', '其他'))
+check('目录格式 空格拒收', ws.validate_yuque_dir('https://www.yuque.com/aaa/bb b') is None)
+
+# 19. 博主语雀目录设置
+r = ws.api_blogger_yuque_dir({'uid': '1234567890', 'dir': 'https://www.yuque.com/aaa/bbb/ddd'})
+check('设置目录成功', r['ok'] is True)
+r = ws.api_blogger_yuque_dir({'uid': '1234567890', 'dir': 'not-a-url'})
+check('非法目录拒绝', r['ok'] is False)
+check('blogger_rows 带 yuque_dir', ws.blogger_rows()[0]['yuque_dir'] == 'https://www.yuque.com/aaa/bbb/ddd')
+
+# 20. 归档预检与入队
+check('归档空ids拒绝', ws.api_yuque_sync({'ids': []})['ok'] is False)
+ws.db("INSERT INTO posts(id,uid,bid,text,created_ts,media_json,retweeted_json,raw_json,fetched_at) "
+      "VALUES('a4','1234567890','a4','普通微博',%d,'{}','','{}','2026-08-19 00:00:00')" % (t - 50))
+ws.api_blogger_yuque_dir({'uid': '1234567890', 'dir': ''})
+r = ws.api_yuque_sync({'ids': ['a4']})
+check('未配目录报博主', r['ok'] is False and '博主' in r['error'])
+ws.api_blogger_yuque_dir({'uid': '1234567890', 'dir': 'https://www.yuque.com/aaa/bbb/ddd'})
+r = ws.api_yuque_sync({'ids': ['a2']})
+check('转发微博不可归档', r['ok'] is False)
+r = ws.api_yuque_sync({'ids': ['a4']})
+check('单条归档入队', r['ok'] is True and r['queued'] == 1)
+check('归档队列1条', len(ws.SYNC_QUEUE) == 1)
+ws.SYNC_QUEUE.clear()
+ws.SYNC['total'] = 0
+ws.SYNC['done'] = 0
+ws.SYNC['msg'] = ''
+
+# 21. 归档筛选 + 状态字段
+ws.db("UPDATE posts SET archived=1, yuque_doc_url='https://www.yuque.com/aaa/bbb/doc' WHERE id='a4'")
+check('已归档筛选1条', q({'archived': '1'})['total'] == 1)
+check('未归档筛选1条(a2未归档)', q({'archived': '0'})['total'] == 1)
+r = q({'page': '1'})
+it = {i['id']: i for i in r['items']}
+check('返回归档字段', it['a4']['archived'] == 1 and it['a4']['yuque_doc_url'].endswith('/doc'))
+check('state 带归档进度', ws.api_state()['yuque_total'] == 0)
+
 print('---- RESULT: %s ----' % ('ALL PASS' if ok else 'HAS FAILURES'))
 sys.exit(0 if ok else 1)

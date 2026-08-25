@@ -5,7 +5,7 @@ a = Analysis(
     ['weibo_server.py'],
     pathex=[],
     binaries=[],
-    datas=[('weibo_web.html', '.')],
+    datas=[('weibo_web.html', '.'), ('yuque-sync-template.md', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

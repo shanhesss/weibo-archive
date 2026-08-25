@@ -9,6 +9,7 @@
   :root{
     --bg:#f5f6f7; --card:#fff; --line:#e5e6eb; --txt:#1f2329; --sub:#86909c;
     --blue:#1d9bf0; --green:#67c23a; --amber:#e6a23c; --red:#f56c6c; --grey:#c0c4cc;
+    --yuque:#00b96b;
   }
   *{box-sizing:border-box; margin:0; padding:0;}
   html,body{height:100%;}
@@ -132,6 +133,26 @@
   .p-who{font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   .p-time{color:var(--sub); font-size:12px; flex:none;}
   .p-src{margin-left:auto; font-size:12px; flex:none;}
+  .yuque-btn{flex:none; font-size:12px; padding:1px 8px; background:var(--yuque); border-color:var(--yuque);}
+  button.mini.yuque-btn{color:#fff;}
+  button.mini.yuque-btn:hover{opacity:.88; color:#fff;}
+  button.mini.yuque-btn[disabled]{opacity:.5; cursor:not-allowed; background:var(--grey); border-color:var(--grey); color:#fff;}
+  button.mini.yuque-btn.yq-off{background:var(--grey); border-color:var(--grey); color:#fff; cursor:pointer;}
+  button.mini.yuque-btn.yq-off:hover{opacity:.88; color:#fff;}
+  .yuque-ok{flex:none; color:var(--yuque); font-size:12px; margin-left:4px; cursor:pointer;}
+  .b-yuque{color:var(--sub); font-size:12px; margin-top:2px; display:flex; align-items:center; gap:6px; min-width:0;}
+  .b-yuque .yq-ok{color:var(--yuque); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;}
+  .b-yuque .none{color:var(--amber); white-space:nowrap;}
+  .b-yuque .yq-edit{flex:none; padding:1px 6px;}
+  .btn-yuque{background:var(--yuque); border-color:var(--yuque);}
+  button.mini.btn-yuque{color:#fff;}
+  button.mini.btn-yuque:hover{opacity:.88; color:#fff;}
+  #yuqueEdit{flex:none; display:none; align-items:center; gap:8px; margin-bottom:8px; padding:8px 12px;
+             background:var(--card); border:1px solid var(--line); border-radius:8px; flex-wrap:wrap;}
+  #yuqueEdit.show{display:flex;}
+  #yuqueEdit .lbl{color:var(--sub); font-size:13px; flex:none;}
+  #yuqueEdit input{flex:1; min-width:280px;}
+  #yuqueEdit .hint{color:var(--red); font-size:12px; flex-basis:100%;}
   .p-text{flex:1 1 auto; min-height:44px; overflow-y:auto; white-space:pre-wrap;
           word-break:break-word; font-size:13px; margin-top:3px; padding-right:4px;}
       /* flex:1 撑满剩余空间（纯文字微博不留白）；图片微博由图片区弹性占位，正文不再被压出滚动条 */
@@ -227,6 +248,14 @@
   </aside>
 
   <main>
+    <div id="yuqueEdit">
+      <span class="lbl" id="yuqueEditLabel"></span>
+      <input type="text" id="yuqueEditInput" placeholder="https://www.yuque.com/账号/知识库/目录">
+      <button id="yuqueEditSave" class="mini btn-yuque">保存</button>
+      <button id="yuqueEditClear" class="mini">清空</button>
+      <button id="yuqueEditCancel" class="mini">取消</button>
+      <span class="hint" id="yuqueEditHint"></span>
+    </div>
     <div id="filters">
       <input type="text" id="kw" placeholder="搜索关键词">
       <select id="yearSel"><option value="">全部年份</option></select>
@@ -244,6 +273,11 @@
         <option value="0">正常</option>
         <option value="1">已删除</option>
       </select>
+      <select id="archSel">
+        <option value="">全部归档</option>
+        <option value="0">未归档</option>
+        <option value="1">已归档</option>
+      </select>
       <button id="clearF" class="mini">清空筛选</button>
       <div id="pager"></div>
       <span id="total"></span>
@@ -253,7 +287,9 @@
       <button id="selAllFilter" class="mini">全选当前筛选结果</button>
       <span id="selCount">已选 0 条</span>
       <span id="refreshHint"></span>
+      <span id="yuqueHint"></span>
       <span style="flex:1"></span>
+      <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀（单次最多 6 条）">同步到语雀</button>
       <button id="batchUpdate" class="mini primary">批量更新</button>
       <button id="batchDelete" class="mini danger">批量删除</button>
       <button id="selClear" class="mini">清空选择</button>
@@ -289,6 +325,8 @@ var selMode = 'manual';           // 勾选模式：manual 逐条 / all 全选�
 var selManual = {};               // 手动勾选的 id
 var selAllIds = [];               // 全选模式下获取的全部匹配 id
 var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
+var syncingIds = [];              // 正在归档的微博 id（用于按钮「同步中…」）
+var prevYuqueBusy = false;        // 归档批次是否在进行中，用于完成检测
 
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
@@ -343,6 +381,20 @@ function richText(t){                 // 正文：普通文本转义，微博表
       return esc(p);
     }).join('');
 }
+function syncBtnHtml(p){
+  if(p.archived){
+    return p.yuque_doc_url
+      ? '<a class="yuque-ok" href="'+esc(p.yuque_doc_url)+'" target="_blank" title="已同步到语雀，点击打开">已归档</a>'
+      : '<span class="yuque-ok">已归档</span>';
+  }
+  if(p.retweeted){
+    return '<button class="mini yuque-btn yq-off" data-rt="1" title="转发微博不支持同步">同步</button>';
+  }
+  if(syncingIds.indexOf(p.id) >= 0){
+    return '<button class="mini yuque-btn" disabled>同步中…</button>';
+  }
+  return '<button class="mini yuque-btn" data-sync="'+esc(p.id)+'" title="AI 总结后同步到语雀">同步</button>';
+}
 function copyId(id, ev){
   if(ev) ev.stopPropagation();
   copyText(id);
@@ -389,6 +441,13 @@ function stateLabel(s){
   return {idle:'未开始', queued:'排队中', fulling:'拉取中', paused:'已暂停',
           done:'已完成', error:'出错了'}[s] || s;
 }
+function yuqueDirLine(b){
+  return '<div class="b-yuque">'
+    + (b.yuque_dir
+        ? '<span class="yq-ok" title="'+esc(b.yuque_dir)+'">语雀已设置</span>'
+        : '<span class="none">未设置语雀目录</span>')
+    + '<button class="mini yq-edit" data-act="yuque-edit" data-uid="'+esc(b.uid)+'" title="设置/修改语雀同步目录链接">设置</button></div>';
+}
 function bloggerButtons(b){
   var btns = '';
   if(b.state === 'queued' || b.state === 'fulling'){
@@ -418,7 +477,7 @@ function renderBloggers(list){
       + '<button class="b-del" data-act="del" data-uid="'+esc(b.uid)+'" title="删除博主及其全部微博数据">⚠ 删除</button>'
       + '</div>';
     var noteCls = (b.state==='error') ? ' bad' : ((b.state==='paused') ? ' warn' : '');
-    html += '<div class="b-item'+(selUid===b.uid?' sel':'')+'" data-uid="'+esc(b.uid)+'">'
+    html += '<div class="b-item'+(selUid===b.uid?' sel':'')+'" data-uid="'+esc(b.uid)+'" data-dir="'+esc(b.yuque_dir||'')+'">'
       + av
       + '<div class="b-main">'
       +   '<div class="b-top"><span class="light '+b.state+'"></span>'
@@ -428,6 +487,7 @@ function renderBloggers(list){
         + (b.latest ? ' · 最新 ' + fmtDateShort(b.latest) : '') + '</div>' : '')
       +   '<div class="b-note'+noteCls+'">'+esc(b.note || stateLabel(b.state))
       +     (b.last_synced_at ? ' · 上次同步 '+esc(b.last_synced_at.slice(5,16)) : '')+'</div>'
+      +   yuqueDirLine(b)
       +   '<div class="b-btns">'+bloggerButtons(b)+'</div>'
       + '</div></div>';
   }
@@ -458,6 +518,10 @@ $('bloggerList').addEventListener('click', function(e){
       copyText(btn.dataset.home);
       toast('已复制主页链接');
     }
+    else if(act === 'yuque-edit'){
+      var bItem = btn.closest('.b-item');
+      openYuqueEdit(uid, bItem.querySelector('.b-name').textContent, bItem.dataset.dir || '');
+    }
     else if(act === 'del'){
       var name = btn.closest('.b-item').querySelector('.b-name').textContent;
       showModal('删除博主「' + name + '」？\n\n将删除该博主及其全部微博数据，删除后无法恢复。', [
@@ -479,6 +543,43 @@ $('bloggerList').addEventListener('click', function(e){
     loadState(); loadPosts();
   }
 });
+/* ── 语雀目录编辑（主区全宽，链接完整可看）── */
+var YUQUE_URL_RX = /^https:\/\/www\.yuque\.com\/[^\s/?#]+\/[^\s/?#]+(?:\/[^\s/?#]+)*\/?$/;
+function openYuqueEdit(uid, nickname, dir){
+  $('yuqueEdit').dataset.uid = uid;
+  $('yuqueEditLabel').textContent = '博主「' + nickname + '」的语雀同步目录';
+  $('yuqueEditInput').value = dir;
+  $('yuqueEditHint').textContent = '';
+  $('yuqueEdit').classList.add('show');
+  $('yuqueEditInput').focus();
+}
+$('yuqueEditSave').onclick = function(){
+  var val = $('yuqueEditInput').value.trim();
+  var uid = $('yuqueEdit').dataset.uid;
+  if(val && !YUQUE_URL_RX.test(val)){
+    $('yuqueEditHint').textContent = '链接格式不对，示例：https://www.yuque.com/账号/知识库/目录';
+    return;
+  }
+  $('yuqueEditHint').textContent = '';
+  post('/api/blogger/yuque_dir', {uid: uid, dir: val}).then(function(r){
+    if(!r.ok){ showAlert(r.error); return; }
+    $('yuqueEdit').classList.remove('show');
+    toast(val ? '已设置语雀同步目录' : '已清空语雀同步目录');
+    loadState();
+  });
+};
+$('yuqueEditClear').onclick = function(){
+  var uid = $('yuqueEdit').dataset.uid;
+  post('/api/blogger/yuque_dir', {uid: uid, dir: ''}).then(function(r){
+    if(!r.ok){ showAlert(r.error); return; }
+    $('yuqueEdit').classList.remove('show');
+    toast('已清空语雀同步目录');
+    loadState();
+  });
+};
+$('yuqueEditCancel').onclick = function(){
+  $('yuqueEdit').classList.remove('show');
+};
 
 /* ── 添加博主 ─────────────────────────────── */
 $('addBtn').onclick = function(){
@@ -538,7 +639,8 @@ function syncSelection(){
   var chks = document.querySelectorAll('.chk');
   for(var i=0;i<chks.length;i++) chks[i].checked = ids.has(chks[i].dataset.id);
   $('selCount').textContent = '已选 ' + ids.size + ' 条';
-  $('batchBar').classList.toggle('show', ids.size > 0 || $('refreshHint').textContent !== '');
+  $('batchBar').classList.toggle('show', ids.size > 0
+    || $('refreshHint').textContent !== '' || $('yuqueHint').textContent !== '');
 }
 $('grid').addEventListener('change', function(e){
   var cb = e.target.closest('.chk');
@@ -554,6 +656,18 @@ $('grid').addEventListener('change', function(e){
     delete selManual[id];
   }
   syncSelection();
+});
+$('grid').addEventListener('click', function(e){
+  if(e.target.closest('[data-rt]')){ showAlert('转发微博不支持同步'); return; }
+  var btn = e.target.closest('[data-sync]');
+  if(!btn) return;
+  var id = btn.dataset.sync;
+  post('/api/yuque/sync', {ids: [id]}).then(function(r){
+    if(!r.ok){ showAlert(r.error); return; }
+    syncingIds = [id];
+    toast('已开始归档，正在 AI 总结并同步到语雀');
+    loadPosts(); loadState();
+  });
 });
 $('selAllPage').onclick = function(){
   var chks = document.querySelectorAll('.chk');
@@ -601,6 +715,16 @@ $('batchUpdate').onclick = function(){
     {text:'取消', cls:'', fn: null}
   ]);
 };
+$('batchYuque').onclick = function(){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  post('/api/yuque/sync', {ids: ids}).then(function(r){
+    if(!r.ok){ showAlert(r.error); return; }
+    syncingIds = ids;
+    toast('已加入同步队列（' + r.queued + ' 条，后台逐条归档）');
+    loadPosts(); loadState();
+  });
+};
 
 /* ── 确认弹窗 ─────────────────────────────── */
 function showModal(msg, buttons){
@@ -618,6 +742,9 @@ function showModal(msg, buttons){
   $('modal').classList.add('show');
 }
 function hideModal(){ $('modal').classList.remove('show'); }
+function showAlert(msg){                    // 居中醒目提示（单按钮确认）
+  showModal(msg, [{text:'知道了', cls:'primary', fn:null}]);
+}
 $('modal').onclick = function(e){ if(e.target === $('modal')) hideModal(); };
 
 /* ── 状态轮询 ─────────────────────────────── */
@@ -643,7 +770,16 @@ function loadState(){
     prevUpdating = updating;
     $('refreshHint').textContent = updating
       ? '更新中：已更新 ' + rd + ' 条 / 待更新 ' + (rt - rd) + ' 条' : '';
-    if(!updating) syncSelection();
+    var yt = st.yuque_total || 0, yd = st.yuque_done || 0;
+    var ybusy = yt > yd;
+    if(prevYuqueBusy && !ybusy && yt > 0){                 // 归档批次完成 → 提示结果并刷新卡片
+      if(st.yuque_msg) toast(st.yuque_msg);
+      syncingIds = [];
+      loadPosts();
+    }
+    prevYuqueBusy = ybusy;
+    $('yuqueHint').textContent = ybusy ? '归档中：已归档 ' + yd + ' / ' + yt : '';
+    if(!updating && !ybusy) syncSelection();
   });
 }
 
@@ -656,7 +792,8 @@ function postsQuery(page, allIds){
         + ($('yearSel').value ? '&year=' + $('yearSel').value : '')
         + ($('from').value ? '&from=' + $('from').value : '')
         + ($('to').value ? '&to=' + $('to').value : '')
-        + ($('statusSel').value ? '&deleted=' + $('statusSel').value : '');
+        + ($('statusSel').value ? '&deleted=' + $('statusSel').value : '')
+        + ($('archSel').value ? '&archived=' + $('archSel').value : '');
   return q;
 }
 function loadPosts(){
@@ -725,6 +862,7 @@ function renderPosts(r){
       +   (p.avatar ? '<img src="'+esc(imgProxy(thumbUrl(p.avatar)))+'" onerror="this.style.visibility=\'hidden\'">' : '')
       +   '<span class="p-who">'+esc(p.nickname)+'</span>'
       +   '<span class="p-time">'+fmtTime(p.created_ts)+'</span>'
+      +   syncBtnHtml(p)
       +   '<a class="p-src" href="https://m.weibo.cn/detail/'+esc(p.bid)+'" target="_blank">原文</a>'
       + '</div>'
       + delBadge + '<div class="p-text">'+richText(p.text)+rt+'</div>'
@@ -892,6 +1030,7 @@ $('yearSel').addEventListener('change', resetAndLoad);
 $('from').addEventListener('change', resetAndLoad);
 $('to').addEventListener('change', resetAndLoad);
 $('statusSel').addEventListener('change', resetAndLoad);
+$('archSel').addEventListener('change', resetAndLoad);
 $('clearF').onclick = function(){
   $('kw').value = '';
   $('yearSel').value = '';
@@ -899,6 +1038,7 @@ $('clearF').onclick = function(){
   $('from').value = '';
   $('to').value = '';
   $('statusSel').value = '';
+  $('archSel').value = '';
   resetAndLoad();
 };
 
