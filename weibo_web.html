@@ -55,7 +55,7 @@
 
   /* ── 主体两栏 ─────────────────────────── */
   #layout{flex:1; display:flex; min-height:0;}
-  aside{width:264px; flex:none; background:var(--card); border-right:1px solid var(--line);
+  aside{width:288px; flex:none; background:var(--card); border-right:1px solid var(--line);
         padding:14px; display:flex; flex-direction:column; gap:10px; min-height:0;}
   aside h2{font-size:13px; color:var(--sub); font-weight:400;}
   #addRow{display:flex; gap:6px;}
@@ -69,21 +69,28 @@
   #previewCard .p-btns{display:flex; gap:6px;}
   #bloggerList{flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px;}
   .b-all{padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:600;}
-  .b-item{padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:8px;}
+  .b-item{padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:10px;}
   .b-item:hover,.b-all:hover{background:var(--bg);}
   .b-item.sel,.b-all.sel{background:#e8f4fd;}
   .b-item img{width:38px; height:38px; border-radius:50%; object-fit:cover; flex:none;}
-  .b-av{display:flex; flex-direction:column; align-items:center; gap:3px; flex:none;}
+  .b-av{display:flex; flex-direction:column; align-items:center; gap:4px; flex:none; padding-top:2px;}
+  .b-av .light{width:38px; height:38px; border-radius:50%;}
   .b-home{font-size:11px; color:var(--sub); background:none; border:none; padding:0;
           cursor:pointer; line-height:1.2;}
   .b-home:hover{color:var(--blue);}
-  .b-del{font-size:11px; color:#fff; background:var(--red); border:none; border-radius:4px;
-         padding:1px 6px; cursor:pointer; line-height:1.5; white-space:nowrap;}
-  .b-del:hover{opacity:.85;}
+  .b-count{font-size:11px; color:var(--sub); line-height:1.2; text-align:center;}
+  .b-count b{font-size:15px; font-weight:700; color:var(--txt); margin-right:1px;}
+  .b-order{display:flex; gap:3px; flex:none;}
+  button.mini.b-mv{padding:0 5px; font-size:10px; line-height:1.3; color:var(--sub);}
+  button.mini.b-mv:hover{color:var(--blue); border-color:var(--blue);}
+  button.mini.b-mv[disabled]{opacity:.35; cursor:default;}
+  button.mini.b-mv[disabled]:hover{color:var(--sub); border-color:var(--line);}
+  .b-del{font-size:11px; color:#d04333; background:#fdf0ef; border:1px solid #f3d2cd;
+         border-radius:4px; padding:1px 7px; cursor:pointer; line-height:1.5; white-space:nowrap;}
+  .b-del:hover{background:#fbe2df; color:#b33424;}
   .b-main{flex:1; min-width:0;}
   .b-top{display:flex; align-items:center; gap:6px;}
   .b-name{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
-  .b-count{color:var(--sub); font-size:12px;}
   .light{width:8px; height:8px; border-radius:50%; flex:none; background:var(--grey);}
   .light.queued{background:var(--amber);}
   .light.fulling{background:var(--blue); animation:pulse 1s infinite;}
@@ -92,7 +99,7 @@
   .light.error{background:var(--red);}
   @keyframes pulse{50%{opacity:.25;}}
   .b-note{color:var(--sub); font-size:12px; line-height:1.4; margin-top:1px;}
-  .b-early{color:var(--sub); font-size:12px; margin-top:1px;}
+  .b-early{color:var(--sub); font-size:12px; margin-top:1px; white-space:nowrap;}
   .b-note.warn{color:var(--amber);}
   .b-note.bad{color:var(--red);}
   .b-btns{display:flex; gap:4px; margin-top:4px; flex-wrap:wrap;}
@@ -216,6 +223,28 @@
   #modalMsg{font-size:14px; line-height:1.7; margin-bottom:16px; white-space:pre-wrap;}
   #modalBtns{display:flex; gap:10px; justify-content:flex-end;}
 
+  /* ── 拉取范围弹窗（添加/重拉共用）───────── */
+  #refullModal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
+               align-items:center; justify-content:center; z-index:99;}
+  #refullModal.show{display:flex;}
+  #refullBox{background:#fff; border-radius:12px; padding:20px 22px; width:400px;
+             max-width:92vw; box-shadow:0 10px 40px rgba(0,0,0,.22);}
+  #refullTitle{font-size:16px; font-weight:600; margin-bottom:8px;}
+  #refullDesc{font-size:13px; color:var(--sub); line-height:1.7; margin-bottom:16px;}
+  #refullDesc b{color:var(--txt); font-weight:600;}
+  .rf-label{font-size:13px; color:var(--sub); margin-bottom:6px;}
+  #refullDate{width:100%; padding:8px 10px; font-size:14px;}
+  .rf-chips{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
+  .rf-chips button{padding:4px 14px; font-size:12px; border-radius:999px;
+                   border:1px solid var(--line); background:#fff; color:var(--sub); cursor:pointer;}
+  .rf-chips button:hover{border-color:var(--blue); color:var(--blue);}
+  .rf-chips button.active{background:#e8f3fd; border-color:var(--blue); color:var(--blue); font-weight:600;}
+  #refullPreview{margin-top:14px; padding:10px 12px; background:var(--bg); border-radius:8px;
+                 font-size:13px; line-height:1.8;}
+  #refullPreview .big{color:var(--txt); font-weight:600;}
+  #refullPreview .warn{color:var(--amber);}
+  #refullBtns{display:flex; gap:10px; justify-content:flex-end; margin-top:18px;}
+
   /* ── 轻提示 ───────────────────────────── */
   #toast{position:fixed; left:50%; bottom:36px; transform:translateX(-50%);
          background:rgba(31,35,41,.92); color:#fff; border-radius:8px; padding:8px 18px;
@@ -327,6 +356,23 @@
   </div>
 </div>
 <div id="modal"><div id="modalBox"><div id="modalMsg"></div><div id="modalBtns"></div></div></div>
+<div id="refullModal"><div id="refullBox">
+  <div id="refullTitle"></div>
+  <div id="refullDesc"></div>
+  <div class="rf-label">起始日期（拉取这一天 → 今天）</div>
+  <input type="date" id="refullDate">
+  <div class="rf-chips" id="refullChips">
+    <button type="button" data-days="all">最早至今</button>
+    <button type="button" data-days="365">近一年</button>
+    <button type="button" data-days="180">近半年</button>
+    <button type="button" data-days="90">近三月</button>
+  </div>
+  <div id="refullPreview"></div>
+  <div id="refullBtns">
+    <button id="refullOk" class="primary">开始重拉</button>
+    <button id="refullCancel">取消</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 
 <script>
@@ -342,6 +388,8 @@ var selManual = {};               // 手动勾选的 id
 var selAllIds = [];               // 全选模式下获取的全部匹配 id
 var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
 var prevYuqueBusy = false;        // 归档批次是否在进行中，用于完成检测
+var rfMeta = {};                  // uid -> {earliest, nickname}，重拉全量弹窗预填起始日期用
+var WEIBO_LAUNCH = new Date(2009, 7, 28);   // 微博上线日，作为"最早"兜底
 
 function esc(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
@@ -370,6 +418,13 @@ function fmtDateShort(ts){        // 时间戳 → YYYY-MM-DD
   if(!ts) return '';
   var d = new Date(ts * 1000), p = function(n){ return ('0'+n).slice(-2); };
   return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate());
+}
+function fmtDateInput(d){         // Date → YYYY-MM-DD（date 输入框取值/赋值用）
+  var p = function(n){ return ('0'+n).slice(-2); };
+  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate());
+}
+function fmtDateCN(d){            // Date → 2024年1月1日
+  return d.getFullYear() + '年' + (d.getMonth()+1) + '月' + d.getDate() + '日';
 }
 function toast(msg){
   var t = $('toast');
@@ -492,12 +547,20 @@ function bloggerButtons(b){
 }
 function renderBloggers(list){
   var html = '<div class="b-all'+(selUid===''?' sel':'')+'" data-uid="">📋 全部微博</div>';
+  rfMeta = {};
   for(var i=0;i<list.length;i++){
     var b = list[i];
+    rfMeta[b.uid] = {earliest: b.earliest, nickname: b.nickname};
+    var first = i === 0, last = i === list.length - 1;
     var av = '<div class="b-av">'
       + (b.avatar ? '<img src="'+esc(imgProxy(thumbUrl(b.avatar)))+'" onerror="this.style.visibility=\'hidden\'">'
                   : '<div class="light"></div>')
       + '<button class="b-home" data-act="home" data-uid="'+esc(b.uid)+'" data-home="'+esc(b.homepage)+'">复制主页</button>'
+      + '<div class="b-count" title="微博总数"><b>'+b.count+'</b>条</div>'
+      + '<div class="b-order">'
+      +   '<button class="mini b-mv" data-act="move" data-dir="up" data-uid="'+esc(b.uid)+'" title="上移"'+(first?' disabled':'')+'>▲</button>'
+      +   '<button class="mini b-mv" data-act="move" data-dir="down" data-uid="'+esc(b.uid)+'" title="下移"'+(last?' disabled':'')+'>▼</button>'
+      + '</div>'
       + '<button class="b-del" data-act="del" data-uid="'+esc(b.uid)+'" title="删除博主及其全部微博数据">⚠ 删除</button>'
       + '</div>';
     var noteCls = (b.state==='error') ? ' bad' : ((b.state==='paused') ? ' warn' : '');
@@ -505,10 +568,9 @@ function renderBloggers(list){
       + av
       + '<div class="b-main">'
       +   '<div class="b-top"><span class="light '+b.state+'"></span>'
-      +     '<span class="b-name">'+esc(b.nickname)+'</span>'
-      +     '<span class="b-count">'+b.count+'条</span></div>'
-      +   (b.earliest ? '<div class="b-early">最早 ' + fmtDateShort(b.earliest)
-        + (b.latest ? ' · 最新 ' + fmtDateShort(b.latest) : '') + '</div>' : '')
+      +     '<span class="b-name">'+esc(b.nickname)+'</span></div>'
+      +   (b.earliest ? '<div class="b-early" title="微博时间范围">'+fmtDateShort(b.earliest)
+        + (b.latest && b.latest !== b.earliest ? ' ~ '+fmtDateShort(b.latest) : '')+'</div>' : '')
       +   '<div class="b-note'+noteCls+'">'+esc(b.note || stateLabel(b.state))
       +     (b.last_synced_at ? ' · 上次同步 '+esc(b.last_synced_at.slice(5,16)) : '')+'</div>'
       +   yuqueDirLine(b)
@@ -521,22 +583,27 @@ $('bloggerList').addEventListener('click', function(e){
   var btn = e.target.closest('button');
   if(btn){
     var uid = btn.dataset.uid, act = btn.dataset.act;
-    if(act === 'pause') post('/api/pause', {uid: uid}).then(loadState);
+    if(act === 'move') post('/api/blogger/move', {uid: uid, dir: btn.dataset.dir}).then(function(r){
+      if(!r.ok) toast(r.error);
+      loadState();
+    });
+    else if(act === 'pause') post('/api/pause', {uid: uid}).then(loadState);
     else if(act === 'cancel') post('/api/cancel', {uid: uid}).then(loadState);
     else if(act === 'sync') post('/api/sync', {uid: uid}).then(function(r){
       if(!r.ok) toast(r.error); loadState();
     });
     else if(act === 'refull'){
       var name = btn.closest('.b-item').querySelector('.b-name').textContent;
-      showModal('重拉全量「' + name + '」：将从第一条重新全量拉取并覆盖（不删除数据），拉到底后把微博上已删除的博文标记为【博主已删除】。可能需要较长时间，可随时暂停。', [
-        {text:'开始重拉', cls:'primary', fn: function(){
-          post('/api/refull', {uid: uid}).then(function(r){
+      var meta = rfMeta[uid] || {};
+      openPullRange('重拉全量「' + name + '」',
+        '选择从哪一天开始重新拉取：工具会重新拉取所选日期到今天的全部微博并刷新数据，<b>所选日期之前的微博保持不动</b>。拉取完成后，微博上已删除的博文会被标记。',
+        meta.earliest,
+        function(start){
+          post('/api/refull', {uid: uid, start: start}).then(function(r){
             if(!r.ok) toast(r.error);
             loadState();
           });
-        }},
-        {text:'取消', cls:'', fn: null}
-      ]);
+        });
     }
     else if(act === 'home'){
       copyText(btn.dataset.home);
@@ -621,7 +688,7 @@ $('addBtn').onclick = function(){
     $('pvName').textContent = r.profile.nickname;
     $('pvIntro').textContent = r.profile.intro || '这个博主没有简介';
     $('pvAdd').disabled = !!r.profile.exists;
-    $('pvAdd').textContent = r.profile.exists ? '已在列表中' : '添加并拉取全部';
+    $('pvAdd').textContent = r.profile.exists ? '已在列表中' : '添加并拉取';
     $('previewCard').classList.add('show');
     $('previewCard').dataset.input = input;
   });
@@ -629,14 +696,21 @@ $('addBtn').onclick = function(){
 $('addInput').addEventListener('keydown', function(e){ if(e.key === 'Enter') $('addBtn').click(); });
 $('pvCancel').onclick = function(){ $('previewCard').classList.remove('show'); };
 $('pvAdd').onclick = function(){
-  post('/api/blogger/add', {input: $('previewCard').dataset.input}).then(function(r){
-    if(r.ok){
-      $('previewCard').classList.remove('show');
-      $('addInput').value = '';
-      toast('已添加，开始拉取全部历史（后台慢慢跑，可以关掉页面）');
-      loadState();
-    }else showAddMsg(r.error, true);
-  });
+  var input = $('previewCard').dataset.input;
+  var name = $('pvName').textContent;
+  openPullRange('添加「' + name + '」并拉取',
+    '选择从哪一天开始拉取：工具会拉取所选日期到今天的新微博并入队，后台慢慢跑，可以关掉页面。',
+    0,
+    function(start){
+      post('/api/blogger/add', {input: input, start: start}).then(function(r){
+        if(r.ok){
+          $('previewCard').classList.remove('show');
+          $('addInput').value = '';
+          toast('已添加，开始拉取所选范围（后台慢慢跑，可以关掉页面）');
+          loadState();
+        }else showAddMsg(r.error, true);
+      });
+    }, '添加并拉取');
 };
 function showAddMsg(msg, bad){
   var el = $('addMsg');
@@ -788,6 +862,75 @@ function showAlert(msg){                    // 居中醒目提示（单按钮确
   showModal(msg, [{text:'知道了', cls:'primary', fn:null}]);
 }
 $('modal').onclick = function(e){ if(e.target === $('modal')) hideModal(); };
+
+/* ── 拉取范围弹窗（添加博主 / 重拉全量共用，选择起始日期）───── */
+var pullRange = {earliest: 0, onOk: null};   // 当前弹窗：起始日期默认值 + 确认回调
+function rfDefaultStart(){                   // 默认起始：最早一条微博的日期，否则微博上线日
+  return pullRange.earliest ? new Date(pullRange.earliest * 1000) : new Date(WEIBO_LAUNCH.getTime());
+}
+function rfMidnight(d){ var x = new Date(d); x.setHours(0,0,0,0); return x; }
+function updateRefullPreview(){
+  var v = $('refullDate').value, box = $('refullPreview');
+  if(!v){ box.innerHTML = '<span class="warn">请选择起始日期</span>'; return; }
+  var d = rfMidnight(new Date(v + 'T00:00:00'));
+  var today = rfMidnight(new Date());
+  var days = Math.round((today - d) / 864e5);
+  if(days < 0){ box.innerHTML = '<span class="warn">起始日期不能晚于今天</span>'; return; }
+  var span = '';
+  if(days >= 365){
+    var y = Math.floor(days/365), m = Math.floor((days%365)/30);
+    span = '，跨度约 ' + y + ' 年' + (m ? ' ' + m + ' 个月' : '');
+  } else if(days >= 30){
+    span = '，跨度约 ' + Math.floor(days/30) + ' 个月';
+  } else if(days > 0){
+    span = '，跨度约 ' + days + ' 天';
+  }
+  box.innerHTML = '将拉取 <span class="big">' + fmtDateCN(d) + '</span> → <span class="big">今天</span> 的全部微博' + span;
+  var earliest = rfMidnight(rfDefaultStart());
+  var chips = $('refullChips').querySelectorAll('button');
+  for(var i=0;i<chips.length;i++){
+    var c = chips[i], active = false;
+    if(c.dataset.days === 'all') active = (d.getTime() === earliest.getTime());
+    else{
+      var target = new Date(today.getTime() - parseInt(c.dataset.days,10)*864e5);
+      target.setHours(0,0,0,0);
+      active = (d.getTime() === target.getTime());
+    }
+    c.classList.toggle('active', active);
+  }
+}
+function openPullRange(title, desc, earliest, onOk, confirmText){
+  pullRange = {earliest: earliest || 0, onOk: onOk};
+  $('refullTitle').textContent = title;
+  $('refullDesc').innerHTML = desc;
+  $('refullOk').textContent = confirmText || '开始重拉';
+  var today = new Date(), dateEl = $('refullDate');
+  dateEl.max = fmtDateInput(today);
+  dateEl.min = fmtDateInput(WEIBO_LAUNCH);
+  dateEl.value = fmtDateInput(rfDefaultStart());
+  updateRefullPreview();
+  $('refullModal').classList.add('show');
+}
+$('refullChips').addEventListener('click', function(e){
+  var btn = e.target.closest('button');
+  if(!btn) return;
+  var today = rfMidnight(new Date()), d;
+  if(btn.dataset.days === 'all') d = rfMidnight(rfDefaultStart());
+  else{ d = new Date(today.getTime() - parseInt(btn.dataset.days,10)*864e5); d.setHours(0,0,0,0); }
+  $('refullDate').value = fmtDateInput(d);
+  updateRefullPreview();
+});
+$('refullDate').addEventListener('change', updateRefullPreview);
+$('refullOk').onclick = function(){
+  var v = $('refullDate').value;
+  if(!v) v = fmtDateInput(rfDefaultStart());
+  $('refullModal').classList.remove('show');
+  var cb = pullRange.onOk;
+  pullRange = {earliest: 0, onOk: null};
+  if(cb) cb(v);
+};
+$('refullCancel').onclick = function(){ $('refullModal').classList.remove('show'); };
+$('refullModal').onclick = function(e){ if(e.target === $('refullModal')) $('refullModal').classList.remove('show'); };
 
 /* ── 状态轮询 ─────────────────────────────── */
 function renderTaskHints(updating, rd, rt, ybusy, yd, yt){

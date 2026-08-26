@@ -142,6 +142,16 @@ check('重拉全量不存在拒绝', r['ok'] is False)
 # 博主主页（无 homepage 时按 uid 推导）
 check('主页链接推导', ws.blogger_rows()[0]['homepage'] == 'https://weibo.com/u/1234567890')
 
+# 13b. 重拉全量可选起始日期（新交互：选择起始日期，范围=所选日期→今天）
+pf_exp = int(ws.datetime.datetime.strptime('2024-01-01', '%Y-%m-%d').timestamp())
+r = ws.api_refull({'uid': '1234567890', 'start': '2024-01-01'})
+check('重拉全量带起始日期入队', r['ok'] is True)
+check('pull_from 落库', ws.db("SELECT pull_from FROM bloggers WHERE uid='1234567890'").fetchone()['pull_from'] == pf_exp)
+ws.api_cancel({'uid': '1234567890'})
+check('取消清空 pull_from', ws.db("SELECT pull_from FROM bloggers WHERE uid='1234567890'").fetchone()['pull_from'] == 0)
+check('非法起始日期拒绝', ws.api_refull({'uid': '1234567890', 'start': '昨天'})['ok'] is False)
+check('未来起始日期拒绝', ws.api_refull({'uid': '1234567890', 'start': '2099-01-01'})['ok'] is False)
+
 # 14. 已删除筛选
 ws.db("UPDATE posts SET deleted=0")
 ws.db("UPDATE posts SET deleted=1 WHERE id='a2'")
@@ -251,6 +261,111 @@ check('待归档筛选1条', q({'arch': 'pending'})['total'] == 1)
 check('无需归档剩1条', q({'arch': 'skip'})['total'] == 1)
 r = ws.api_yuque_mark({'ids': [], 'to': 'skip'})
 check('mark 空ids拒绝', r['ok'] is False)
+
+# 25. 添加博主带起始日期 + 博主排序 + 转发自动标「无需归档」
+ws.fetch_profile = lambda session, uid: {'uid': uid, 'nickname': '新博主' + uid, 'avatar': '', 'intro': ''}
+pf_add = int(ws.datetime.datetime.strptime('2024-06-01', '%Y-%m-%d').timestamp())
+check('添加未来日期拒绝', ws.api_add({'input': '888999', 'start': '2099-01-01'})['ok'] is False)
+check('添加非法日期拒绝', ws.api_add({'input': '888999', 'start': '昨天'})['ok'] is False)
+r = ws.api_add({'input': '777888', 'start': '2024-06-01'})
+check('添加带起始日期入队', r['ok'] is True)
+check('添加起始日期落库', ws.db("SELECT pull_from FROM bloggers WHERE uid='777888'").fetchone()['pull_from'] == pf_add)
+check('新博主排最后', ws.blogger_rows()[-1]['uid'] == '777888')
+# 上移：777888 与 1234567890 换位
+r = ws.api_blogger_move({'uid': '777888', 'dir': 'up'})
+check('上移成功', r['ok'] is True and [x['uid'] for x in ws.blogger_rows()] == ['777888', '1234567890'])
+# 最前的再上移应保持不动
+r = ws.api_blogger_move({'uid': '777888', 'dir': 'up'})
+check('最前上移无变化', [x['uid'] for x in ws.blogger_rows()] == ['777888', '1234567890'])
+check('移动方向校验', ws.api_blogger_move({'uid': '777888', 'dir': 'left'})['ok'] is False)
+check('移动不存在博主', ws.api_blogger_move({'uid': '0', 'dir': 'up'})['ok'] is False)
+# 转发微博拉取 → 自动标「无需归档」
+import json as _json
+rt_mb = {'id': 'rt_auto', 'bid': 'rt_auto', 'text': '转发测试',
+         'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+         'reposts_count': 0, 'comments_count': 0, 'attitudes_count': 0,
+         'retweeted_status': {'user': {'screen_name': '原博主'}, 'text': '原文',
+                              'created_at': '2026-08-19 00:00:00'}}
+ws.upsert_post(None, '777888', rt_mb)
+row = ws.db("SELECT arch_skip, retweeted_json FROM posts WHERE id='rt_auto'").fetchone()
+check('转发自动标无需归档', row['arch_skip'] == 1 and _json.loads(row['retweeted_json'])['nickname'] == '原博主')
+# 普通微博不误标
+ws.upsert_post(None, '777888', {'id': 'nrt_1', 'bid': 'nrt_1', 'text': '普通微博',
+                                'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'reposts_count': 0, 'comments_count': 0, 'attitudes_count': 0})
+check('普通微博不误标', ws.db("SELECT arch_skip FROM posts WHERE id='nrt_1'").fetchone()['arch_skip'] == 0)
+
+# 26. 已有长微博增量刷新不再补拉全文（避免每次增量都为整页长微博白等）
+ws.time.sleep = lambda s: None
+called = {'n': 0}
+ws.fetch_post_detail = lambda session, pid: called.__setitem__('n', called['n'] + 1) or {}
+ws.db("INSERT INTO posts(id,uid,bid,text,created_ts,deleted) "
+      "VALUES('long_exist','777888','le','旧正文',%d,0)" % (t - 100))
+r = ws.upsert_post(None, '777888', {'id': 'long_exist', 'bid': 'long_exist', 'text': '列表正文',
+                                    'isLongText': True,
+                                    'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                    'reposts_count': 5, 'comments_count': 2, 'attitudes_count': 1})
+check('已有长微博不补拉全文', called['n'] == 0 and r == 'update')
+check('已有长微博计数已刷新', ws.db("SELECT reposts FROM posts WHERE id='long_exist'").fetchone()['reposts'] == 5)
+called['n'] = 0
+ws.fetch_post_detail = lambda session, pid: called.__setitem__('n', called['n'] + 1) or {'id': pid, 'text': '完整长文'}
+r = ws.upsert_post(None, '777888', {'id': 'long_new', 'bid': 'long_new', 'text': '列表截断',
+                                    'isLongText': True,
+                                    'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                    'reposts_count': 0, 'comments_count': 0, 'attitudes_count': 0})
+check('新长微博仍补拉全文', called['n'] == 1)
+
+# 27. 重拉全量·选起始日期：范围停止 + 范围外博文不动（打桩直跑 run_sync，不发网络）
+ws.MSession = lambda: None
+ws.random.uniform = lambda a, b: 0.1
+def _ts(y, m, d):
+    return int(ws.datetime.datetime(y, m, d).timestamp())
+def _mb(pid, ts, pinned=False):
+    d = {'id': pid, 'bid': pid, 'text': '微博' + pid,
+         'created_at': time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)),
+         'reposts_count': 0, 'comments_count': 0, 'attitudes_count': 0}
+    if pinned:
+        d['isTop'] = True
+    return d
+def _post(id_):
+    return ws.db("SELECT * FROM posts WHERE id=?", (id_,)).fetchone()
+def _run_range(pages, start_ts, pre_old_ts, pre_gone_ts):
+    ws.fetch_page = lambda session, uid, page: pages.get(page, [])
+    ws.db("INSERT INTO bloggers(uid,nickname,state,next_page,pull_from,note,created_at) "
+          "VALUES('99001','范围测试','idle',1,?,'','2026-08-19 00:00:00')", (start_ts,))
+    ws.db("INSERT INTO posts(id,uid,bid,text,created_ts,deleted) VALUES('r_old','99001','x','旧',?,0)",
+          (_ts(*pre_old_ts),))
+    ws.db("INSERT INTO posts(id,uid,bid,text,created_ts,deleted) VALUES('r_gone','99001','x','表',?,0)",
+          (_ts(*pre_gone_ts),))
+    ws.run_sync('99001', 'full')
+    b = ws.db("SELECT state, next_page, pull_from, note FROM bloggers WHERE uid='99001'").fetchone()
+    return b
+# 选起始 2024-01-01：翻到比它更早的非置顶博文就停
+b = _run_range(
+    {1: [_mb('r0', _ts(2020, 1, 1), pinned=True), _mb('r1', _ts(2025, 12, 31)), _mb('r2', _ts(2025, 6, 1))],
+     2: [_mb('r3', _ts(2024, 6, 15)), _mb('r4', _ts(2024, 1, 2)), _mb('r5', _ts(2023, 12, 31))]},
+    _ts(2024, 1, 1), (2023, 6, 1), (2025, 3, 1))
+check('范围内博文全部入库', all(_post(p) for p in ('r0', 'r1', 'r2', 'r3', 'r4')))
+check('更早博文不入库', _post('r5') is None)
+check('置顶旧博文也入库', _post('r0') is not None)
+check('范围外更早博文不动', _post('r_old')['deleted'] == 0)
+check('范围内已删博文被标记', _post('r_gone')['deleted'] == 1)
+check('范围任务完成并清场', b['state'] == 'done' and b['next_page'] is None and b['pull_from'] == 0)
+check('完成说明含起始日期', '2024-01-01' in b['note'])
+ws.db("DELETE FROM bloggers WHERE uid='99001'")
+ws.db("DELETE FROM posts WHERE uid='99001'")
+ws.db("DELETE FROM pull_seen WHERE uid='99001'")
+# 不选起始（pull_from=0）：老行为，范围外更早博文一并标记删除
+b = _run_range(
+    {1: [_mb('q1', _ts(2025, 12, 31)), _mb('q2', _ts(2025, 6, 1))],
+     2: [_mb('q3', _ts(2024, 6, 15))]},
+    0, (2023, 6, 1), (2025, 3, 1))
+check('无起始→更早博文也标记删除', _post('r_old')['deleted'] == 1)
+check('无起始→范围内已删标记', _post('r_gone')['deleted'] == 1)
+ws.db("DELETE FROM bloggers WHERE uid='99001'")
+ws.db("DELETE FROM posts WHERE uid='99001'")
+ws.db("DELETE FROM pull_seen WHERE uid='99001'")
+check('新长微博落库完整正文', ws.db("SELECT text FROM posts WHERE id='long_new'").fetchone()['text'] == '完整长文')
 
 print('---- RESULT: %s ----' % ('ALL PASS' if ok else 'HAS FAILURES'))
 sys.exit(0 if ok else 1)

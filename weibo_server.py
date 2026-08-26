@@ -101,6 +101,8 @@ def init_db():
       yuque_dir TEXT DEFAULT '',      -- 语雀归档目录链接（可为空，ADR-0008）
       state TEXT DEFAULT 'idle',
       next_page INTEGER,              -- 全量拉取的断点页码（NULL=没有未完成的全量）
+      pull_from INTEGER DEFAULT 0,    -- 重拉全量的起始时间戳（0=从头拉到底；暂停续拉时保持）
+      sort_order INTEGER DEFAULT 0,   -- 博主列表排序序号（1 起，可上下移动）
       note TEXT DEFAULT '',           -- 人话进度/错误说明，直接展示给用户
       last_synced_at TEXT,
       created_at TEXT);
@@ -135,6 +137,8 @@ def init_db():
     # 旧库迁移：补列（新库直接建表已含）
     for table, col, decl in (('bloggers', 'homepage', "TEXT DEFAULT ''"),
                              ('bloggers', 'yuque_dir', "TEXT DEFAULT ''"),
+                             ('bloggers', 'pull_from', 'INTEGER DEFAULT 0'),
+                             ('bloggers', 'sort_order', 'INTEGER DEFAULT 0'),
                              ('posts', 'deleted', 'INTEGER DEFAULT 0'),
                              ('posts', 'archived', 'INTEGER DEFAULT 0'),
                              ('posts', 'yuque_doc_url', "TEXT DEFAULT ''"),
@@ -145,6 +149,12 @@ def init_db():
         cols = [r[1] for r in CONN.execute('PRAGMA table_info(%s)' % table).fetchall()]
         if col not in cols:
             CONN.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
+    # 老库补博主排序序号（按添加时间），保证 sort_order 连续不重复
+    if any(r['c'] for r in CONN.execute(
+            'SELECT COUNT(*) c FROM bloggers WHERE sort_order=0').fetchall()):
+        for k, r in enumerate(CONN.execute(
+                'SELECT uid FROM bloggers ORDER BY created_at, rowid').fetchall(), 1):
+            CONN.execute('UPDATE bloggers SET sort_order=? WHERE uid=?', (k, r[0]))
     CONN.commit()
 
 
@@ -467,7 +477,8 @@ def upsert_post(session, uid, mb, force=False, full=False):
         return 'skip'
     existing = db('SELECT id FROM posts WHERE id=?', (pid,)).fetchone()
     text_html = mb.get('text') or ''
-    if not full:
+    if not full and not existing:
+        # 只有新博文才补拉全文；已存在的博文只刷新计数，不重拉正文，避免每次增量都为整页长微博白等 5~8 秒
         is_long = bool(mb.get('isLongText')) or ('全文' in text_html and '</a>' in text_html)
         if is_long:
             time.sleep(random.uniform(*DETAIL_SLEEP))
@@ -487,17 +498,22 @@ def upsert_post(session, uid, mb, force=False, full=False):
         db('UPDATE posts SET text=?, media_json=?, retweeted_json=?, raw_json=?, '
            'reposts=?, comments=?, atts=?, counts_updated_at=?, fetched_at=?, deleted=0 WHERE id=?',
            (text, media, rt, raw, reposts, comments, atts, now_str(), now_str(), pid))
-        return 'update'
-    if existing:
+        res = 'update'
+    elif existing:
         db('UPDATE posts SET reposts=?, comments=?, atts=?, counts_updated_at=?, deleted=0 WHERE id=?',
            (reposts, comments, atts, now_str(), pid))
-        return 'update'
-    db('INSERT INTO posts(id,uid,bid,text,created_ts,created_raw,reposts,comments,atts,'
-       'media_json,retweeted_json,raw_json,fetched_at,counts_updated_at,deleted) '
-       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)',
-       (pid, uid, mb.get('bid') or pid, text, parse_time(mb.get('created_at')),
-        mb.get('created_at') or '', reposts, comments, atts, media, rt, raw, now_str(), now_str()))
-    return 'insert'
+        res = 'update'
+    else:
+        db('INSERT INTO posts(id,uid,bid,text,created_ts,created_raw,reposts,comments,atts,'
+           'media_json,retweeted_json,raw_json,fetched_at,counts_updated_at,deleted) '
+           'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)',
+           (pid, uid, mb.get('bid') or pid, text, parse_time(mb.get('created_at')),
+            mb.get('created_at') or '', reposts, comments, atts, media, rt, raw, now_str(), now_str()))
+        res = 'insert'
+    if rt:                # 转发微博不支持归档 → 拉取时直接标「无需归档」
+        db("UPDATE posts SET arch_skip=1, archived=0, arch_fail='', arch_state='', yuque_doc_url='' "
+           "WHERE id=?", (pid,))
+    return res
 
 
 def mark_cookie_expired():
@@ -509,22 +525,29 @@ def run_sync(uid, mode):
     ev = STOP.setdefault(uid, threading.Event())
     ev.clear()
     total = db('SELECT COUNT(*) c FROM posts WHERE uid=?', (uid,)).fetchone()['c']
+    start_ts = 0
     if mode == 'full':
-        row = db('SELECT next_page FROM bloggers WHERE uid=?', (uid,)).fetchone()
+        row = db('SELECT next_page, pull_from FROM bloggers WHERE uid=?', (uid,)).fetchone()
         page = (row['next_page'] if row and row['next_page'] else 1) or 1
+        start_ts = (row['pull_from'] if row and row['pull_from'] else 0) or 0
         label = '全量拉取'
     else:
         page = 1
         label = '增量拉取'
+    start_label = ''
+    if start_ts:
+        start_label = datetime.date.fromtimestamp(start_ts).strftime('%Y-%m-%d')
+    start_hint = ('（从 %s 起）' % start_label) if start_label else ''
     try:
         session = MSession()
     except CookieExpired:
         mark_cookie_expired()
         set_blogger(uid, state='paused', note='还没有填写登录信息，填写后会自动继续')
         return
-    set_blogger(uid, state='fulling', note='%s准备中' % label)
+    set_blogger(uid, state='fulling', note='%s%s准备中' % (label, start_hint))
     inserted = updated = 0
     full_mode = mode == 'full'
+    range_done = False                # 全量范围停止：翻到比所选起始时间更早的博文（置顶除外）
     if full_mode and page == 1:      # 全新全量：清空"已见"清单；断点续爬（page>1）不清，避免误判
         db('DELETE FROM pull_seen WHERE uid=?', (uid,))
 
@@ -535,16 +558,16 @@ def run_sync(uid, mode):
         """用户点了暂停或取消：取消→done 保留数据丢弃断点；暂停→paused 保留断点"""
         if uid in CANCEL:
             CANCEL.discard(uid)
-            set_blogger(uid, state='done', next_page=None,
+            set_blogger(uid, state='done', next_page=None, pull_from=0,
                         note='已取消，保留已拉取数据', last_synced_at=now_str())
         else:
-            set_blogger(uid, state='paused', note='%s已暂停，点击继续接着拉' % label,
+            set_blogger(uid, state='paused', note='%s%s已暂停，点击继续接着拉' % (label, start_hint),
                         next_page=mode == 'full' and page or None)
         revert_deleted()
 
     def save_progress(p, extra=''):
         set_blogger(uid, next_page=mode == 'full' and p or None,
-                    note='%s · 第%d页 · 新增%d条' % (label, p - 1, inserted) + extra)
+                    note='%s%s · 第%d页 · 新增%d条' % (label, start_hint, p - 1, inserted) + extra)
 
     while True:
         if ev.is_set():
@@ -600,16 +623,25 @@ def run_sync(uid, mode):
             revert_deleted()
             return
 
-        if not mblogs:
-            if full_mode:            # 拉到底：本次从未见到的博文确认已删除（pull_seen 清单）
-                db('UPDATE posts SET deleted=1 WHERE uid=? AND id NOT IN '
-                   '(SELECT id FROM pull_seen WHERE uid=?)', (uid, uid))
+        if not mblogs or range_done:
+            if full_mode:            # 拉完：本次范围内从未见到的博文确认已删除（pull_seen 清单）
+                if start_ts:         # 范围外（更早）的博文保持不动，不参与删除判定
+                    db('UPDATE posts SET deleted=1 WHERE uid=? AND created_ts>=? AND id NOT IN '
+                       '(SELECT id FROM pull_seen WHERE uid=?)', (uid, start_ts, uid))
+                else:
+                    db('UPDATE posts SET deleted=1 WHERE uid=? AND id NOT IN '
+                       '(SELECT id FROM pull_seen WHERE uid=?)', (uid, uid))
             ndel = db('SELECT COUNT(*) c FROM posts WHERE uid=? AND deleted=1',
                       (uid,)).fetchone()['c']
-            note = '%s完成，翻到底了' % label
+            if full_mode:
+                note = '全量拉取完成' + (start_label
+                       and '，已从 %s 拉取到今天；更早的微博保持不动' % start_label or '，翻到底了')
+            else:
+                note = '%s完成，翻到底了' % label
             if full_mode and ndel:
                 note += '，%d条已标记为博主已删除' % ndel
-            set_blogger(uid, state='done', next_page=None, note=note, last_synced_at=now_str())
+            set_blogger(uid, state='done', next_page=None, pull_from=0,
+                        note=note, last_synced_at=now_str())
             return
 
         hit_existing = False       # 增量停止条件：本页出现库中已有的非置顶微博
@@ -617,6 +649,10 @@ def run_sync(uid, mode):
             if ev.is_set():
                 finish_paused()
                 return
+            if full_mode and start_ts and not is_pinned(mb):
+                if parse_time(mb.get('created_at')) < start_ts:
+                    range_done = True
+                    break
             pid_mb = str(mb.get('id') or '')
             if pid_mb and full_mode:
                 db('INSERT OR IGNORE INTO pull_seen(uid,id) VALUES(?,?)', (uid, pid_mb))
@@ -954,7 +990,7 @@ def blogger_rows():
     counts = {r['uid']: r['c'] for r in db('SELECT uid, COUNT(*) c FROM posts GROUP BY uid').fetchall()}
     earliest = {r['uid']: r['t'] for r in db('SELECT uid, MIN(created_ts) t FROM posts GROUP BY uid').fetchall()}
     latest = {r['uid']: r['t'] for r in db('SELECT uid, MAX(created_ts) t FROM posts GROUP BY uid').fetchall()}
-    rows = db('SELECT * FROM bloggers ORDER BY created_at').fetchall()
+    rows = db('SELECT * FROM bloggers ORDER BY sort_order, created_at, rowid').fetchall()
     out = []
     for r in rows:
         out.append({
@@ -1036,6 +1072,15 @@ def api_add(body):
         return {'ok': False, 'error': '没认出这是哪位博主，请粘贴主页链接（形如 weibo.com/u/一串数字）'}
     if db('SELECT uid FROM bloggers WHERE uid=?', (uid,)).fetchone():
         return {'ok': False, 'error': '这位博主已经在列表里了'}
+    start = (body.get('start') or '').strip()
+    start_ts = 0
+    if start:
+        try:
+            start_ts = int(datetime.datetime.strptime(start, '%Y-%m-%d').timestamp())
+        except ValueError:
+            return {'ok': False, 'error': '起始日期格式不对，示例：2024-01-01'}
+        if start_ts > time.time():
+            return {'ok': False, 'error': '起始日期不能是未来'}
     try:
         profile = fetch_profile(MSession(), uid)
     except CookieExpired:
@@ -1046,11 +1091,32 @@ def api_add(body):
     except ApiError as e:
         return {'ok': False, 'error': str(e)}
     kv_set('cookie_status', 'ok')
-    db('INSERT INTO bloggers(uid,nickname,avatar,intro,homepage,state,note,created_at) '
-       'VALUES(?,?,?,?,?,?,?,?)',
+    sort_order = db('SELECT COALESCE(MAX(sort_order),0)+1 s FROM bloggers').fetchone()['s']
+    db('INSERT INTO bloggers(uid,nickname,avatar,intro,homepage,state,note,created_at,sort_order,pull_from) '
+       'VALUES(?,?,?,?,?,?,?,?,?,?)',
        (uid, profile['nickname'], profile['avatar'], profile['intro'],
-        'https://weibo.com/u/%s' % uid, 'idle', '已添加，准备开始拉取全部历史', now_str()))
+        'https://weibo.com/u/%s' % uid, 'idle', '已添加，准备开始拉取', now_str(), sort_order, start_ts))
     enqueue(uid, 'full')
+    return {'ok': True}
+
+
+def api_blogger_move(body):
+    """上下移动博主在列表中的顺序"""
+    uid = str(body.get('uid') or '')
+    d = body.get('dir')
+    if d not in ('up', 'down'):
+        return {'ok': False, 'error': '移动方向不对'}
+    ids = [r['uid'] for r in db(
+        'SELECT uid FROM bloggers ORDER BY sort_order, created_at, rowid').fetchall()]
+    if uid not in ids:
+        return {'ok': False, 'error': '博主不存在'}
+    i = ids.index(uid)
+    j = i - 1 if d == 'up' else i + 1
+    if j < 0 or j >= len(ids):
+        return {'ok': True}                          # 已在最前/最后，无需移动
+    ids[i], ids[j] = ids[j], ids[i]
+    for k, u in enumerate(ids):                      # 重排序号，保证连续不重复
+        db('UPDATE bloggers SET sort_order=? WHERE uid=?', (k + 1, u))
     return {'ok': True}
 
 
@@ -1065,14 +1131,23 @@ def api_sync(body):
 
 
 def api_refull(body):
-    """重拉全量：从头全量重拉并覆盖；不删数据，拉到底后标记微博已删的博文（ADR-0007）"""
+    """重拉全量：从头（或所选起始日期起）全量重拉并覆盖；不删数据，范围内微博已删的标记（ADR-0007）"""
     uid = str(body.get('uid') or '')
     row = db('SELECT state FROM bloggers WHERE uid=?', (uid,)).fetchone()
     if not row:
         return {'ok': False, 'error': '博主不存在'}
     if row['state'] in ('queued', 'fulling'):
         return {'ok': False, 'error': '正在拉取中，请稍候'}
-    set_blogger(uid, next_page=1)              # 从头开始
+    start = (body.get('start') or '').strip()
+    start_ts = 0
+    if start:
+        try:
+            start_ts = int(datetime.datetime.strptime(start, '%Y-%m-%d').timestamp())
+        except ValueError:
+            return {'ok': False, 'error': '起始日期格式不对，示例：2024-01-01'}
+        if start_ts > time.time():
+            return {'ok': False, 'error': '起始日期不能是未来'}
+    set_blogger(uid, next_page=1, pull_from=start_ts)   # 从头（或所选日期）开始
     enqueue(uid, 'full')
     return {'ok': True}
 
@@ -1098,7 +1173,7 @@ def api_cancel(body):
         for i, (u, _) in enumerate(TASKQ):
             if u == uid:
                 del TASKQ[i]
-                set_blogger(uid, state='done', next_page=None, note='已取消')
+                set_blogger(uid, state='done', next_page=None, pull_from=0, note='已取消')
                 break
         else:
             CANCEL.add(uid)
@@ -1382,6 +1457,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_pause(body))
             elif path == '/api/blogger/delete':
                 self._json(api_delete(body))
+            elif path == '/api/blogger/move':
+                self._json(api_blogger_move(body))
             elif path == '/api/batch/delete':
                 self._json(api_batch_delete(body))
             elif path == '/api/batch/update':
