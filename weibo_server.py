@@ -875,12 +875,15 @@ def _build_archive_prompt(row, template, update_doc_url=None):
             '4. 不要重复调用 yuque_update_doc；不要调用 get_doc / get_toc / 任何其他 yuque 工具。\n'
             % (folder_desc))
     else:
-        target = '语雀目录链接：%s（账号 %s，知识库 %s，文档要放进目录 %s）' % (
+        target = '语雀目标节点链接：%s（账号 %s，知识库 %s，文档要放进目标节点 %s）' % (
             row['yuque_dir'], acc, book, folder_desc)
         steps = (
-            '1. 调用 yuque_get_toc 查看该知识库的目录树，确认目标目录节点是否存在。\n'
-            '2. 如果目标目录不存在，最终输出 SYNC_ERR|目录不存在，不要创建任何内容。\n'
-            '3. 如果目录存在，调用 yuque_create_doc 创建文档（标题按模板）；若该工具无法指定目录，创建后用 yuque_update_toc 把文档移到目标目录节点下。\n')
+            '1. 调用 yuque_get_toc 查看该知识库的目录树，按 slug 匹配目标节点是否存在。'
+            '目标节点是「目录」还是普通「文档」都算有效，不用纠结节点类型。\n'
+            '2. 如果 TOC 里完全找不到这个 slug 的节点，最终输出 SYNC_ERR|目录不存在，不要创建任何内容。\n'
+            '3. 调用 yuque_create_doc 创建文档（标题按模板）。'
+            '如果目标节点是真正的目录（TITLE 节点），创建后用 yuque_update_toc 把文档移到该目录下；'
+            '如果目标节点是普通文档（不能当目录），直接创建即可，跳过移动。\n')
     return (
         '你是一个「微博 → 语雀归档」助手。把下面这条微博按模板格式总结并同步到语雀。\n\n'
         '【目标】%s\n'
@@ -1379,6 +1382,10 @@ def api_posts(query):
     elif arch == 'skip':
         where.append('p.arch_skip=1')
     w = ('WHERE ' + ' AND '.join(where)) if where else ''
+    wid = query.get('id', [''])[0].strip()
+    if wid:                              # 微博ID直达：忽略其他筛选，精确匹配状态id或bid
+        w = 'WHERE (p.id=? OR lower(p.bid)=lower(?))'
+        params = [wid, wid]
     total = db('SELECT COUNT(*) c FROM posts p %s' % w, tuple(params)).fetchone()['c']
     rows = db('SELECT p.*, b.nickname, b.avatar FROM posts p '
               'LEFT JOIN bloggers b ON b.uid=p.uid %s '

@@ -115,7 +115,7 @@
   main{flex:1; min-width:0; min-height:0; display:flex; flex-direction:column;
        padding:10px 14px 12px; overflow:hidden;}
   #filters{flex:none; display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;}
-  #kw{width:170px;}
+  #kw{width:200px;}
   #total{color:var(--sub); font-size:13px;}
 
   /* ── 翻页条（与筛选同一行，位于总数左边）── */
@@ -310,7 +310,7 @@
       <span class="hint" id="yuqueEditHint"></span>
     </div>
     <div id="filters">
-      <input type="text" id="kw" placeholder="搜索关键词">
+      <input type="text" id="kw" placeholder="搜索关键词，或粘贴微博ID/链接直达" autocomplete="off" spellcheck="false">
       <select id="yearSel"><option value="">全部年份</option></select>
       <select id="presetSel">
         <option value="">快捷时间</option>
@@ -468,7 +468,9 @@ function syncBtnHtml(p){
   if(p.arch_state === 'updating') return '<button class="mini yuque-btn" disabled>更新中…</button>';
   if(p.archived){
     var s = p.arch_fail
-      ? '<span class="arch-st warn" title="'+esc(p.arch_fail)+'">更新失败</span>'
+      ? (p.yuque_doc_url
+          ? '<a class="arch-st warn" href="'+esc(p.yuque_doc_url)+'" target="_blank" title="'+esc(p.arch_fail)+'（点击打开语雀文档）">更新失败</a>'
+          : '<span class="arch-st warn" title="'+esc(p.arch_fail)+'">更新失败</span>')
       : (p.yuque_doc_url
           ? '<a class="yuque-ok" href="'+esc(p.yuque_doc_url)+'" target="_blank" title="已同步到语雀，点击打开">已归档</a>'
           : '<span class="yuque-ok">已归档</span>');
@@ -1021,17 +1023,29 @@ function loadState(){
 }
 
 /* ── 查询与卡片网格 ───────────────────────── */
+function looksLikeWeiboId(s){
+  s = (s || '').trim();
+  if(!s) return '';
+  if(/^https?:\/\//i.test(s)){                       // 微博链接 → 取路径最后一段
+    var m = s.match(/^https?:\/\/[^/?#\s]+\/(?:[^/?#\s]+\/)*([^/?#\s]+)/i);
+    return m ? m[1].trim() : '';
+  }
+  var tok = s.split(/[\s,，;；]+/)[0].trim();         // 一长串纯数字 → 当微博ID
+  if(/^\d{14,}$/.test(tok)) return tok;
+  return '';
+}
 function postsQuery(page, allIds){
-  var q = '/api/posts?page=' + page + '&page_size=6'
-        + (allIds ? '&all_ids=1' : '')
+  var kw = $('kw').value.trim(), idTok = looksLikeWeiboId(kw);
+  var q = '/api/posts?page=' + page + '&page_size=6' + (allIds ? '&all_ids=1' : '');
+  if(idTok) return q + '&id=' + encodeURIComponent(idTok);   // 粘贴微博ID/链接 → 按ID直达
+  if(kw) q += '&kw=' + encodeURIComponent(kw);
+  return q
         + (selUid ? '&uid=' + encodeURIComponent(selUid) : '')
-        + ($('kw').value.trim() ? '&kw=' + encodeURIComponent($('kw').value.trim()) : '')
         + ($('yearSel').value ? '&year=' + $('yearSel').value : '')
         + ($('from').value ? '&from=' + $('from').value : '')
         + ($('to').value ? '&to=' + $('to').value : '')
         + ($('statusSel').value ? '&deleted=' + $('statusSel').value : '')
         + ($('archSel').value ? '&arch=' + $('archSel').value : '');
-  return q;
 }
 function loadPosts(){
   fetch(postsQuery(curPage, false)).then(function(r){ return r.json(); }).then(renderPosts);
@@ -1055,7 +1069,9 @@ function renderPosts(r){
     grid.innerHTML = '';
     empty.innerHTML = (document.querySelectorAll('.b-item').length === 0)
       ? '<div class="big">还没有添加博主</div>在左侧粘贴博主主页链接，添加后自动开始拉取全部历史微博'
-      : '<div class="big">没有符合条件的微博</div>换个关键词或放宽日期范围试试';
+      : (looksLikeWeiboId($('kw').value)
+          ? '<div class="big">库里没有这条微博</div>检查ID是否完整，或直接粘贴微博链接再试'
+          : '<div class="big">没有符合条件的微博</div>换个关键词或放宽日期范围试试');
     empty.classList.add('show');
     renderPager(1, 1);
     syncSelection();
