@@ -1130,6 +1130,30 @@ def api_sync(body):
     return {'ok': True}
 
 
+def api_sync_all(body):
+    """一键为全部博主拉取新微博：逐个入队（有未完成全量的续拉，否则增量）；
+    已在拉取/排队的自动跳过；返回本次实际启动的博主清单，供前端跟踪批量进度"""
+    rows = db('SELECT uid FROM bloggers ORDER BY sort_order, created_at, rowid').fetchall()
+    if not rows:
+        return {'ok': False, 'error': '还没有添加博主，先添加一位再拉取'}
+    if not kv_get('cookie'):
+        return {'ok': False, 'error': '还没有填写登录信息，请先在页面顶部粘贴'}
+    started, skipped = [], 0
+    for r in rows:
+        row = db('SELECT state, next_page FROM bloggers WHERE uid=?', (r['uid'],)).fetchone()
+        if row['state'] in ('queued', 'fulling'):
+            skipped += 1
+            continue
+        enqueue(r['uid'], 'full' if row['next_page'] else 'incr')
+        started.append(r['uid'])
+    if not started:
+        return {'ok': False, 'error': '所有博主都在拉取中，稍后再点'}
+    msg = '已开始为 %d 位博主拉取新微博' % len(started)
+    if skipped:
+        msg += '，%d 位正在拉取已跳过' % skipped
+    return {'ok': True, 'total': len(started), 'started': started, 'skipped': skipped, 'message': msg}
+
+
 def api_refull(body):
     """重拉全量：从头（或所选起始日期起）全量重拉并覆盖；不删数据，范围内微博已删的标记（ADR-0007）"""
     uid = str(body.get('uid') or '')
@@ -1453,6 +1477,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_add(body))
             elif path == '/api/sync':
                 self._json(api_sync(body))
+            elif path == '/api/sync_all':
+                self._json(api_sync_all(body))
             elif path == '/api/pause':
                 self._json(api_pause(body))
             elif path == '/api/blogger/delete':

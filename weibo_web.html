@@ -68,7 +68,15 @@
                         overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   #previewCard .p-btns{display:flex; gap:6px;}
   #bloggerList{flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:4px;}
-  .b-all{padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:600;}
+  .b-all{padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:600;
+         display:flex; align-items:center; gap:8px;}
+  .b-all-txt{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .b-all .b-all-sync{flex:none; padding:1px 12px; font-size:12px; line-height:1.8; border-radius:6px;
+                     background:var(--green); border-color:var(--green); color:#fff;
+                     font-weight:600; cursor:pointer; white-space:nowrap;}
+  .b-all .b-all-sync:hover{opacity:.88; color:#fff; border-color:var(--green);}
+  .b-all .b-all-sync:disabled{opacity:.5; cursor:default;}
+  .b-all .b-all-sync:disabled:hover{opacity:.5; color:#fff; border-color:var(--green);}
   .b-item{padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:10px;}
   .b-item:hover,.b-all:hover{background:var(--bg);}
   .b-item.sel,.b-all.sel{background:#e8f4fd;}
@@ -285,7 +293,10 @@
     </div>
     <h2 style="margin-top:8px;">我的博主</h2>
     <div id="bloggerList">
-      <div class="b-all sel" data-uid="">📋 全部微博</div>
+      <div class="b-all sel" data-uid="">
+        <span class="b-all-txt">📋 全部微博</span>
+        <button class="b-all-sync" data-act="sync-all" title="为所有博主拉取最新微博，正在拉取的会自动跳过">拉取新的</button>
+      </div>
     </div>
   </aside>
 
@@ -380,6 +391,7 @@
 var $ = function(id){ return document.getElementById(id); };
 var selUid = '';                  // 当前筛选的博主（空 = 全部）
 var prevState = {};               // 上次轮询时的博主状态，用于检测「拉取完成」
+var batchPull = null;             // 一键全部拉取：本次实际启动的博主清单，用于进度与完成提示
 var curPage = 1, curPages = 1, kwTimer = null;
 var lbList = [], lbIdx = 0;       // 灯箱图片列表与当前索引
 var lbMap = {};                   // 微博 id -> 图片 URL 列表（渲染时填充）
@@ -546,7 +558,13 @@ function bloggerButtons(b){
   return btns;
 }
 function renderBloggers(list){
-  var html = '<div class="b-all'+(selUid===''?' sel':'')+'" data-uid="">📋 全部微博</div>';
+  var bSyncing = !!(batchPull && batchPull.total > 0);
+  var html = '<div class="b-all'+(selUid===''?' sel':'')+'" data-uid="">'
+    + '<span class="b-all-txt">📋 全部微博</span>'
+    + '<button class="b-all-sync" data-act="sync-all"'+(bSyncing?' disabled':'')
+    + ' title="为所有博主拉取最新微博，正在拉取的会自动跳过">'
+    + (bSyncing ? '拉取中…' : '拉取新的') + '</button>'
+    + '</div>';
   rfMeta = {};
   for(var i=0;i<list.length;i++){
     var b = list[i];
@@ -591,6 +609,14 @@ $('bloggerList').addEventListener('click', function(e){
     else if(act === 'cancel') post('/api/cancel', {uid: uid}).then(loadState);
     else if(act === 'sync') post('/api/sync', {uid: uid}).then(function(r){
       if(!r.ok) toast(r.error); loadState();
+    });
+    else if(act === 'sync-all') post('/api/sync_all', {}).then(function(r){
+      if(!r.ok) toast(r.error);
+      else {
+        toast(r.message);
+        batchPull = {uids: r.started || [], total: r.total || 0};
+      }
+      loadState();
     });
     else if(act === 'refull'){
       var name = btn.closest('.b-item').querySelector('.b-name').textContent;
@@ -933,20 +959,22 @@ $('refullCancel').onclick = function(){ $('refullModal').classList.remove('show'
 $('refullModal').onclick = function(e){ if(e.target === $('refullModal')) $('refullModal').classList.remove('show'); };
 
 /* ── 状态轮询 ─────────────────────────────── */
-function renderTaskHints(updating, rd, rt, ybusy, yd, yt){
+function renderTaskHints(updating, rd, rt, ybusy, yd, yt, bbusy, bd, bt){
   var h = [];
   if(updating) h.push('批量更新中：已更新 ' + rd + ' / ' + rt);
   if(ybusy) h.push('语雀同步中：已处理 ' + yd + ' / ' + yt);
+  if(bbusy) h.push('全部拉取中：已处理 ' + bd + ' / ' + bt);
   $('taskHints').innerHTML = h.length ? '<span class="busy">' + h.join(' · ') + '</span>' : '';
 }
 function loadState(){
   fetch('/api/state').then(function(r){ return r.json(); }).then(function(st){
     renderCookie(st.cookie_status);
     renderBloggers(st.bloggers);
-    for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒
+    for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒（一键批量时不逐条打扰）
       var b = st.bloggers[i];
       var old = prevState[b.uid];
-      if(old && (old === 'fulling' || old === 'queued') && b.state === 'done'){
+      var inBatch = batchPull && batchPull.uids.indexOf(b.uid) !== -1;
+      if(!inBatch && old && (old === 'fulling' || old === 'queued') && b.state === 'done'){
         toast('「'+b.nickname+'」'+b.note);
         loadPosts();
       }
@@ -966,7 +994,27 @@ function loadState(){
       loadPosts();
     }
     prevYuqueBusy = ybusy;
-    renderTaskHints(updating, rd, rt, ybusy, yd, yt);
+    var bt = batchPull ? batchPull.total : 0, bd = 0;
+    if(bt > 0){
+      for(var j=0;j<st.bloggers.length;j++){              // 进度 = 批内博主里已离开「拉取中/排队中」的个数
+        var bb = st.bloggers[j];
+        if(batchPull.uids.indexOf(bb.uid) !== -1 && bb.state !== 'queued' && bb.state !== 'fulling') bd++;
+      }
+      if(bd >= bt){                                       // 一键全部拉取结束 → 一次提示并刷新
+        var okCount = 0;
+        for(var k=0;k<st.bloggers.length;k++){
+          var bbk = st.bloggers[k];
+          if(batchPull.uids.indexOf(bbk.uid) !== -1 && bbk.state === 'done') okCount++;
+        }
+        toast(okCount === bt ? '全部博主拉取完成'
+              : '已拉取 ' + okCount + ' / ' + bt + ' 位，未完成的看左侧状态');
+        loadPosts();
+        batchPull = null;
+        bt = 0;
+        renderBloggers(st.bloggers);                      // 让按钮立刻恢复「拉取新的」
+      }
+    }
+    renderTaskHints(updating, rd, rt, ybusy, yd, yt, bt > bd, bd, bt);
     $('batchYuque').disabled = ybusy;
     if(!updating && !ybusy) syncSelection();
   });
