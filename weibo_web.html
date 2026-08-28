@@ -36,6 +36,12 @@
   header{height:52px; flex:none; background:var(--card); border-bottom:1px solid var(--line);
          display:flex; align-items:center; gap:14px; padding:0 20px;}
   header h1{font-size:17px; font-weight:600;}
+  #wbLink{display:inline-flex; align-items:center; gap:2px; font-size:12px; color:var(--sub);
+          border:1px solid var(--line); border-radius:999px; padding:2px 10px; line-height:1.6;
+          background:#fff; text-decoration:none; flex:none;}
+  #wbLink .ic{font-size:11px; opacity:.75;}
+  #wbLink:hover{color:#fff; background:#e6162d; border-color:#e6162d;}
+  #wbLink:hover .ic{opacity:.9;}
   #cookiePill{margin-left:auto; border-radius:999px; padding:3px 14px; font-size:12px;
               border:1px solid var(--line); background:#fff; cursor:pointer;}
   #cookiePill .dot{display:inline-block; width:8px; height:8px; border-radius:50%;
@@ -174,6 +180,10 @@
   #taskHints{flex:1; text-align:center; min-width:0;}
   #taskHints .busy{display:inline-block; padding:3px 14px; border-radius:999px; background:#fdf6ec;
                    color:#a1622a; border:1px solid #faecd8; font-size:13px; font-weight:600;}
+  #taskHints .cancel-btn{background:none; border:1px solid #e3b4b4; color:#c45656;
+                         border-radius:999px; padding:0 9px; margin-left:6px; font-size:12px;
+                         font-weight:600; line-height:1.7;}
+  #taskHints .cancel-btn:hover{background:#f56c6c; border-color:#f56c6c; color:#fff;}
   #yuqueEdit{flex:none; display:none; align-items:center; gap:8px; margin-bottom:8px; padding:8px 12px;
              background:var(--card); border:1px solid var(--line); border-radius:8px; flex-wrap:wrap;}
   #yuqueEdit.show{display:flex;}
@@ -263,6 +273,7 @@
 
 <header>
   <h1>微博存档</h1>
+  <a id="wbLink" href="https://weibo.com" target="_blank" rel="noopener" title="打开微博官网">微博<span class="ic">↗</span></a>
   <div id="taskHints"></div>
   <button id="cookiePill"><span class="dot"></span><span id="cookiePillTxt">…</span></button>
 </header>
@@ -343,7 +354,7 @@
       <button id="selAllFilter" class="mini">全选当前筛选结果</button>
       <span id="selCount">已选 0 条</span>
       <span style="flex:1"></span>
-      <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀（单次最多 6 条）">同步到语雀</button>
+      <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀，可随时在顶部取消">同步到语雀</button>
       <button id="batchUpdate" class="mini primary">批量更新</button>
       <button id="batchDelete" class="mini danger">批量删除</button>
       <button id="batchMarkSkip" class="mini btn-skip" title="选中微博转为无需归档，不再参与语雀同步">转无需归档</button>
@@ -597,9 +608,18 @@ function renderBloggers(list){
       +   '<div class="b-btns">'+bloggerButtons(b)+'</div>'
       + '</div></div>';
   }
+  if($('bloggerList').innerHTML === html) return;   // 内容没变就不重建，避免打断正在复制的文字
   $('bloggerList').innerHTML = html;
 }
+var blDown = null;                                   // 拖选文字 vs 点击博主：记录按下位置来区分
+$('bloggerList').addEventListener('mousedown', function(e){
+  blDown = {x: e.clientX, y: e.clientY};
+});
 $('bloggerList').addEventListener('click', function(e){
+  if(blDown && (Math.abs(e.clientX - blDown.x) > 4 || Math.abs(e.clientY - blDown.y) > 4)){
+    blDown = null; return;                           // 刚拖选过文字 → 不当作点击，避免误选博主/误删
+  }
+  blDown = null;
   var btn = e.target.closest('button');
   if(btn){
     var uid = btn.dataset.uid, act = btn.dataset.act;
@@ -658,6 +678,7 @@ $('bloggerList').addEventListener('click', function(e){
   }
   var item = e.target.closest('[data-uid]');
   if(item){
+    clearSelection();                 // 切换博主：之前勾选的清空，避免“已选 N 条”残留
     selUid = item.dataset.uid;
     loadState(); loadPosts();
   }
@@ -847,7 +868,9 @@ $('batchYuque').onclick = function(){
     var parts = [];
     if(r.created) parts.push('新增 ' + r.created + ' 条');
     if(r.updated) parts.push('更新 ' + r.updated + ' 条');
-    toast('已加入同步队列（' + (parts.join('、') || (r.queued + ' 条')) + '，后台逐条处理）');
+    var msg = '已加入同步队列（' + (parts.join('、') || (r.queued + ' 条')) + '，后台处理中）';
+    if(r.skipped_busy) msg += '，另有 ' + r.skipped_busy + ' 条已在同步中，已跳过';
+    toast(msg);
     loadPosts(); loadState();
   });
 };
@@ -963,11 +986,21 @@ $('refullModal').onclick = function(e){ if(e.target === $('refullModal')) $('ref
 /* ── 状态轮询 ─────────────────────────────── */
 function renderTaskHints(updating, rd, rt, ybusy, yd, yt, bbusy, bd, bt){
   var h = [];
-  if(updating) h.push('批量更新中：已更新 ' + rd + ' / ' + rt);
-  if(ybusy) h.push('语雀同步中：已处理 ' + yd + ' / ' + yt);
+  if(updating) h.push('批量更新中：已更新 ' + rd + ' / ' + rt
+    + '<button class="cancel-btn" data-cancel="update" title="停止剩余更新，已更新的保留">取消</button>');
+  if(ybusy) h.push('语雀同步中：已处理 ' + yd + ' / ' + yt
+    + '<button class="cancel-btn" data-cancel="sync" title="停止剩余同步，已归档的保留">取消</button>');
   if(bbusy) h.push('全部拉取中：已处理 ' + bd + ' / ' + bt);
   $('taskHints').innerHTML = h.length ? '<span class="busy">' + h.join(' · ') + '</span>' : '';
 }
+$('taskHints').addEventListener('click', function(e){
+  var btn = e.target.closest('[data-cancel]');
+  if(!btn) return;
+  post('/api/' + (btn.dataset.cancel === 'update' ? 'update/cancel' : 'yuque/cancel'), {}).then(function(r){
+    if(r.ok) toast('已取消');
+    loadState();
+  });
+});
 function loadState(){
   fetch('/api/state').then(function(r){ return r.json(); }).then(function(st){
     renderCookie(st.cookie_status);
@@ -1017,7 +1050,6 @@ function loadState(){
       }
     }
     renderTaskHints(updating, rd, rt, ybusy, yd, yt, bt > bd, bd, bt);
-    $('batchYuque').disabled = ybusy;
     if(!updating && !ybusy) syncSelection();
   });
 }

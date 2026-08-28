@@ -15,6 +15,7 @@
 
 决策背景见 weibo/docs/adr/（SQLite / m 站接口+小号 Cookie / raw 留底）。
 """
+import concurrent.futures
 import datetime
 import email.utils
 import glob
@@ -48,7 +49,7 @@ HTML_PATH = os.path.join(BUNDLE_DIR, 'weibo_web.html')
 
 TEMPLATE_PATH = os.path.join(BUNDLE_DIR, 'yuque-sync-template.md')
 YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:/[^\s/?#]+)*)/?$')
-SYNC_MAX = 6                     # 单次归档最多条数
+SYNC_WORKERS = 2                 # 批内并发路数：2 路并行跑，墙钟约减半
 SYNC_TIMEOUT = 240               # 单条 claude 调用超时（秒）
 
 API_BASE = 'https://m.weibo.cn'
@@ -710,10 +711,11 @@ def _is_deleted_error(e):
     return any(h in s for h in DELETED_HINTS)
 REFRESH_QUEUE = deque()
 RQ_COND = threading.Condition()
+REFRESH_CANCEL = threading.Event()   # 批量更新取消标记：set=用户点了取消
 
 
 def run_refresh(ids):
-    """批量更新：逐条抓取最新完整数据并覆盖写入（长文截断借此修复），逐条上报进度"""
+    """批量更新：逐条抓取最新完整数据并覆盖写入（长文截断借此修复），逐条上报进度；支持中途取消"""
     try:
         session = MSession()
     except CookieExpired:
@@ -721,6 +723,8 @@ def run_refresh(ids):
         REFRESH['done'] = REFRESH['total']      # 标为全部完成，前端停止进度显示
         return
     for pid in ids:
+        if REFRESH_CANCEL.is_set():             # 用户取消 → 立即停
+            break
         row = db('SELECT uid FROM posts WHERE id=?', (pid,)).fetchone()
         if not row:
             REFRESH['done'] += 1
@@ -742,15 +746,21 @@ def run_refresh(ids):
                 db('UPDATE posts SET deleted=1 WHERE id=?', (pid,))
         REFRESH['done'] += 1
         time.sleep(random.uniform(*DETAIL_SLEEP))
+    if REFRESH_CANCEL.is_set():                 # 取消收尾：清标记、标为结束
+        REFRESH_CANCEL.clear()
+        REFRESH['done'] = REFRESH['total']
 
 
 def refresh_worker():
     """专职批量更新通道：进队即跑，不等待、不暂停正在进行的拉取"""
     while True:
         with RQ_COND:
-            while not REFRESH_QUEUE:
+            while not REFRESH_QUEUE and not REFRESH_CANCEL.is_set():
                 RQ_COND.wait()
-            ids = REFRESH_QUEUE.popleft()
+            ids = REFRESH_QUEUE.popleft() if REFRESH_QUEUE else None
+        if ids is None:                         # 取消时队列被清空 → 清标记继续待命
+            REFRESH_CANCEL.clear()
+            continue
         try:
             run_refresh(ids)
         except Exception:                       # noqa: BLE001 —— 兜底，不能卡死更新通道
@@ -758,9 +768,11 @@ def refresh_worker():
 
 
 # ----------------------------------------------------------- 语雀归档 ----
-SYNC = {'total': 0, 'done': 0, 'msg': ''}     # 归档进度与结果消息（供前端展示）
+SYNC = {'total': 0, 'done': 0, 'msg': '',      # 归档进度与结果消息（供前端展示）
+        'created': 0, 'updated': 0, 'failed': 0, 'reasons': []}   # 本轮同步会话累计（可多批入队）
 SYNC_QUEUE = deque()
 SYNC_COND = threading.Condition()
+SYNC_CANCEL = threading.Event()    # 语雀同步取消标记：set=用户点了取消
 
 
 def find_claude():
@@ -861,7 +873,6 @@ def _spawn_claude(prompt, attempts=2):
 def _build_archive_prompt(row, template, update_doc_url=None):
     """组装单条微博的归档提示词：新建或按最新模板更新语雀文档 + 模板 + 微博内容"""
     acc, book, folder = validate_yuque_dir(row['yuque_dir'])
-    folder_desc = folder or '知识库根目录'
     media = json.loads(row['media_json'] or '{}')
     nimgs = len(media.get('imgs') or [])
     ts = row['created_ts']
@@ -871,19 +882,33 @@ def _build_archive_prompt(row, template, update_doc_url=None):
         steps = (
             '1. 先生成整篇文档的完整内容：按模板结构包含元信息块、AI 总结、关键要点、AI 分析。\n'
             '2. 调用 yuque_update_doc 更新该文档：body 参数必须填完整生成的 Markdown 内容，禁止传空 body、禁止只传标题、禁止清空原有内容。\n'
-            '3. 若更新报错「文档不存在」，则新建并按模板生成，创建后移入目录 %s。\n'
+            '3. 若更新报错「文档不存在」，则调用 yuque_create_doc 在该知识库（repo_id 传「%s/%s」）新建文档并按模板生成。\n'
             '4. 不要重复调用 yuque_update_doc；不要调用 get_doc / get_toc / 任何其他 yuque 工具。\n'
-            % (folder_desc))
+            % (acc, book))
     else:
-        target = '语雀目标节点链接：%s（账号 %s，知识库 %s，文档要放进目标节点 %s）' % (
-            row['yuque_dir'], acc, book, folder_desc)
-        steps = (
-            '1. 调用 yuque_get_toc 查看该知识库的目录树，按 slug 匹配目标节点是否存在。'
-            '目标节点是「目录」还是普通「文档」都算有效，不用纠结节点类型。\n'
-            '2. 如果 TOC 里完全找不到这个 slug 的节点，最终输出 SYNC_ERR|目录不存在，不要创建任何内容。\n'
-            '3. 调用 yuque_create_doc 创建文档（标题按模板）。'
-            '如果目标节点是真正的目录（TITLE 节点），创建后用 yuque_update_toc 把文档移到该目录下；'
-            '如果目标节点是普通文档（不能当目录），直接创建即可，跳过移动。\n')
+        if folder:
+            target = '语雀知识库链接：%s（账号 %s，知识库 %s，目录节点 slug 是「%s」，新文档要挂到它下面）' % (
+                row['yuque_dir'], acc, book, folder)
+            steps = (
+                '1. 调用 yuque_create_doc 创建文档：repo_id 传「%s/%s」，标题按模板，正文严格按模板生成。\n'
+                '2. 调用 yuque_get_toc 查看目录树：找到 slug 等于「%s」的节点（目录或普通文档都行），'
+                '记下它的 uuid；再找到刚创建文档的节点（slug 是文档链接最后一段），记下它的 uuid。\n'
+                '3. 调用 yuque_update_toc 把新文档挂到目标节点下，toc_data 传：'
+                '{"action":"appendChild","target_uuid":"<目标节点uuid>","node_uuid":"<新文档uuid>"}。\n'
+                '4. 如果第 2 步找不到目标节点或新文档节点，跳过第 3 步，不影响归档。\n'
+                '5. 创建成功后，最终输出一行：SYNC_OK|文档URL。\n'
+                '6. 如果创建文档失败（知识库不存在、没权限、限流等），最终输出一行：SYNC_ERR|具体错误原因，'
+                '不要重试，不要调用其他 yuque 工具。\n'
+                % (acc, book, folder))
+        else:
+            target = '语雀知识库链接：%s（账号 %s，知识库 %s，直接在该知识库下创建文档）' % (
+                row['yuque_dir'], acc, book)
+            steps = (
+                '1. 调用 yuque_create_doc 创建文档：repo_id 传「%s/%s」，标题按模板，正文严格按模板生成。\n'
+                '2. 创建成功后，最终输出一行：SYNC_OK|文档URL。\n'
+                '3. 如果创建失败（知识库不存在、没权限、限流等），最终输出一行：SYNC_ERR|具体错误原因，'
+                '不要重试，不要调用其他 yuque 工具。\n'
+                % (acc, book))
     return (
         '你是一个「微博 → 语雀归档」助手。把下面这条微博按模板格式总结并同步到语雀。\n\n'
         '【目标】%s\n'
@@ -917,7 +942,7 @@ def _extract_sync_result(out):
 
 
 def run_archive(ids):
-    """逐条归档：读模板 → 调 claude（AI 总结 + 建语雀文档）→ 写回归档状态"""
+    """批量归档：读模板 → 并发调 claude（AI 总结 + 建语雀文档，默认 2 路）→ 写回归档状态"""
     try:
         with open(TEMPLATE_PATH, 'r', encoding='utf-8') as f:
             template = f.read()
@@ -925,9 +950,9 @@ def run_archive(ids):
         SYNC['msg'] = '读取同步模板失败：%s' % e
         SYNC['done'] = SYNC['total']
         return
-    created = updated = 0
-    reasons = []
-    for pid in ids:
+    done_lock = threading.Lock()
+
+    def archive_one(pid):
         try:
             row = db('SELECT p.*, b.nickname, b.yuque_dir FROM posts p '
                      'LEFT JOIN bloggers b ON b.uid=p.uid WHERE p.id=?', (pid,)).fetchone()
@@ -944,30 +969,76 @@ def run_archive(ids):
             url = _extract_sync_result(out)
             db('UPDATE posts SET archived=1, yuque_doc_url=?, archived_at=?, '
                "arch_fail='', arch_state='' WHERE id=?", (url, now_str(), pid))
-            if is_update:
-                updated += 1
-            else:
-                created += 1
+            return (pid, 'ok', is_update)
         except Exception as e:  # noqa: BLE001
             reason = str(e)
             db("UPDATE posts SET arch_fail=?, arch_state='' WHERE id=?", (reason, pid))
-            reasons.append('%s：%s' % (pid, reason))
+            return (pid, 'err', reason)
         finally:
-            SYNC['done'] += 1
-    if reasons:
-        SYNC['msg'] = '同步完成：新增 %d 条、更新 %d 条，失败 %d 条（%s）' % (
-            created, updated, len(reasons), '；'.join(reasons[:5]))
-    else:
-        SYNC['msg'] = '同步完成：新增 %d 条、更新 %d 条' % (created, updated)
+            with done_lock:                  # 多路并发，进度计数要加锁
+                SYNC['done'] += 1
+
+    created = updated = 0
+    reasons = []
+    pending = list(ids)
+    cancelled = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_WORKERS) as ex:
+        futs = []
+        while pending and not SYNC_CANCEL.is_set():
+            while pending and len(futs) < SYNC_WORKERS:
+                futs.append(ex.submit(archive_one, pending.pop(0)))
+            done_set, _ = concurrent.futures.wait(
+                futs, return_when=concurrent.futures.FIRST_COMPLETED)
+            for f in done_set:
+                futs.remove(f)
+                pid, status, info = f.result()
+                if status == 'ok':
+                    if info:
+                        updated += 1
+                    else:
+                        created += 1
+                else:
+                    reasons.append('%s：%s' % (pid, info))
+        cancelled = SYNC_CANCEL.is_set()
+        for f in futs:                        # 取消/收尾：把已提交的结果统计进去
+            pid, status, info = f.result()
+            if status == 'ok':
+                if info:
+                    updated += 1
+                else:
+                    created += 1
+            else:
+                reasons.append('%s：%s' % (pid, info))
+    with done_lock:                          # 累计到本轮同步会话，供整队跑完后汇总
+        SYNC['created'] += created
+        SYNC['updated'] += updated
+        SYNC['failed'] += len(reasons)
+        if reasons:
+            SYNC['reasons'] = (SYNC['reasons'] + reasons)[:5]
+    if cancelled:                            # 用户取消：清标记、清掉没跑到的瞬态、收尾
+        SYNC_CANCEL.clear()
+        db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")
+        SYNC['msg'] = '已取消：已归档 %d 条，其余未同步' % (created + updated)
+        SYNC['done'] = SYNC['total']
+        return
+    if SYNC['done'] >= SYNC['total']:        # 等待队列全部跑完（可能含后续入队的批次）才给最终汇总
+        if SYNC['failed']:
+            SYNC['msg'] = '同步完成：新增 %d 条、更新 %d 条，失败 %d 条（%s）' % (
+                SYNC['created'], SYNC['updated'], SYNC['failed'], '；'.join(SYNC['reasons']))
+        else:
+            SYNC['msg'] = '同步完成：新增 %d 条、更新 %d 条' % (SYNC['created'], SYNC['updated'])
 
 
 def archive_worker():
-    """归档 worker：串行处理归档批次（单次最多 SYNC_MAX 条，ADR-0008）"""
+    """归档 worker：一次处理一个批次（不限条数，批内 SYNC_WORKERS 路并发）"""
     while True:
         with SYNC_COND:
-            while not SYNC_QUEUE:
+            while not SYNC_QUEUE and not SYNC_CANCEL.is_set():
                 SYNC_COND.wait()
-            ids = SYNC_QUEUE.popleft()
+            ids = SYNC_QUEUE.popleft() if SYNC_QUEUE else None
+        if ids is None:                     # 取消时队列被清空 → 清标记继续待命
+            SYNC_CANCEL.clear()
+            continue
         try:
             run_archive(ids)
         except Exception as e:  # noqa: BLE001 —— 兜底，不能卡死归档通道
@@ -1246,11 +1317,31 @@ def api_batch_update(body):
     if REFRESH['total'] > REFRESH['done']:
         return {'ok': False, 'error': '上一批更新还在进行，请稍候'}
     with RQ_COND:
+        REFRESH_CANCEL.clear()          # 新一轮更新：清除残留的取消标记
         REFRESH_QUEUE.append(ids)
         REFRESH['total'] = len(ids)      # 只统计本次操作：新批次从 0 开始
         REFRESH['done'] = 0
         RQ_COND.notify()
     return {'ok': True, 'queued': len(ids)}
+
+
+def api_update_cancel(body=None):
+    """取消正在进行的批量更新：停新任务、清排队、进度收尾"""
+    with RQ_COND:
+        REFRESH_CANCEL.set()
+        REFRESH_QUEUE.clear()
+        RQ_COND.notify_all()
+    return {'ok': True}
+
+
+def api_yuque_cancel(body=None):
+    """取消正在进行的语雀同步：清排队、停新任务、清掉没跑到的「同步中」瞬态"""
+    with SYNC_COND:
+        SYNC_CANCEL.set()
+        SYNC_QUEUE.clear()
+        SYNC_COND.notify_all()
+    db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")
+    return {'ok': True}
 
 
 def api_blogger_yuque_dir(body):
@@ -1266,52 +1357,54 @@ def api_blogger_yuque_dir(body):
 
 
 def api_yuque_sync(body):
-    """归档勾选的微博到语雀：≤6 条、串行；预检各类失败原因并给出人话提示"""
+    """归档勾选的微博到语雀：不限条数；单个与批量互不拦截，已在同步中的自动跳过、其余进等待队列、顶部计数累加"""
     ids = _clean_ids(body)
     if not ids:
         return {'ok': False, 'error': '没有选中要同步的微博'}
-    if SYNC['total'] > SYNC['done']:
-        return {'ok': False, 'error': '上一批同步还在进行，请稍候'}
     rows = db('SELECT p.id, p.retweeted_json, p.archived, p.arch_skip, b.nickname, b.yuque_dir '
               'FROM posts p LEFT JOIN bloggers b ON b.uid=p.uid '
               'WHERE p.id IN (%s)' % ','.join('?' * len(ids)), tuple(ids)).fetchall()
-    todo, no_dir = [], set()
-    create_n = update_n = 0
+    wanted, no_dir = [], set()
     for r in rows:
         if r['retweeted_json'] or r['arch_skip']:
             continue
         if not r['yuque_dir']:
             no_dir.add(r['nickname'] or r['uid'])
             continue
-        todo.append(r['id'])
-        if r['archived']:
-            update_n += 1
-        else:
-            create_n += 1
+        wanted.append(r['id'])
     if no_dir:
         return {'ok': False, 'error': '博主「%s」还没配置语雀同步目录，请先在左侧博主行设置' % '、'.join(sorted(no_dir))}
-    if not todo:
+    if not wanted:
         return {'ok': False, 'error': '勾选的微博都是转发微博或无需归档，不支持同步'}
-    if len(todo) > SYNC_MAX:
-        return {'ok': False, 'error': '单次最多同步 %d 条，当前待同步 %d 条，请减少勾选' % (SYNC_MAX, len(todo))}
     if not find_claude():
         return {'ok': False, 'error': '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'}
     if not find_yuque_mcp():
         return {'ok': False, 'error': '未配置语雀 MCP，请先用 claude mcp add 注册 yuque 服务'}
-    todo_set = set(todo)
-    todo_archived = {r['id'] for r in rows if r['id'] in todo_set and r['archived']}
-    with SYNC_COND:                          # 忙检与入队原子化：更新/同步互斥，同一时间只能跑一批
-        if SYNC['total'] > SYNC['done']:
-            return {'ok': False, 'error': '上一批同步还在进行，请稍候'}
+    with SYNC_COND:                          # 入队原子化：跳过已在同步/等待中的微博，其余追加到等待队列
+        busy = {r['id'] for r in db(
+            'SELECT id FROM posts WHERE id IN (%s) AND arch_state IN (?,?)'
+            % ','.join('?' * len(wanted)),
+            tuple(wanted) + ('syncing', 'updating')).fetchall()}
+        todo = [pid for pid in wanted if pid not in busy]
+        if not todo:
+            return {'ok': False, 'error': '选中的微博都在同步中，稍等完成后再试'}
+        todo_set = set(todo)
+        todo_archived = {r['id'] for r in rows if r['id'] in todo_set and r['archived']}
+        if SYNC['total'] == SYNC['done']:    # 空闲 → 新一轮同步会话，重置累计
+            SYNC['created'] = SYNC['updated'] = SYNC['failed'] = 0
+            SYNC['reasons'] = []
+        SYNC_CANCEL.clear()                  # 新一轮同步：清除残留的取消标记
         SYNC_QUEUE.append(todo)
-        SYNC['total'] = len(todo)
-        SYNC['done'] = 0
+        SYNC['total'] += len(todo)           # 顶部计数累加：已完成数不动
         SYNC['msg'] = ''
         SYNC_COND.notify()
-    for pid in todo:                        # 瞬态落库：刷新页面仍显示同步中/更新中
-        db('UPDATE posts SET arch_state=? WHERE id=?',
-           ('updating' if pid in todo_archived else 'syncing', pid))
-    return {'ok': True, 'queued': len(todo), 'created': create_n, 'updated': update_n}
+        for pid in todo:                     # 瞬态落库：刷新页面仍显示同步中/更新中
+            db('UPDATE posts SET arch_state=? WHERE id=?',
+               ('updating' if pid in todo_archived else 'syncing', pid))
+    create_n = sum(1 for pid in todo if pid not in todo_archived)
+    update_n = len(todo_archived)
+    return {'ok': True, 'queued': len(todo), 'created': create_n, 'updated': update_n,
+            'skipped_busy': len(busy)}
 
 
 def api_yuque_mark(body):
@@ -1506,6 +1599,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_yuque_sync(body))
             elif path == '/api/yuque/mark':
                 self._json(api_yuque_mark(body))
+            elif path == '/api/yuque/cancel':
+                self._json(api_yuque_cancel(body))
+            elif path == '/api/update/cancel':
+                self._json(api_update_cancel(body))
             else:
                 self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:  # noqa: BLE001
