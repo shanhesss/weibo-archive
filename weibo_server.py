@@ -1390,7 +1390,9 @@ def api_yuque_sync(body):
             return {'ok': False, 'error': '选中的微博都在同步中，稍等完成后再试'}
         todo_set = set(todo)
         todo_archived = {r['id'] for r in rows if r['id'] in todo_set and r['archived']}
-        if SYNC['total'] == SYNC['done']:    # 空闲 → 新一轮同步会话，重置累计
+        if SYNC['total'] == SYNC['done']:    # 空闲 → 新一轮同步会话：计数清零，会话内再累加排队
+            SYNC['total'] = 0
+            SYNC['done'] = 0
             SYNC['created'] = SYNC['updated'] = SYNC['failed'] = 0
             SYNC['reasons'] = []
         SYNC_CANCEL.clear()                  # 新一轮同步：清除残留的取消标记

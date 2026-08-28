@@ -1017,15 +1017,17 @@ function loadState(){
     }
     var rt = st.refresh_total || 0, rd = st.refresh_done || 0;
     var updating = rt > rd;
-    if(prevUpdating && !updating){                         // 批量更新完成
+    if(prevUpdating && !updating){                         // 批量更新完成 → 清勾选、刷新卡片
       toast('批量更新完成');
+      clearSelection();
       loadPosts();
     }
     prevUpdating = updating;
     var yt = st.yuque_total || 0, yd = st.yuque_done || 0;
     var ybusy = yt > yd;
-    if(prevYuqueBusy && !ybusy && yt > 0){                 // 归档批次完成 → 提示结果并刷新卡片
+    if(prevYuqueBusy && !ybusy && yt > 0){                 // 归档批次完成 → 提示结果、清勾选、刷新卡片
       if(st.yuque_msg) toast(st.yuque_msg);
+      clearSelection();
       loadPosts();
     }
     prevYuqueBusy = ybusy;
