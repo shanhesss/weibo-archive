@@ -83,6 +83,13 @@
   .b-all .b-all-sync:hover{opacity:.88; color:#fff; border-color:var(--green);}
   .b-all .b-all-sync:disabled{opacity:.5; cursor:default;}
   .b-all .b-all-sync:disabled:hover{opacity:.5; color:#fff; border-color:var(--green);}
+  .b-head{display:flex; align-items:center; justify-content:space-between; margin-top:8px;}
+  .b-all-sched{flex:none; padding:1px 8px; font-size:12px; line-height:1.8; border-radius:6px;
+               color:var(--sub); background:#fff; border:1px solid var(--line); cursor:pointer;
+               white-space:nowrap;}
+  .b-all-sched:hover{border-color:var(--blue); color:var(--blue);}
+  .b-all-sched.on{background:#e8f4fd; border-color:#b7dff7; color:#1d6fb8; font-weight:600;}
+  .b-all-sched.on:hover{border-color:var(--blue); color:var(--blue);}
   .b-item{padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:10px;}
   .b-item:hover,.b-all:hover{background:var(--bg);}
   .b-item.sel,.b-all.sel{background:#e8f4fd;}
@@ -166,6 +173,8 @@
   button.mini.yuque-btn.yq-update{background:#fff; color:var(--yuque); border-color:var(--yuque);}
   button.mini.yuque-btn.yq-update:hover{opacity:.88; color:var(--yuque);}
   .yuque-ok{flex:none; color:var(--yuque); font-size:12px; margin-left:4px; cursor:pointer;}
+  button.mini.arch-del{flex:none; color:var(--red); padding:1px 8px;}
+  button.mini.arch-del:hover{border-color:var(--red);}
   .b-yuque{color:var(--sub); font-size:12px; margin-top:2px; display:flex; align-items:center; gap:6px; min-width:0;}
   .b-yuque .yq-ok{color:var(--yuque); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;}
   .b-yuque .none{color:var(--amber); white-space:nowrap;}
@@ -263,6 +272,18 @@
   #refullPreview .warn{color:var(--amber);}
   #refullBtns{display:flex; gap:10px; justify-content:flex-end; margin-top:18px;}
 
+  /* ── 定时拉取设置弹窗 ─────────────────── */
+  #schedModal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
+              align-items:center; justify-content:center; z-index:99;}
+  #schedModal.show{display:flex;}
+  #schedBox{background:#fff; border-radius:12px; padding:20px 22px; width:380px;
+           max-width:92vw; box-shadow:0 10px 40px rgba(0,0,0,.22);}
+  #schedTitle{font-size:16px; font-weight:600; margin-bottom:8px;}
+  #schedDesc{font-size:13px; color:var(--sub); line-height:1.7; margin-bottom:14px;}
+  #schedBox input[type=number]{width:100%; padding:8px 10px;}
+  #schedBox .rf-label{display:flex; align-items:center; gap:6px;}
+  #schedBtns{display:flex; gap:10px; justify-content:flex-end; margin-top:18px;}
+
   /* ── 轻提示 ───────────────────────────── */
   #toast{position:fixed; left:50%; bottom:36px; transform:translateX(-50%);
          background:rgba(31,35,41,.92); color:#fff; border-radius:8px; padding:8px 18px;
@@ -302,7 +323,10 @@
         <button id="pvCancel">取消</button>
       </div>
     </div>
-    <h2 style="margin-top:8px;">我的博主</h2>
+    <div class="b-head">
+      <h2>我的博主</h2>
+      <button id="schedHeadBtn" class="b-all-sched" title="设置定时自动拉取新微博">定时·关</button>
+    </div>
     <div id="bloggerList">
       <div class="b-all sel" data-uid="">
         <span class="b-all-txt">📋 全部微博</span>
@@ -355,6 +379,7 @@
       <span id="selCount">已选 0 条</span>
       <span style="flex:1"></span>
       <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀，可随时在顶部取消">同步到语雀</button>
+      <button id="batchArchDel" class="mini danger" title="删除选中有语雀文档的微博对应的语雀文档，微博重置为待归档">删语雀档</button>
       <button id="batchUpdate" class="mini primary">批量更新</button>
       <button id="batchDelete" class="mini danger">批量删除</button>
       <button id="batchMarkSkip" class="mini btn-skip" title="选中微博转为无需归档，不再参与语雀同步">转无需归档</button>
@@ -395,6 +420,17 @@
     <button id="refullCancel">取消</button>
   </div>
 </div></div>
+<div id="schedModal"><div id="schedBox">
+  <div id="schedTitle">定时自动拉取</div>
+  <div id="schedDesc">开启后按设定间隔自动为所有博主「拉取新的」（正在拉取的自动跳过）。工具重启后若已超过间隔，会立即补跑一次。</div>
+  <label class="rf-label"><input type="checkbox" id="schedOn"> 开启定时拉取</label>
+  <div class="rf-label" style="margin-top:10px;">拉取间隔（分钟，30 ~ 1440）</div>
+  <input type="number" id="schedMinutes" min="30" max="1440" step="30" value="60">
+  <div id="schedBtns">
+    <button id="schedOk" class="primary">保存</button>
+    <button id="schedCancel">取消</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 
 <script>
@@ -411,6 +447,7 @@ var selManual = {};               // 手动勾选的 id
 var selAllIds = [];               // 全选模式下获取的全部匹配 id
 var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
 var prevYuqueBusy = false;        // 归档批次是否在进行中，用于完成检测
+var schedCfg = {on: false, minutes: 60};   // 定时拉取配置（/api/state 下发）
 var rfMeta = {};                  // uid -> {earliest, nickname}，重拉全量弹窗预填起始日期用
 var WEIBO_LAUNCH = new Date(2009, 7, 28);   // 微博上线日，作为"最早"兜底
 
@@ -499,6 +536,16 @@ function syncBtnHtml(p){
   }
   return '<button class="mini yuque-btn" data-sync="'+esc(p.id)+'" title="AI 总结后同步到语雀">同步</button>';
 }
+function archDelHtml(p){
+  if(p.yuque_doc_url && p.arch_state !== 'syncing' && p.arch_state !== 'updating'){
+    return '<button class="mini arch-del" data-del="'+esc(p.id)
+      + '" title="删除这条微博的语雀文档，微博改回待归档（微博本身不删）">删档</button>';
+  }
+  return '';
+}
+function fmtMinutes(m){
+  return (m % 60 === 0) ? (m / 60) + '小时' : m + '分钟';
+}
 function copyId(id, ev){
   if(ev) ev.stopPropagation();
   copyText(id);
@@ -572,6 +619,9 @@ function bloggerButtons(b){
 }
 function renderBloggers(list){
   var bSyncing = !!(batchPull && batchPull.total > 0);
+  var schedBtn = $('schedHeadBtn');
+  schedBtn.textContent = schedCfg.on ? '定时·每' + fmtMinutes(schedCfg.minutes) : '定时·关';
+  schedBtn.classList.toggle('on', !!schedCfg.on);
   var html = '<div class="b-all'+(selUid===''?' sel':'')+'" data-uid="">'
     + '<span class="b-all-txt">📋 全部微博</span>'
     + '<button class="b-all-sync" data-act="sync-all"'+(bSyncing?' disabled':'')
@@ -721,6 +771,26 @@ $('yuqueEditCancel').onclick = function(){
   $('yuqueEdit').classList.remove('show');
 };
 
+/* ── 定时拉取设置 ─────────────────────────── */
+function openSched(){
+  $('schedOn').checked = schedCfg.on;
+  $('schedMinutes').value = schedCfg.minutes;
+  $('schedModal').classList.add('show');
+}
+$('schedHeadBtn').onclick = openSched;
+$('schedOk').onclick = function(){
+  var on = $('schedOn').checked;
+  var minutes = parseInt($('schedMinutes').value, 10);
+  post('/api/schedule', {on: on, minutes: minutes}).then(function(r){
+    if(!r.ok){ toast(r.error); return; }
+    $('schedModal').classList.remove('show');
+    toast(on ? '已开启定时拉取：每 ' + fmtMinutes(minutes) : '已关闭定时拉取');
+    loadState();
+  });
+};
+$('schedCancel').onclick = function(){ $('schedModal').classList.remove('show'); };
+$('schedModal').onclick = function(e){ if(e.target === $('schedModal')) $('schedModal').classList.remove('show'); };
+
 /* ── 添加博主 ─────────────────────────────── */
 $('addBtn').onclick = function(){
   var input = $('addInput').value.trim();
@@ -805,6 +875,20 @@ $('grid').addEventListener('change', function(e){
 });
 $('grid').addEventListener('click', function(e){
   if(e.target.closest('[data-rt]')){ showAlert('转发微博不支持同步'); return; }
+  var delBtn = e.target.closest('[data-del]');
+  if(delBtn){
+    showModal('删除这条微博的语雀文档？\n\n将从语雀删掉该文档，微博改回「待归档」（微博本身不删），之后可重新同步。文档删除不可恢复。', [
+      {text:'删除', cls:'danger', fn: function(){
+        post('/api/yuque/delete', {ids: [delBtn.dataset.del]}).then(function(r){
+          if(!r.ok){ showAlert(r.error); return; }
+          toast(r.failed ? '删除失败：' + (r.error_sample || '') : '已删除语雀文档');
+          loadPosts();
+        });
+      }},
+      {text:'取消', cls:'', fn: null}
+    ]);
+    return;
+  }
   var btn = e.target.closest('[data-sync]');
   if(!btn) return;
   var id = btn.dataset.sync;
@@ -873,6 +957,24 @@ $('batchYuque').onclick = function(){
     toast(msg);
     loadPosts(); loadState();
   });
+};
+$('batchArchDel').onclick = function(){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  showModal('删除选中 ' + ids.length + ' 条微博对应的语雀文档？\n\n只有已建语雀文档的会被删，删成功的微博改回「待归档」；微博本身不删。文档删除不可恢复。', [
+    {text:'删除', cls:'danger', fn: function(){
+      toast('正在删除语雀文档，请稍候…');
+      post('/api/yuque/delete', {ids: ids}).then(function(r){
+        if(!r.ok){ showAlert(r.error); return; }
+        toast(r.failed
+          ? '已删 ' + r.deleted + ' 条，失败 ' + r.failed + ' 条：' + (r.error_sample || '')
+          : '已删除 ' + r.deleted + ' 条语雀文档');
+        clearSelection();
+        loadPosts(); loadState();
+      });
+    }},
+    {text:'取消', cls:'', fn: null}
+  ]);
 };
 function doBatchMark(to, okMsg){
   var ids = Array.from(currentSelected());
@@ -1004,6 +1106,7 @@ $('taskHints').addEventListener('click', function(e){
 function loadState(){
   fetch('/api/state').then(function(r){ return r.json(); }).then(function(st){
     renderCookie(st.cookie_status);
+    if(st.schedule) schedCfg = st.schedule;
     renderBloggers(st.bloggers);
     for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒（一键批量时不逐条打扰）
       var b = st.bloggers[i];
@@ -1150,6 +1253,7 @@ function renderPosts(r){
       +   '<span class="p-who">'+esc(p.nickname)+'</span>'
       +   '<span class="p-time">'+fmtTime(p.created_ts)+'</span>'
       +   syncBtnHtml(p)
+      +   archDelHtml(p)
       +   '<a class="p-src" href="https://m.weibo.cn/detail/'+esc(p.bid)+'" target="_blank">原文</a>'
       + '</div>'
       + delBadge + '<div class="p-text">'+richText(p.text)+rt+'</div>'

@@ -394,5 +394,46 @@ ws.kv_set('cookie', '')
 r = ws.api_sync_all({})
 check('无登录信息拒绝', r['ok'] is False and '登录信息' in r['error'])
 
+# 29. 定时拉取设置 + 归档删除
+def kv_last_is_now():
+    v = ws.kv_get('sched_last')
+    return bool(v) and abs(float(v) - time.time()) < 10
+check('定时 低于30分钟拒绝', ws.api_schedule({'on': True, 'minutes': 10})['ok'] is False)
+check('定时 超1440拒绝', ws.api_schedule({'on': True, 'minutes': 2000})['ok'] is False)
+check('定时 非数字拒绝', ws.api_schedule({'on': True, 'minutes': 'abc'})['ok'] is False)
+check('定时 开启成功', ws.api_schedule({'on': True, 'minutes': 60})['ok'] is True)
+check('定时 配置落库', ws.sched_cfg() == (True, 60) and kv_last_is_now())
+check('定时 state 带配置', ws.api_state()['schedule'] == {'on': True, 'minutes': 60})
+check('定时 关闭成功', ws.api_schedule({'on': False})['ok'] is True and ws.sched_cfg()[0] is False)
+check('定时 越界值夹回', (ws.kv_set('sched_minutes', '5'), ws.sched_cfg()[1] == 30)[1])
+
+check('文档链接解析', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1') == ('acc/book', 'slug1'))
+check('文档链接带参数', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1?a=1') == ('acc/book', 'slug1'))
+check('文档链接非法', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book') is None)
+
+ws.load_yuque_token = lambda: 'test-token'
+ws.db("UPDATE posts SET archived=1, arch_skip=0, arch_fail='', arch_state='', "
+      "yuque_doc_url='https://www.yuque.com/acc/book/doc1', archived_at='2026-08-30' WHERE id='a2'")
+del_calls = []
+ws.yuque_delete_doc = lambda url, token: del_calls.append((url, token))
+r = ws.api_yuque_delete({'ids': ['a2']})
+row = ws.db("SELECT archived, arch_skip, yuque_doc_url FROM posts WHERE id='a2'").fetchone()
+check('归档删除成功重置待归档', r['ok'] and r['deleted'] == 1 and row['archived'] == 0 and row['yuque_doc_url'] == '')
+check('归档删除调了远端', del_calls == [('https://www.yuque.com/acc/book/doc1', 'test-token')])
+check('归档删除无文档拒绝', ws.api_yuque_delete({'ids': ['a2']})['ok'] is False)
+ws.db("UPDATE posts SET archived=1, yuque_doc_url='https://www.yuque.com/acc/book/doc1' WHERE id='a2'")
+def _raise(url, token):
+    raise ws.ApiError('语雀接口错误（500）')
+ws.yuque_delete_doc = _raise
+r = ws.api_yuque_delete({'ids': ['a2']})
+row = ws.db("SELECT archived, yuque_doc_url FROM posts WHERE id='a2'").fetchone()
+check('归档删除失败保留原状态', r['deleted'] == 0 and r['failed'] == 1 and row['archived'] == 1 and row['yuque_doc_url'])
+check('归档删除失败带原因', '500' in r['error_sample'])
+ws.db("UPDATE posts SET arch_state='syncing' WHERE id='a2'")
+ws.yuque_delete_doc = lambda url, token: None
+check('归档删除瞬态跳过', ws.api_yuque_delete({'ids': ['a2']})['ok'] is False)
+ws.db("UPDATE posts SET arch_state='' WHERE id='a2'")
+check('归档删除空ids拒绝', ws.api_yuque_delete({'ids': []})['ok'] is False)
+
 print('---- RESULT: %s ----' % ('ALL PASS' if ok else 'HAS FAILURES'))
 sys.exit(0 if ok else 1)

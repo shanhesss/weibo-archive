@@ -52,6 +52,9 @@ YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:
 SYNC_WORKERS = 2                 # 批内并发路数：2 路并行跑，墙钟约减半
 SYNC_TIMEOUT = 240               # 单条 claude 调用超时（秒）
 
+SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
+SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
+
 API_BASE = 'https://m.weibo.cn'
 PAGE_COUNT = 50                 # 列表接口每页条数（上限 100）
 PAGE_SLEEP = (6, 10)            # 页间随机间隔（对齐社区反风控实践）
@@ -702,6 +705,47 @@ def cookie_watcher():
             pass                  # 网络抖动等：保持原状，下轮再试
 
 
+def sched_cfg():
+    """定时拉取配置：开关 + 间隔（分钟，越界自动夹回 30~1440）"""
+    try:
+        minutes = int(kv_get('sched_minutes') or '60')
+    except ValueError:
+        minutes = 60
+    return kv_get('sched_on') == '1', min(max(minutes, SCHED_MIN_MINUTES), SCHED_MAX_MINUTES)
+
+
+def enqueue_all():
+    """一键全部拉取的入队规则：逐个博主入队（有未完成全量的续拉，否则增量），在拉/排队的跳过。
+    返回 (实际入队的 uid 列表, 跳过数)。手动一键与定时触发共用。"""
+    started, skipped = [], 0
+    for r in db('SELECT uid, state, next_page FROM bloggers '
+                'ORDER BY sort_order, created_at, rowid').fetchall():
+        if r['state'] in ('queued', 'fulling'):
+            skipped += 1
+            continue
+        enqueue(r['uid'], 'full' if r['next_page'] else 'incr')
+        started.append(r['uid'])
+    return started, skipped
+
+
+def schedule_worker():
+    """定时拉取：到点按一键全部拉取规则跑一轮；上次执行时间落库，
+    工具重启后发现已超间隔会在首轮循环自然补跑一次（只补一次）"""
+    while True:
+        time.sleep(20)
+        try:
+            on, minutes = sched_cfg()
+            if not on:
+                continue
+            if time.time() - float(kv_get('sched_last') or 0) < minutes * 60:
+                continue
+            kv_set('sched_last', str(int(time.time())))   # 先落时间再入队，防重复触发
+            if kv_get('cookie'):                          # 没登录信息就不入队，等下个间隔
+                enqueue_all()
+        except Exception:
+            pass                  # 兜底：调度线程不能死
+
+
 REFRESH = {'total': 0, 'done': 0}           # 批量更新的总数与已完成数（供前端显示进度）
 DELETED_HINTS = ('删除', '不存在', '已删除')     # 接口提示「该微博不存在/已删除」的特征
 
@@ -1081,8 +1125,10 @@ def blogger_rows():
 def api_state():
     cookie_status = kv_get('cookie_status') or ('unknown' if kv_get('cookie') else 'none')
     busy = any(b['state'] in ('queued', 'fulling') for b in blogger_rows())
+    on, minutes = sched_cfg()
     return {'ok': True, 'cookie_status': cookie_status, 'cookie_set': bool(kv_get('cookie')),
             'bloggers': blogger_rows(), 'busy': busy,
+            'schedule': {'on': on, 'minutes': minutes},
             'refresh_total': REFRESH['total'], 'refresh_done': REFRESH['done'],
             'yuque_total': SYNC['total'], 'yuque_done': SYNC['done'], 'yuque_msg': SYNC['msg']}
 
@@ -1205,27 +1251,36 @@ def api_sync(body):
 
 
 def api_sync_all(body):
-    """一键为全部博主拉取新微博：逐个入队（有未完成全量的续拉，否则增量）；
-    已在拉取/排队的自动跳过；返回本次实际启动的博主清单，供前端跟踪批量进度"""
-    rows = db('SELECT uid FROM bloggers ORDER BY sort_order, created_at, rowid').fetchall()
-    if not rows:
+    """一键为全部博主拉取新微博：入队规则见 enqueue_all；返回本次实际启动的博主清单，供前端跟踪批量进度"""
+    if not db('SELECT uid FROM bloggers LIMIT 1').fetchone():
         return {'ok': False, 'error': '还没有添加博主，先添加一位再拉取'}
     if not kv_get('cookie'):
         return {'ok': False, 'error': '还没有填写登录信息，请先在页面顶部粘贴'}
-    started, skipped = [], 0
-    for r in rows:
-        row = db('SELECT state, next_page FROM bloggers WHERE uid=?', (r['uid'],)).fetchone()
-        if row['state'] in ('queued', 'fulling'):
-            skipped += 1
-            continue
-        enqueue(r['uid'], 'full' if row['next_page'] else 'incr')
-        started.append(r['uid'])
+    started, skipped = enqueue_all()
     if not started:
         return {'ok': False, 'error': '所有博主都在拉取中，稍后再点'}
     msg = '已开始为 %d 位博主拉取新微博' % len(started)
     if skipped:
         msg += '，%d 位正在拉取已跳过' % skipped
     return {'ok': True, 'total': len(started), 'started': started, 'skipped': skipped, 'message': msg}
+
+
+def api_schedule(body):
+    """定时拉取设置：开关 + 间隔（分钟）；开启即从当前时刻起算一个新周期"""
+    if not body.get('on'):
+        kv_set('sched_on', '0')
+        return {'ok': True}
+    try:
+        minutes = int(body.get('minutes'))
+    except (TypeError, ValueError):
+        return {'ok': False, 'error': '请填写拉取间隔（分钟）'}
+    if minutes < SCHED_MIN_MINUTES or minutes > SCHED_MAX_MINUTES:
+        return {'ok': False, 'error': '间隔需在 %d 分钟到 %d 分钟（24 小时）之间'
+                % (SCHED_MIN_MINUTES, SCHED_MAX_MINUTES)}
+    kv_set('sched_minutes', str(minutes))
+    kv_set('sched_on', '1')
+    kv_set('sched_last', str(int(time.time())))
+    return {'ok': True}
 
 
 def api_refull(body):
@@ -1427,6 +1482,112 @@ def api_yuque_mark(body):
     return {'ok': True, 'updated': cur.rowcount}
 
 
+YUQUE_API = 'https://www.yuque.com/api/v2'
+
+
+def load_yuque_token():
+    """运行时读取语雀个人令牌：复用归档 MCP 配置的 YUQUE_PERSONAL_TOKEN（不入代码、不入库）"""
+    home = os.path.expanduser('~')
+    for path in (os.path.join(home, '.claude', 'settings.json'),
+                 os.path.join(home, '.claude.json'),
+                 os.path.join(BASE_DIR, '.mcp.json')):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception:
+            continue
+        tok = ((cfg.get('env') or {}).get('YUQUE_PERSONAL_TOKEN') or '').strip()
+        if tok:
+            return tok
+        for srv in (cfg.get('mcpServers') or {}).values():
+            tok = (((srv or {}).get('env') or {}).get('YUQUE_PERSONAL_TOKEN') or '').strip()
+            if tok:
+                return tok
+    return ''
+
+
+def _yuque_api(path, token, method='GET'):
+    """语雀 OpenAPI 调用，返回 (data, status)；404 原样返回供上层判断「已不存在」"""
+    req = urllib.request.Request(YUQUE_API + path, method=method,
+                                 headers={'X-Auth-Token': token,
+                                          'User-Agent': 'weibo-archive',
+                                          'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode('utf-8', 'replace')), resp.status
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, 404
+        raise ApiError('语雀接口错误（%d）' % e.code)
+    except (urllib.error.URLError, OSError) as e:
+        raise ApiError('连接语雀失败：%s' % e)
+
+
+def parse_yuque_doc_url(url):
+    """语雀文档链接 → (账号/知识库, 文档slug)；认不出返回 None"""
+    m = re.match(r'^https://www\.yuque\.com/([^/?#\s]+)/([^/?#\s]+)/([^/?#\s]+)', (url or '').strip())
+    return ('%s/%s' % (m.group(1), m.group(2)), m.group(3)) if m else None
+
+
+def yuque_delete_doc(url, token):
+    """删除语雀文档：链接解析出知识库与 slug → 列表里查出数字 id → DELETE。
+    文档或知识库已不存在（404 / 查不到）视为删除成功"""
+    parsed = parse_yuque_doc_url(url)
+    if not parsed:
+        raise ApiError('语雀文档链接格式不对：%s' % url)
+    namespace, slug = parsed
+    doc_id = None
+    for offset in range(0, 2000, 100):
+        # ponytail: 线性翻页查 id（上限 2000 篇）；单库超过这个量再换语雀搜索接口
+        data, st = _yuque_api('/repos/%s/docs?limit=100&offset=%d' % (namespace, offset), token)
+        if st == 404:
+            return                                  # 知识库都没了 → 文档自然不在了
+        docs = (data or {}).get('data') or []
+        for d in docs:
+            if d.get('slug') == slug:
+                doc_id = d.get('id')
+                break
+        if doc_id or len(docs) < 100:
+            break
+    if not doc_id:
+        return                                      # 文档已不存在 → 视为删除成功
+    _, st = _yuque_api('/repos/%s/docs/%s' % (namespace, doc_id), token, method='DELETE')
+    if st == 404:
+        return
+
+
+def api_yuque_delete(body):
+    """归档删除：逐条删语雀文档，成功后该微博重置为「待归档」；远端失败原样保留可重试。
+    串行执行，中途失败继续删其余，最后汇总成功/失败数"""
+    ids = _clean_ids(body)
+    if not ids:
+        return {'ok': False, 'error': '没有选中要删除的微博'}
+    token = load_yuque_token()
+    if not token:
+        return {'ok': False, 'error': '未找到语雀令牌：请在 ~/.claude/settings.json 配置 YUQUE_PERSONAL_TOKEN'}
+    rows = db('SELECT id, yuque_doc_url, arch_state FROM posts WHERE id IN (%s)'
+              % ','.join('?' * len(ids)), tuple(ids)).fetchall()
+    todo = [r for r in rows if r['yuque_doc_url'] and r['arch_state'] not in ('syncing', 'updating')]
+    if not todo:
+        return {'ok': False, 'error': '选中的微博没有可删除的语雀文档（未归档或正在同步中）'}
+    ok = failed = 0
+    first_err = ''
+    for r in todo:
+        try:
+            yuque_delete_doc(r['yuque_doc_url'], token)
+            db("UPDATE posts SET archived=0, arch_skip=0, arch_fail='', arch_state='', "
+               "yuque_doc_url='', archived_at='' WHERE id=?", (r['id'],))
+            ok += 1
+        except Exception as e:  # noqa: BLE001 —— 单条失败不阻断其余
+            failed += 1
+            if not first_err:
+                first_err = str(e)
+    res = {'ok': True, 'deleted': ok, 'failed': failed}
+    if failed:
+        res['error_sample'] = first_err
+    return res
+
+
 def api_posts(query):
     try:
         page = max(1, int(query.get('page', ['1'])[0]))
@@ -1581,6 +1742,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_sync(body))
             elif path == '/api/sync_all':
                 self._json(api_sync_all(body))
+            elif path == '/api/schedule':
+                self._json(api_schedule(body))
             elif path == '/api/pause':
                 self._json(api_pause(body))
             elif path == '/api/blogger/delete':
@@ -1601,6 +1764,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_yuque_sync(body))
             elif path == '/api/yuque/mark':
                 self._json(api_yuque_mark(body))
+            elif path == '/api/yuque/delete':
+                self._json(api_yuque_delete(body))
             elif path == '/api/yuque/cancel':
                 self._json(api_yuque_cancel(body))
             elif path == '/api/update/cancel':
@@ -1652,6 +1817,7 @@ def main():
     threading.Thread(target=refresh_worker, daemon=True).start()   # 专职批量更新通道
     threading.Thread(target=archive_worker, daemon=True).start()   # 专职语雀归档通道
     threading.Thread(target=cookie_watcher, daemon=True).start()
+    threading.Thread(target=schedule_worker, daemon=True).start()  # 定时拉取调度
 
     # pythonw 后台运行时没有控制台（stdout 为 None），print 全部丢失：日志转写到文件
     if sys.stdout is None:
