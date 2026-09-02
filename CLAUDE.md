@@ -18,16 +18,16 @@
 - 数据全部在 `weibo.db`（SQLite 单文件）；接口原始 JSON 留底（ADR-0003）。
 - 拉取走 m.weibo.cn 非官方接口 + 小号 cookie（ADR-0002）；432 退避、断点续爬、增量 / 全量 / 重拉语义见 ADR-0006 / 0007。
 - 定时拉取 = 一键全部拉取的定时版：配置存 kv 表（开关 + 间隔，30~1440 分钟），调度线程到点入队，重启后超间隔补跑一次。
-- 语雀归档 = 无头 claude CLI + yuque MCP（ADR-0008）：weibo_server spawn `claude -p`，AI 总结 + 建语雀文档一体完成；语雀 token 不入库、不入 git。
-- 语雀删除 = OpenAPI 直连（ADR-0009）：yuque MCP 无删除工具，删除走 `DELETE /api/v2/repos/:namespace/docs/:id`，token 运行时读 `~/.claude/settings.json`。
+- 语雀归档 = 无头 claude CLI + yuque MCP（ADR-0008）：weibo_server spawn `claude -p`，AI 总结 + 建语雀文档一体完成；语雀 token 按用户存 `weibo.db` 的 `user_kv` 表（ADR-0010），不入 git；旧库迁移时一次性从 `~/.claude/settings.json` 导入。
+- 语雀删除 = OpenAPI 直连（ADR-0009）：yuque MCP 无删除工具，删除走 `DELETE /api/v2/repos/:namespace/docs/:id`，token 从该用户的 `user_kv` 读取（ADR-0010）。
 - 新增功能的全部产出（代码 / 文档 / 数据）放 weibo/ 内，后续相关文件也只往里加。
 
 ## 易用性（五条硬承诺）
 
-1. **单页单屏、无 Tab 无弹窗**：所有功能一屏可达
+1. **主界面单页单屏、无 Tab 无弹窗**：所有功能一屏可达（登录视图与个人设置 / 管理弹窗是唯一例外）
 2. **零术语**：界面不出现 432、containerid、uid 等字眼，状态全部人话
 3. **常用操作 ≤2 次点击**
-4. **默认即可用**：无必填配置，登录信息未填只出一条引导
+4. **默认即可用**：登录后即可用，无必填配置；微博登录信息未填只出一条引导
 5. **进度一屏可见**
 
 **兜底原则：任何时刻页面出现用户看不懂的状态，视为 bug。**

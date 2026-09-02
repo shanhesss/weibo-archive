@@ -1,39 +1,39 @@
 @echo off
 chcp 936 >nul
 cd /d "%~dp0"
-title Î¢²©´æµµ - ÖØÐÂ´ò°ü
+title Î¢ï¿½ï¿½ï¿½æµµ - ï¿½ï¿½ï¿½Â´ï¿½ï¿½
 echo ====================================
-echo   Î¢²©´æµµ - ÖØÐÂ´ò°ü½Å±¾
+echo   Î¢ï¿½ï¿½ï¿½æµµ - ï¿½ï¿½ï¿½Â´ï¿½ï¿½ï¿½Å±ï¿½
 echo ====================================
 
-rem 1. Í£µôÕýÔÚÔËÐÐµÄ exe£¨·ñÔòÎÄ¼þ±»Õ¼ÓÃ£¬ÐÂ exe ¸²¸Ç²»ÁË£©
-echo [1/3] ¹Ø±ÕÕýÔÚÔËÐÐµÄ weibo_archive.exe ...
+rem 1. Í£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ðµï¿½ exeï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½ï¿½ï¿½Õ¼ï¿½Ã£ï¿½ï¿½ï¿½ exe ï¿½ï¿½ï¿½Ç²ï¿½ï¿½Ë£ï¿½
+echo [1/3] ï¿½Ø±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ðµï¿½ weibo_archive.exe ...
 taskkill /f /im weibo_archive.exe >nul 2>&1
 ping 127.0.0.1 -n 2 >nul
 
-rem 2. È·±£ PyInstaller ÒÑ°²×°
+rem 2. È·ï¿½ï¿½ PyInstaller ï¿½Ñ°ï¿½×°
 python -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
-  echo Ê×´ÎÊ¹ÓÃ£ºÕýÔÚ°²×° PyInstaller ...
+  echo ï¿½×´ï¿½Ê¹ï¿½Ã£ï¿½ï¿½ï¿½ï¿½Ú°ï¿½×° PyInstaller ...
   python -m pip install pyinstaller
 )
 
-rem 3. ÖØÐÂ´ò°ü
-echo [2/3] ¿ªÊ¼´ò°ü£¨Ô¼ 1-2 ·ÖÖÓ£¬ÇëÉÔºò£©...
-python -m PyInstaller --noconfirm --onefile --noconsole --name weibo_archive --icon weibo_icon.ico --add-data "weibo_web.html;." weibo_server.py
+rem 3. ï¿½ï¿½ï¿½Â´ï¿½ï¿½
+echo [2/3] ï¿½ï¿½Ê¼ï¿½ï¿½ï¿½ï¿½ï¿½Ô¼ 1-2 ï¿½ï¿½ï¿½Ó£ï¿½ï¿½ï¿½ï¿½Ôºï¿½...
+python -m PyInstaller --noconfirm --onefile --noconsole --name weibo_archive --icon weibo_icon.ico --add-data "weibo_web.html;." --add-data "yuque-sync-template.md;." weibo_server.py
 if errorlevel 1 (
   echo.
-  echo *** ´ò°üÊ§°Ü£¡Çë²é¿´ÉÏ·½´íÎóÐÅÏ¢¡£***
+  echo *** ï¿½ï¿½ï¿½Ê§ï¿½Ü£ï¿½ï¿½ï¿½é¿´ï¿½Ï·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¢ï¿½ï¿½***
   pause
   exit /b 1
 )
 
-rem 4. ÇåÀíÖÐ¼ä²úÎï
-echo [3/3] ÇåÀíÁÙÊ±ÎÄ¼þ ...
+rem 4. ï¿½ï¿½ï¿½ï¿½ï¿½Ð¼ï¿½ï¿½ï¿½ï¿½
+echo [3/3] ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½Ä¼ï¿½ ...
 if exist build rmdir /s /q build
 
 echo.
 echo ====================================
-echo   ´ò°üÍê³É£¡ÐÂ°æ±¾ÔÚ dist\weibo_archive.exe
+echo   ï¿½ï¿½ï¿½ï¿½ï¿½É£ï¿½ï¿½Â°æ±¾ï¿½ï¿½ dist\weibo_archive.exe
 echo ====================================
 pause

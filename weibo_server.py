@@ -19,15 +19,19 @@ import concurrent.futures
 import datetime
 import email.utils
 import glob
+import hashlib
 import html as html_mod
+import http.cookies
 import json
 import os
 import random
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -89,15 +93,35 @@ CONN = None
 
 
 def init_db():
-    global CONN
-    CONN = sqlite3.connect(DB_PATH, check_same_thread=False)
+    global CONN, MIGRATE_MSG
+    # cached_statements=0：多线程共用连接时，语句缓存会让同文本 SQL 复用同一 prepared
+    # statement，互相重置游标导致 fetchone() 读到 None/半行（曾引发 posts 主键冲突）
+    CONN = sqlite3.connect(DB_PATH, check_same_thread=False, cached_statements=0)
     CONN.row_factory = sqlite3.Row
     CONN.execute('PRAGMA journal_mode=WAL')
     CONN.executescript('''
     CREATE TABLE IF NOT EXISTS kv (
       k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      pass_hash TEXT NOT NULL,                 -- PBKDF2-HMAC-SHA256 hex
+      pass_salt TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',       -- admin / user
+      disabled INTEGER NOT NULL DEFAULT 0,     -- 管理员强制停用
+      deactivated_at INTEGER NOT NULL DEFAULT 0,  -- 注销时间戳，0=未注销，7 天后清除
+      can_archive INTEGER NOT NULL DEFAULT 0,  -- 语雀 AI 归档权限（消耗服务器 claude 配额）
+      created_at TEXT, last_login_at TEXT);
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS user_kv (       -- 按用户设置（cookie/定时/语雀令牌等）
+      user_id INTEGER NOT NULL, k TEXT NOT NULL, v TEXT,
+      PRIMARY KEY (user_id, k));
     CREATE TABLE IF NOT EXISTS bloggers (
-      uid TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      uid TEXT NOT NULL,
       nickname TEXT DEFAULT '',
       avatar TEXT DEFAULT '',
       intro TEXT DEFAULT '',
@@ -109,9 +133,11 @@ def init_db():
       sort_order INTEGER DEFAULT 0,   -- 博主列表排序序号（1 起，可上下移动）
       note TEXT DEFAULT '',           -- 人话进度/错误说明，直接展示给用户
       last_synced_at TEXT,
-      created_at TEXT);
+      created_at TEXT,
+      PRIMARY KEY (user_id, uid));
     CREATE TABLE IF NOT EXISTS posts (
-      id TEXT PRIMARY KEY,            -- 微博 id（字符串，防长数字丢精度）
+      user_id INTEGER NOT NULL,
+      id TEXT NOT NULL,                 -- 微博 id（字符串，防长数字丢精度）
       uid TEXT NOT NULL,
       bid TEXT DEFAULT '',
       text TEXT DEFAULT '',
@@ -131,35 +157,122 @@ def init_db():
       archived_at TEXT,
       arch_fail TEXT DEFAULT '',      -- 归档失败原因（同步失败/更新失败，空=无失败）
       arch_skip INTEGER DEFAULT 0,    -- 1=无需归档（用户手动标记）
-      arch_state TEXT DEFAULT '');    -- 瞬态：syncing 同步中 / updating 更新中（空=无）
-    CREATE INDEX IF NOT EXISTS idx_posts_uid_ts ON posts(uid, created_ts DESC);
-    CREATE INDEX IF NOT EXISTS idx_posts_ts ON posts(created_ts DESC);
+      arch_state TEXT DEFAULT '',     -- 瞬态：syncing 同步中 / updating 更新中（空=无）
+      PRIMARY KEY (user_id, id));
     CREATE TABLE IF NOT EXISTS pull_seen (
-      uid TEXT NOT NULL, id TEXT NOT NULL,
-      PRIMARY KEY(uid, id));          -- 全量拉取中已见到的博文清单（跨断点续爬持久保留）
+      user_id INTEGER NOT NULL, uid TEXT NOT NULL, id TEXT NOT NULL,
+      PRIMARY KEY(user_id, uid, id));  -- 全量拉取中已见到的博文清单（跨断点续爬持久保留）
     ''')
-    # 旧库迁移：补列（新库直接建表已含）
-    for table, col, decl in (('bloggers', 'homepage', "TEXT DEFAULT ''"),
-                             ('bloggers', 'yuque_dir', "TEXT DEFAULT ''"),
-                             ('bloggers', 'pull_from', 'INTEGER DEFAULT 0'),
-                             ('bloggers', 'sort_order', 'INTEGER DEFAULT 0'),
-                             ('posts', 'deleted', 'INTEGER DEFAULT 0'),
-                             ('posts', 'archived', 'INTEGER DEFAULT 0'),
-                             ('posts', 'yuque_doc_url', "TEXT DEFAULT ''"),
-                             ('posts', 'archived_at', "TEXT DEFAULT ''"),
-                             ('posts', 'arch_fail', "TEXT DEFAULT ''"),
-                             ('posts', 'arch_skip', 'INTEGER DEFAULT 0'),
-                             ('posts', 'arch_state', "TEXT DEFAULT ''")):
-        cols = [r[1] for r in CONN.execute('PRAGMA table_info(%s)' % table).fetchall()]
-        if col not in cols:
-            CONN.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
-    # 老库补博主排序序号（按添加时间），保证 sort_order 连续不重复
-    if any(r['c'] for r in CONN.execute(
-            'SELECT COUNT(*) c FROM bloggers WHERE sort_order=0').fetchall()):
-        for k, r in enumerate(CONN.execute(
-                'SELECT uid FROM bloggers ORDER BY created_at, rowid').fetchall(), 1):
-            CONN.execute('UPDATE bloggers SET sort_order=? WHERE uid=?', (k, r[0]))
+    if 'user_id' not in [r[1] for r in CONN.execute('PRAGMA table_info(bloggers)').fetchall()]:
+        # 旧库升级（bloggers 还是旧结构）：先补齐早期版本缺的列，再做用户化迁移（ADR-0010）
+        for table, col, decl in (('bloggers', 'homepage', "TEXT DEFAULT ''"),
+                                 ('bloggers', 'yuque_dir', "TEXT DEFAULT ''"),
+                                 ('bloggers', 'pull_from', 'INTEGER DEFAULT 0'),
+                                 ('bloggers', 'sort_order', 'INTEGER DEFAULT 0'),
+                                 ('posts', 'deleted', 'INTEGER DEFAULT 0'),
+                                 ('posts', 'archived', 'INTEGER DEFAULT 0'),
+                                 ('posts', 'yuque_doc_url', "TEXT DEFAULT ''"),
+                                 ('posts', 'archived_at', "TEXT DEFAULT ''"),
+                                 ('posts', 'arch_fail', "TEXT DEFAULT ''"),
+                                 ('posts', 'arch_skip', 'INTEGER DEFAULT 0'),
+                                 ('posts', 'arch_state', "TEXT DEFAULT ''")):
+            cols = [r[1] for r in CONN.execute('PRAGMA table_info(%s)' % table).fetchall()]
+            if col not in cols:
+                CONN.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
+        if CONN.execute('SELECT COUNT(*) c FROM bloggers WHERE sort_order=0').fetchone()['c']:
+            for k, r in enumerate(CONN.execute(
+                    'SELECT uid FROM bloggers ORDER BY created_at, rowid').fetchall(), 1):
+                CONN.execute('UPDATE bloggers SET sort_order=? WHERE uid=?', (k, r[0]))
+        CONN.commit()
+        _migrate_multiuser(_seed_admin())
+    CONN.executescript('''
+    CREATE INDEX IF NOT EXISTS idx_posts_uid_ts ON posts(user_id, uid, created_ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_ts ON posts(user_id, created_ts DESC);
+    ''')
+    if not CONN.execute('SELECT id FROM users LIMIT 1').fetchone():
+        _seed_admin()
+    if not CONN.execute("SELECT v FROM kv WHERE k='invite_code'").fetchone():
+        CONN.execute("INSERT INTO kv(k,v) VALUES('invite_code',?)",
+                     (secrets.token_urlsafe(8),))
+    CONN.execute("INSERT OR IGNORE INTO kv(k,v) VALUES('schema_version','2')")
     CONN.commit()
+
+
+MIGRATE_MSG = ''      # 首次迁移生成的 admin 初始密码提示，由 main() 打印
+
+
+def _seed_admin():
+    """内置 admin：密码取环境变量 AUTH_ADMIN_PASSWORD，未设则随机生成（只展示一次）；返回用户 id"""
+    global MIGRATE_MSG
+    pw = os.environ.get('AUTH_ADMIN_PASSWORD') or secrets.token_urlsafe(12)
+    salt = secrets.token_hex(16)
+    cur = CONN.execute('INSERT INTO users(username,pass_hash,pass_salt,role,can_archive,created_at) '
+                       'VALUES(?,?,?,?,1,?)',
+                       ('admin', _hash_password(pw, salt), salt, 'admin', now_str()))
+    if not os.environ.get('AUTH_ADMIN_PASSWORD'):
+        MIGRATE_MSG = '初始管理员账号：admin  密码：%s（只显示这一次，请立即登录后修改）' % pw
+    return cur.lastrowid
+
+
+def _migrate_multiuser(admin_id):
+    """单用户旧库 → 多用户（ADR-0010）：存量数据全归 admin；全局设置与语雀令牌搬到其名下。
+    users/sessions/user_kv 等表已由 init_db 建好；启动前 backup_db() 已留备份，可回滚。"""
+    for k in ('cookie', 'cookie_status', 'sched_on', 'sched_minutes', 'sched_last'):
+        row = CONN.execute('SELECT v FROM kv WHERE k=?', (k,)).fetchone()
+        if row:
+            CONN.execute('INSERT OR REPLACE INTO user_kv(user_id,k,v) VALUES(?,?,?)',
+                         (admin_id, k, row[0]))
+            CONN.execute('DELETE FROM kv WHERE k=?', (k,))
+    tok = load_yuque_token()          # 一次性导入本机 claude 配置里的语雀令牌，此后只认库
+    if tok:
+        CONN.execute('INSERT OR REPLACE INTO user_kv(user_id,k,v) VALUES(?,?,?)',
+                     (admin_id, 'yuque_token', tok))
+    # 三张存量表重建：加 user_id 归属（全部记在 admin 名下）
+    CONN.executescript('''
+    CREATE TABLE bloggers_new (
+      user_id INTEGER NOT NULL, uid TEXT NOT NULL,
+      nickname TEXT DEFAULT '', avatar TEXT DEFAULT '', intro TEXT DEFAULT '',
+      homepage TEXT DEFAULT '', yuque_dir TEXT DEFAULT '', state TEXT DEFAULT 'idle',
+      next_page INTEGER, pull_from INTEGER DEFAULT 0, sort_order INTEGER DEFAULT 0,
+      note TEXT DEFAULT '', last_synced_at TEXT, created_at TEXT,
+      PRIMARY KEY (user_id, uid));
+    ''')
+    for r in CONN.execute('SELECT * FROM bloggers').fetchall():
+        CONN.execute('INSERT INTO bloggers_new(user_id,uid,nickname,avatar,intro,homepage,'
+                     'yuque_dir,state,next_page,pull_from,sort_order,note,last_synced_at,created_at) '
+                     'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                     (admin_id, r['uid'], r['nickname'], r['avatar'], r['intro'], r['homepage'],
+                      r['yuque_dir'], r['state'], r['next_page'], r['pull_from'],
+                      r['sort_order'], r['note'], r['last_synced_at'], r['created_at']))
+    CONN.executescript('DROP TABLE bloggers; ALTER TABLE bloggers_new RENAME TO bloggers;')
+    CONN.executescript('''
+    CREATE TABLE posts_new (
+      user_id INTEGER NOT NULL, id TEXT NOT NULL, uid TEXT NOT NULL, bid TEXT DEFAULT '',
+      text TEXT DEFAULT '', created_ts INTEGER, created_raw TEXT DEFAULT '',
+      reposts INTEGER DEFAULT 0, comments INTEGER DEFAULT 0, atts INTEGER DEFAULT 0,
+      media_json TEXT DEFAULT '{}', retweeted_json TEXT DEFAULT '', raw_json TEXT,
+      fetched_at TEXT, counts_updated_at TEXT, deleted INTEGER DEFAULT 0,
+      archived INTEGER DEFAULT 0, yuque_doc_url TEXT DEFAULT '', archived_at TEXT,
+      arch_fail TEXT DEFAULT '', arch_skip INTEGER DEFAULT 0, arch_state TEXT DEFAULT '',
+      PRIMARY KEY (user_id, id));
+    ''')
+    for r in CONN.execute('SELECT * FROM posts').fetchall():
+        vals = (admin_id, r['id'], r['uid'], r['bid'], r['text'], r['created_ts'],
+                r['created_raw'], r['reposts'], r['comments'], r['atts'],
+                r['media_json'], r['retweeted_json'], r['raw_json'], r['fetched_at'],
+                r['counts_updated_at'], r['deleted'], r['archived'], r['yuque_doc_url'],
+                r['archived_at'], r['arch_fail'], r['arch_skip'], r['arch_state'])
+        CONN.execute('INSERT INTO posts_new VALUES(%s)' % ','.join('?' * len(vals)), vals)
+    CONN.executescript('''
+    DROP TABLE posts; ALTER TABLE posts_new RENAME TO posts;
+    CREATE TABLE pull_seen_new (
+      user_id INTEGER NOT NULL, uid TEXT NOT NULL, id TEXT NOT NULL,
+      PRIMARY KEY(user_id, uid, id));
+    ''')
+    if CONN.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pull_seen'").fetchone():
+        for r in CONN.execute('SELECT * FROM pull_seen').fetchall():
+            CONN.execute('INSERT INTO pull_seen_new VALUES(?,?,?)', (admin_id, r['uid'], r['id']))
+    CONN.executescript('DROP TABLE IF EXISTS pull_seen; ALTER TABLE pull_seen_new RENAME TO pull_seen;')
 
 
 def db(sql, params=()):
@@ -178,16 +291,111 @@ def kv_set(k, v):
     db('INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', (k, v))
 
 
+def ukv_get(user_id, k, default=None):
+    row = db('SELECT v FROM user_kv WHERE user_id=? AND k=?', (user_id, k)).fetchone()
+    return row[0] if row else default
+
+
+def ukv_set(user_id, k, v):
+    db('INSERT INTO user_kv(user_id,k,v) VALUES(?,?,?) '
+       'ON CONFLICT(user_id,k) DO UPDATE SET v=excluded.v', (user_id, k, v))
+
+
+# ---------------------------------------------------------------- 认证 ----
+SESSION_TTL = 30 * 86400            # 会话 30 天滑动过期
+DEACTIVATE_GRACE = 7 * 86400        # 注销反悔期：7 天后自动清除数据
+USERNAME_RE = re.compile(r'^[\w\u4e00-\u9fa5]{3,16}$')
+LOGIN_FAILS = {}                    # username -> deque(失败时间戳)，进程内存，重启清零
+
+
+def _hash_password(pw, salt_hex):
+    return hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'),
+                               bytes.fromhex(salt_hex), 100_000).hex()
+
+
+def _verify_password(u, pw):
+    return secrets.compare_digest(_hash_password(pw, u['pass_salt']), u['pass_hash'])
+
+
+def new_session(user_id):
+    token = secrets.token_hex(32)
+    db('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)',
+       (token, user_id, int(time.time()) + SESSION_TTL))
+    return token
+
+
+def kill_sessions(user_id):
+    db('DELETE FROM sessions WHERE user_id=?', (user_id,))
+
+
+def session_user(token):
+    """有效会话 → 用户行（顺带滑动续期、校验未停用）；否则 None"""
+    if not token:
+        return None
+    row = db('SELECT u.*, s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id '
+             'WHERE s.token=?', (token,)).fetchone()
+    if not row:
+        return None
+    if row['expires_at'] < time.time():
+        db('DELETE FROM sessions WHERE token=?', (token,))
+        return None
+    if row['disabled'] or row['deactivated_at']:
+        return None                   # 禁用/注销即时失效
+    if row['expires_at'] - time.time() < SESSION_TTL // 2:     # 过半程才续期，避免每请求写库
+        db('UPDATE sessions SET expires_at=? WHERE token=?',
+           (int(time.time()) + SESSION_TTL, token))
+    return row
+
+
+def login_throttled(username):
+    """15 分钟内失败满 5 次 → 返回还需等待的秒数，否则 0"""
+    now = time.time()
+    dq = LOGIN_FAILS.get(username)
+    if dq:
+        while dq and now - dq[0] > 900:
+            dq.popleft()
+        if len(dq) >= 5:
+            return int(900 - (now - dq[0])) + 1
+    return 0
+
+
+def login_fail(username):
+    LOGIN_FAILS.setdefault(username, deque()).append(time.time())
+
+
+def login_ok(username):
+    LOGIN_FAILS.pop(username, None)
+
+
+def purge_stale_users():
+    """注销超 7 天 → 连同数据清除；顺带清过期会话"""
+    cutoff = time.time() - DEACTIVATE_GRACE
+    for u in db('SELECT id, username FROM users WHERE deactivated_at>0 AND deactivated_at<?',
+                (cutoff,)).fetchall():
+        delete_user_data(u['id'])
+        db('DELETE FROM users WHERE id=?', (u['id'],))
+        print('已清除注销超期账号：%s' % u['username'])
+    db('DELETE FROM sessions WHERE expires_at<?', (time.time(),))
+
+
+def delete_user_data(user_id):
+    """清除用户名下全部内容数据与会话（注销清除 / 管理员删除共用）"""
+    purge_user_tasks(user_id)
+    for t in ('posts', 'bloggers', 'pull_seen', 'user_kv', 'sessions'):
+        db('DELETE FROM %s WHERE user_id=?' % t, (user_id,))
+
+
 def now_str():
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
 # ------------------------------------------------------------ m 站会话 ----
 class MSession:
-    """带 Cookie 的 m.weibo.cn 请求会话（首次使用前先预热拿指纹 Cookie）"""
+    """带 Cookie 的 m.weibo.cn 请求会话（首次使用前先预热拿指纹 Cookie）；每个用户各自的登录态"""
 
-    def __init__(self):
-        raw = kv_get('cookie') or ''
+    def __init__(self, user_id):
+        self.user_id = user_id
+        raw = ukv_get(user_id, 'cookie') or ''
         self.cookies = {}
         raw = raw.strip().strip('﻿').strip().strip('"').strip()
         if raw.lower().startswith('cookie:'):
@@ -447,39 +655,64 @@ def fetch_profile(session, uid):
 
 
 # --------------------------------------------------------------- 任务 ----
-TASKQ = deque()
+TASKQ = deque()          # 元素 (user_id, uid, mode)
 Q_COND = threading.Condition()
-STOP = {}            # uid -> Event，置位表示请求暂停/取消当前任务
+STOP = {}            # (user_id, uid) -> Event，置位表示请求暂停/取消当前任务
 CANCEL = set()        # 已请求「取消」的博主（区别于暂停：取消→保留数据、丢弃断点）
 
 
-def set_blogger(uid, **fields):
+def set_blogger(user_id, uid, **fields):
     if not fields:
         return
     cols = ', '.join('%s=?' % k for k in fields)
-    db('UPDATE bloggers SET %s WHERE uid=?' % cols, tuple(fields.values()) + (uid,))
+    db('UPDATE bloggers SET %s WHERE user_id=? AND uid=?' % cols,
+       tuple(fields.values()) + (user_id, uid))
 
 
-def enqueue(uid, mode):
+def enqueue(user_id, uid, mode):
     """mode: 'full'（全量/续爬）或 'incr'（增量）；已在队列/拉取中则忽略"""
-    row = db('SELECT state FROM bloggers WHERE uid=?', (uid,)).fetchone()
-    if not row:
-        raise ApiError('博主不存在')
-    if row['state'] in ('queued', 'fulling'):
-        return False
+    # 检查与入队必须同一把锁：并发请求都过了状态检查再先后入队，会两路拉同一页撞博文主键
     with Q_COND:
-        TASKQ.append((uid, mode))
-        set_blogger(uid, state='queued', note='排队中，等待开始')
+        if any(t[:2] == (user_id, uid) for t in TASKQ):
+            return False
+        row = db('SELECT state FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone()
+        if not row:
+            raise ApiError('博主不存在')
+        if row['state'] in ('queued', 'fulling'):
+            return False
+        TASKQ.append((user_id, uid, mode))
+        set_blogger(user_id, uid, state='queued', note='排队中，等待开始')
         Q_COND.notify()
     return True
 
 
-def upsert_post(session, uid, mb, force=False, full=False):
+def purge_user_tasks(user_id):
+    """用户名下排队任务全部出队（禁用/注销/删除时调用）；进行中的靠 STOP 停"""
+    with Q_COND:
+        for i in range(len(TASKQ) - 1, -1, -1):
+            if TASKQ[i][0] == user_id:
+                del TASKQ[i]
+    with RQ_COND:
+        for i in range(len(REFRESH_QUEUE) - 1, -1, -1):
+            if REFRESH_QUEUE[i][0] == user_id:
+                del REFRESH_QUEUE[i]
+    with SYNC_COND:
+        for i in range(len(SYNC_QUEUE) - 1, -1, -1):
+            if SYNC_QUEUE[i][0] == user_id:
+                del SYNC_QUEUE[i]
+    for key, ev in list(STOP.items()):
+        if key[0] == user_id:
+            ev.set()
+
+
+def upsert_post(user_id, session, uid, mb, force=False, full=False):
     """写入/更新一条博文。force：已存在也整体覆盖（批量更新用）；full：mb 已是完整数据，跳过长文补拉"""
     pid = str(mb.get('id') or '')
     if not pid:
         return 'skip'
-    existing = db('SELECT id FROM posts WHERE id=?', (pid,)).fetchone()
+    if not db('SELECT 1 FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone():
+        return 'skip'          # 博主已被删除（如账号清除）：不再写入
+    existing = db('SELECT id FROM posts WHERE user_id=? AND id=?', (user_id, pid)).fetchone()
     text_html = mb.get('text') or ''
     if not full and not existing:
         # 只有新博文才补拉全文；已存在的博文只刷新计数，不重拉正文，避免每次增量都为整页长微博白等 5~8 秒
@@ -500,38 +733,42 @@ def upsert_post(session, uid, mb, force=False, full=False):
     raw = json.dumps(mb, ensure_ascii=False)
     if existing and force:
         db('UPDATE posts SET text=?, media_json=?, retweeted_json=?, raw_json=?, '
-           'reposts=?, comments=?, atts=?, counts_updated_at=?, fetched_at=?, deleted=0 WHERE id=?',
-           (text, media, rt, raw, reposts, comments, atts, now_str(), now_str(), pid))
+           'reposts=?, comments=?, atts=?, counts_updated_at=?, fetched_at=?, deleted=0 '
+           'WHERE user_id=? AND id=?',
+           (text, media, rt, raw, reposts, comments, atts, now_str(), now_str(), user_id, pid))
         res = 'update'
     elif existing:
-        db('UPDATE posts SET reposts=?, comments=?, atts=?, counts_updated_at=?, deleted=0 WHERE id=?',
-           (reposts, comments, atts, now_str(), pid))
+        db('UPDATE posts SET reposts=?, comments=?, atts=?, counts_updated_at=?, deleted=0 '
+           'WHERE user_id=? AND id=?',
+           (reposts, comments, atts, now_str(), user_id, pid))
         res = 'update'
     else:
-        db('INSERT INTO posts(id,uid,bid,text,created_ts,created_raw,reposts,comments,atts,'
+        db('INSERT INTO posts(user_id,id,uid,bid,text,created_ts,created_raw,reposts,comments,atts,'
            'media_json,retweeted_json,raw_json,fetched_at,counts_updated_at,deleted) '
-           'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)',
-           (pid, uid, mb.get('bid') or pid, text, parse_time(mb.get('created_at')),
+           'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)',
+           (user_id, pid, uid, mb.get('bid') or pid, text, parse_time(mb.get('created_at')),
             mb.get('created_at') or '', reposts, comments, atts, media, rt, raw, now_str(), now_str()))
         res = 'insert'
     if rt:                # 转发微博不支持归档 → 拉取时直接标「无需归档」
         db("UPDATE posts SET arch_skip=1, archived=0, arch_fail='', arch_state='', yuque_doc_url='' "
-           "WHERE id=?", (pid,))
+           "WHERE user_id=? AND id=?", (user_id, pid))
     return res
 
 
-def mark_cookie_expired():
-    kv_set('cookie_status', 'expired' if kv_get('cookie') else 'none')
+def mark_cookie_expired(user_id):
+    ukv_set(user_id, 'cookie_status', 'expired' if ukv_get(user_id, 'cookie') else 'none')
 
 
-def run_sync(uid, mode):
+def run_sync(user_id, uid, mode):
     """一次同步任务主体：全量翻到底 / 增量翻到已有为止；任何退出路径都落好状态"""
-    ev = STOP.setdefault(uid, threading.Event())
+    key = (user_id, uid)
+    ev = STOP.setdefault(key, threading.Event())
     ev.clear()
-    total = db('SELECT COUNT(*) c FROM posts WHERE uid=?', (uid,)).fetchone()['c']
+    total = db('SELECT COUNT(*) c FROM posts WHERE user_id=? AND uid=?', (user_id, uid)).fetchone()['c']
     start_ts = 0
     if mode == 'full':
-        row = db('SELECT next_page, pull_from FROM bloggers WHERE uid=?', (uid,)).fetchone()
+        row = db('SELECT next_page, pull_from FROM bloggers WHERE user_id=? AND uid=?',
+                 (user_id, uid)).fetchone()
         page = (row['next_page'] if row and row['next_page'] else 1) or 1
         start_ts = (row['pull_from'] if row and row['pull_from'] else 0) or 0
         label = '全量拉取'
@@ -543,34 +780,34 @@ def run_sync(uid, mode):
         start_label = datetime.date.fromtimestamp(start_ts).strftime('%Y-%m-%d')
     start_hint = ('（从 %s 起）' % start_label) if start_label else ''
     try:
-        session = MSession()
+        session = MSession(user_id)
     except CookieExpired:
-        mark_cookie_expired()
-        set_blogger(uid, state='paused', note='还没有填写登录信息，填写后会自动继续')
+        mark_cookie_expired(user_id)
+        set_blogger(user_id, uid, state='paused', note='还没有填写登录信息，填写后会自动继续')
         return
-    set_blogger(uid, state='fulling', note='%s%s准备中' % (label, start_hint))
+    set_blogger(user_id, uid, state='fulling', note='%s%s准备中' % (label, start_hint))
     inserted = updated = 0
     full_mode = mode == 'full'
     range_done = False                # 全量范围停止：翻到比所选起始时间更早的博文（置顶除外）
     if full_mode and page == 1:      # 全新全量：清空"已见"清单；断点续爬（page>1）不清，避免误判
-        db('DELETE FROM pull_seen WHERE uid=?', (uid,))
+        db('DELETE FROM pull_seen WHERE user_id=? AND uid=?', (user_id, uid))
 
     def revert_deleted():
         return                     # pull_seen 方案：拉取期间不打标记，中断无需回退
 
     def finish_paused():
         """用户点了暂停或取消：取消→done 保留数据丢弃断点；暂停→paused 保留断点"""
-        if uid in CANCEL:
-            CANCEL.discard(uid)
-            set_blogger(uid, state='done', next_page=None, pull_from=0,
+        if key in CANCEL:
+            CANCEL.discard(key)
+            set_blogger(user_id, uid, state='done', next_page=None, pull_from=0,
                         note='已取消，保留已拉取数据', last_synced_at=now_str())
         else:
-            set_blogger(uid, state='paused', note='%s%s已暂停，点击继续接着拉' % (label, start_hint),
+            set_blogger(user_id, uid, state='paused', note='%s%s已暂停，点击继续接着拉' % (label, start_hint),
                         next_page=mode == 'full' and page or None)
         revert_deleted()
 
     def save_progress(p, extra=''):
-        set_blogger(uid, next_page=mode == 'full' and p or None,
+        set_blogger(user_id, uid, next_page=mode == 'full' and p or None,
                     note='%s%s · 第%d页 · 新增%d条' % (label, start_hint, p - 1, inserted) + extra)
 
     while True:
@@ -579,10 +816,10 @@ def run_sync(uid, mode):
             return
         try:
             mblogs = fetch_page(session, uid, page)
-            kv_set('cookie_status', 'ok')
+            ukv_set(user_id, 'cookie_status', 'ok')
         except CookieExpired:
-            mark_cookie_expired()
-            set_blogger(uid, state='paused', note='登录已过期，请在页面顶部重新粘贴后点击继续',
+            mark_cookie_expired(user_id)
+            set_blogger(user_id, uid, state='paused', note='登录已过期，请在个人设置重新粘贴后点击继续',
                         next_page=mode == 'full' and page or None)
             revert_deleted()
             return
@@ -598,31 +835,31 @@ def run_sync(uid, mode):
                     return
                 try:
                     mblogs = fetch_page(session, uid, page)
-                    kv_set('cookie_status', 'ok')
+                    ukv_set(user_id, 'cookie_status', 'ok')
                     gave_up = False
                     break
                 except CookieExpired:
-                    mark_cookie_expired()
-                    set_blogger(uid, state='paused', note='登录已过期，请在页面顶部重新粘贴',
+                    mark_cookie_expired(user_id)
+                    set_blogger(user_id, uid, state='paused', note='登录已过期，请在个人设置重新粘贴',
                                 next_page=mode == 'full' and page or None)
                     revert_deleted()
                     return
                 except Blocked:
                     continue
                 except ApiError as e:
-                    set_blogger(uid, state='error', note='拉取出错：%s' % e,
+                    set_blogger(user_id, uid, state='error', note='拉取出错：%s' % e,
                                 next_page=mode == 'full' and page or None)
                     revert_deleted()
                     return
             if gave_up:
-                kv_set('cookie_status', 'limited')
-                set_blogger(uid, state='paused',
+                ukv_set(user_id, 'cookie_status', 'limited')
+                set_blogger(user_id, uid, state='paused',
                             note='微博暂时限制了访问频率，已自动暂停；过段时间点击继续即可',
                             next_page=mode == 'full' and page or None)
                 revert_deleted()
                 return
         except ApiError as e:
-            set_blogger(uid, state='error', note='拉取出错：%s' % e,
+            set_blogger(user_id, uid, state='error', note='拉取出错：%s' % e,
                         next_page=mode == 'full' and page or None)
             revert_deleted()
             return
@@ -630,13 +867,15 @@ def run_sync(uid, mode):
         if not mblogs or range_done:
             if full_mode:            # 拉完：本次范围内从未见到的博文确认已删除（pull_seen 清单）
                 if start_ts:         # 范围外（更早）的博文保持不动，不参与删除判定
-                    db('UPDATE posts SET deleted=1 WHERE uid=? AND created_ts>=? AND id NOT IN '
-                       '(SELECT id FROM pull_seen WHERE uid=?)', (uid, start_ts, uid))
+                    db('UPDATE posts SET deleted=1 WHERE user_id=? AND uid=? AND created_ts>=? AND id NOT IN '
+                       '(SELECT id FROM pull_seen WHERE user_id=? AND uid=?)',
+                       (user_id, uid, start_ts, user_id, uid))
                 else:
-                    db('UPDATE posts SET deleted=1 WHERE uid=? AND id NOT IN '
-                       '(SELECT id FROM pull_seen WHERE uid=?)', (uid, uid))
-            ndel = db('SELECT COUNT(*) c FROM posts WHERE uid=? AND deleted=1',
-                      (uid,)).fetchone()['c']
+                    db('UPDATE posts SET deleted=1 WHERE user_id=? AND uid=? AND id NOT IN '
+                       '(SELECT id FROM pull_seen WHERE user_id=? AND uid=?)',
+                       (user_id, uid, user_id, uid))
+            ndel = db('SELECT COUNT(*) c FROM posts WHERE user_id=? AND uid=? AND deleted=1',
+                      (user_id, uid)).fetchone()['c']
             if full_mode:
                 note = '全量拉取完成' + (start_label
                        and '，已从 %s 拉取到今天；更早的微博保持不动' % start_label or '，翻到底了')
@@ -644,7 +883,7 @@ def run_sync(uid, mode):
                 note = '%s完成，翻到底了' % label
             if full_mode and ndel:
                 note += '，%d条已标记为博主已删除' % ndel
-            set_blogger(uid, state='done', next_page=None, pull_from=0,
+            set_blogger(user_id, uid, state='done', next_page=None, pull_from=0,
                         note=note, last_synced_at=now_str())
             return
 
@@ -659,18 +898,20 @@ def run_sync(uid, mode):
                     break
             pid_mb = str(mb.get('id') or '')
             if pid_mb and full_mode:
-                db('INSERT OR IGNORE INTO pull_seen(uid,id) VALUES(?,?)', (uid, pid_mb))
-            r = upsert_post(session, uid, mb)
+                db('INSERT OR IGNORE INTO pull_seen(user_id,uid,id) VALUES(?,?,?)',
+                   (user_id, uid, pid_mb))
+            r = upsert_post(user_id, session, uid, mb)
             if r == 'insert':
                 inserted += 1
             elif r == 'update':
                 updated += 1
             if r == 'update' and not is_pinned(mb):
                 hit_existing = True
-        total = db('SELECT COUNT(*) c FROM posts WHERE uid=?', (uid,)).fetchone()['c']
+        total = db('SELECT COUNT(*) c FROM posts WHERE user_id=? AND uid=?',
+                   (user_id, uid)).fetchone()['c']
 
         if mode == 'incr' and hit_existing:
-            set_blogger(uid, state='done', next_page=None,
+            set_blogger(user_id, uid, state='done', next_page=None,
                         note='已同步到最新，共%d条（本次新增%d条、刷新%d条）' % (total, inserted, updated),
                         last_synced_at=now_str())
             return
@@ -684,139 +925,174 @@ COOKIE_CHECK_INTERVAL = 300        # 后台每几分钟复验一次 cookie
 
 
 def cookie_watcher():
-    """后台定期验证 cookie：真失效就把状态翻成过期，前端轮询会自动看到"""
+    """后台定期验证各用户的 cookie：真失效就把状态翻成过期，前端轮询会自动看到"""
     while True:
         time.sleep(COOKIE_CHECK_INTERVAL)
-        try:
-            if not kv_get('cookie'):
-                continue
-            if any(b['state'] in ('queued', 'fulling') for b in blogger_rows()):
-                continue          # 正在拉取就交给拉取流程去更新，不抢请求
-            ok = validate_cookie(MSession())
-            if ok:
-                kv_set('cookie_status', 'ok')
-            elif ok is False:
-                mark_cookie_expired()
-        except CookieExpired:
-            mark_cookie_expired()
-        except Blocked:
-            kv_set('cookie_status', 'limited')
-        except Exception:
-            pass                  # 网络抖动等：保持原状，下轮再试
+        for u in db('SELECT id FROM users WHERE disabled=0 AND deactivated_at=0').fetchall():
+            user_id = u['id']
+            try:
+                if not ukv_get(user_id, 'cookie'):
+                    continue
+                if db("SELECT 1 FROM bloggers WHERE user_id=? AND state IN ('queued','fulling')",
+                      (user_id,)).fetchone():
+                    continue          # 正在拉取就交给拉取流程去更新，不抢请求
+                ok = validate_cookie(MSession(user_id))
+                if ok:
+                    ukv_set(user_id, 'cookie_status', 'ok')
+                elif ok is False:
+                    mark_cookie_expired(user_id)
+            except CookieExpired:
+                mark_cookie_expired(user_id)
+            except Blocked:
+                ukv_set(user_id, 'cookie_status', 'limited')
+            except Exception:
+                pass                  # 网络抖动等：保持原状，下轮再试
 
 
-def sched_cfg():
-    """定时拉取配置：开关 + 间隔（分钟，越界自动夹回 30~1440）"""
+def sched_cfg(user_id):
+    """某用户的定时拉取配置：开关 + 间隔（分钟，越界自动夹回 30~1440）"""
     try:
-        minutes = int(kv_get('sched_minutes') or '60')
+        minutes = int(ukv_get(user_id, 'sched_minutes') or '60')
     except ValueError:
         minutes = 60
-    return kv_get('sched_on') == '1', min(max(minutes, SCHED_MIN_MINUTES), SCHED_MAX_MINUTES)
+    return ukv_get(user_id, 'sched_on') == '1', min(max(minutes, SCHED_MIN_MINUTES), SCHED_MAX_MINUTES)
 
 
-def enqueue_all():
+def enqueue_all(user_id):
     """一键全部拉取的入队规则：逐个博主入队（有未完成全量的续拉，否则增量），在拉/排队的跳过。
     返回 (实际入队的 uid 列表, 跳过数)。手动一键与定时触发共用。"""
     started, skipped = [], 0
-    for r in db('SELECT uid, state, next_page FROM bloggers '
-                'ORDER BY sort_order, created_at, rowid').fetchall():
+    for r in db('SELECT uid, state, next_page FROM bloggers WHERE user_id=? '
+                'ORDER BY sort_order, created_at, rowid', (user_id,)).fetchall():
         if r['state'] in ('queued', 'fulling'):
             skipped += 1
             continue
-        enqueue(r['uid'], 'full' if r['next_page'] else 'incr')
+        enqueue(user_id, r['uid'], 'full' if r['next_page'] else 'incr')
         started.append(r['uid'])
     return started, skipped
 
 
+_LAST_PURGE = ''      # 上次过期清理的日期（注销超期账号 + 过期会话，每天一次）
+
+
 def schedule_worker():
-    """定时拉取：到点按一键全部拉取规则跑一轮；上次执行时间落库，
+    """定时拉取：按用户各算各的周期，到点按一键全部拉取规则跑一轮；上次执行时间落库，
     工具重启后发现已超间隔会在首轮循环自然补跑一次（只补一次）"""
+    global _LAST_PURGE
     while True:
         time.sleep(20)
         try:
-            on, minutes = sched_cfg()
-            if not on:
-                continue
-            if time.time() - float(kv_get('sched_last') or 0) < minutes * 60:
-                continue
-            kv_set('sched_last', str(int(time.time())))   # 先落时间再入队，防重复触发
-            if kv_get('cookie'):                          # 没登录信息就不入队，等下个间隔
-                enqueue_all()
+            today = datetime.date.today().isoformat()
+            if today != _LAST_PURGE:
+                _LAST_PURGE = today
+                purge_stale_users()
+            for u in db('SELECT id FROM users WHERE disabled=0 AND deactivated_at=0').fetchall():
+                user_id = u['id']
+                on, minutes = sched_cfg(user_id)
+                if not on:
+                    continue
+                if time.time() - float(ukv_get(user_id, 'sched_last') or 0) < minutes * 60:
+                    continue
+                ukv_set(user_id, 'sched_last', str(int(time.time())))   # 先落时间再入队，防重复触发
+                if ukv_get(user_id, 'cookie'):                          # 没登录信息就不入队，等下个间隔
+                    enqueue_all(user_id)
         except Exception:
             pass                  # 兜底：调度线程不能死
 
 
-REFRESH = {'total': 0, 'done': 0}           # 批量更新的总数与已完成数（供前端显示进度）
+REFRESH = {}                          # user_id -> {'total','done'}，批量更新进度按用户隔离
 DELETED_HINTS = ('删除', '不存在', '已删除')     # 接口提示「该微博不存在/已删除」的特征
 
 
 def _is_deleted_error(e):
     s = str(e)
     return any(h in s for h in DELETED_HINTS)
-REFRESH_QUEUE = deque()
+
+
+def refresh_prog(user_id):
+    return REFRESH.setdefault(user_id, {'total': 0, 'done': 0})
+
+
+REFRESH_QUEUE = deque()               # 元素 (user_id, ids)
 RQ_COND = threading.Condition()
-REFRESH_CANCEL = threading.Event()   # 批量更新取消标记：set=用户点了取消
+REFRESH_CANCEL = set()                # 请求取消批量更新的 user_id 集合
 
 
-def run_refresh(ids):
+def run_refresh(user_id, ids):
     """批量更新：逐条抓取最新完整数据并覆盖写入（长文截断借此修复），逐条上报进度；支持中途取消"""
+    prog = refresh_prog(user_id)
     try:
-        session = MSession()
+        session = MSession(user_id)
     except CookieExpired:
-        mark_cookie_expired()
-        REFRESH['done'] = REFRESH['total']      # 标为全部完成，前端停止进度显示
+        mark_cookie_expired(user_id)
+        prog['done'] = prog['total']      # 标为全部完成，前端停止进度显示
         return
     for pid in ids:
-        if REFRESH_CANCEL.is_set():             # 用户取消 → 立即停
+        if user_id in REFRESH_CANCEL:     # 用户取消 → 立即停
             break
-        row = db('SELECT uid FROM posts WHERE id=?', (pid,)).fetchone()
+        row = db('SELECT uid FROM posts WHERE user_id=? AND id=?', (user_id, pid)).fetchone()
         if not row:
-            REFRESH['done'] += 1
+            prog['done'] += 1
             continue
         try:
             mb = fetch_post_detail(session, pid)
-            upsert_post(session, row['uid'], mb, force=True, full=True)
-            kv_set('cookie_status', 'ok')
+            upsert_post(user_id, session, row['uid'], mb, force=True, full=True)
+            ukv_set(user_id, 'cookie_status', 'ok')
         except CookieExpired:
-            mark_cookie_expired()
-            REFRESH['done'] += 1
+            mark_cookie_expired(user_id)
+            prog['done'] += 1
             break
         except Blocked:
-            kv_set('cookie_status', 'limited')
-            REFRESH['done'] += 1
+            ukv_set(user_id, 'cookie_status', 'limited')
+            prog['done'] += 1
             break
         except Exception as e:
             if _is_deleted_error(e):             # 微博上已不存在的博文 → 标记【博主已删除】
-                db('UPDATE posts SET deleted=1 WHERE id=?', (pid,))
-        REFRESH['done'] += 1
+                db('UPDATE posts SET deleted=1 WHERE user_id=? AND id=?', (user_id, pid))
+        prog['done'] += 1
         time.sleep(random.uniform(*DETAIL_SLEEP))
-    if REFRESH_CANCEL.is_set():                 # 取消收尾：清标记、标为结束
-        REFRESH_CANCEL.clear()
-        REFRESH['done'] = REFRESH['total']
+    if user_id in REFRESH_CANCEL:         # 取消收尾：清标记、标为结束
+        REFRESH_CANCEL.discard(user_id)
+        prog['done'] = prog['total']
 
 
 def refresh_worker():
     """专职批量更新通道：进队即跑，不等待、不暂停正在进行的拉取"""
     while True:
         with RQ_COND:
-            while not REFRESH_QUEUE and not REFRESH_CANCEL.is_set():
+            while not REFRESH_QUEUE and not REFRESH_CANCEL:
                 RQ_COND.wait()
-            ids = REFRESH_QUEUE.popleft() if REFRESH_QUEUE else None
-        if ids is None:                         # 取消时队列被清空 → 清标记继续待命
+            item = REFRESH_QUEUE.popleft() if REFRESH_QUEUE else None
+        if item is None:                  # 取消时队列被清空 → 清标记继续待命
             REFRESH_CANCEL.clear()
             continue
+        user_id, ids = item
         try:
-            run_refresh(ids)
+            run_refresh(user_id, ids)
         except Exception:                       # noqa: BLE001 —— 兜底，不能卡死更新通道
-            REFRESH['done'] = REFRESH['total']
+            prog = refresh_prog(user_id)
+            prog['done'] = prog['total']
 
 
 # ----------------------------------------------------------- 语雀归档 ----
-SYNC = {'total': 0, 'done': 0, 'msg': '',      # 归档进度与结果消息（供前端展示）
-        'created': 0, 'updated': 0, 'failed': 0, 'reasons': []}   # 本轮同步会话累计（可多批入队）
-SYNC_QUEUE = deque()
+SYNC = {}      # user_id -> 进度与结果消息字典（供前端展示），按用户隔离
+SYNC_QUEUE = deque()               # 元素 (user_id, todo)
 SYNC_COND = threading.Condition()
-SYNC_CANCEL = threading.Event()    # 语雀同步取消标记：set=用户点了取消
+SYNC_CANCEL = set()                # 请求取消归档同步的 user_id 集合
+
+
+def sync_prog(user_id):
+    return SYNC.setdefault(user_id, {
+        'total': 0, 'done': 0, 'msg': '',
+        'created': 0, 'updated': 0, 'failed': 0, 'reasons': []})  # 本轮同步会话累计（可多批入队）
+
+
+def clear_arch_state(user_id=None):
+    """清掉残留的「同步中/更新中」瞬态：中断/取消/失败/启动清理共用（user_id 空 = 全局）"""
+    if user_id is None:
+        db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")
+    else:
+        clear_arch_state(user_id)
 
 
 def find_claude():
@@ -841,22 +1117,6 @@ def find_claude():
     return None
 
 
-def find_yuque_mcp():
-    """检查全局 claude 配置里是否注册了 yuque MCP（headless claude 会自动加载）"""
-    for path in (os.path.join(os.path.expanduser('~'), '.claude', 'settings.json'),
-                 os.path.join(os.path.expanduser('~'), '.claude.json'),
-                 os.path.join(BASE_DIR, '.mcp.json')):
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-        except Exception:
-            continue
-        servers = cfg.get('mcpServers') or {}
-        if any('yuque' in name.lower() for name in servers):
-            return True
-    return False
-
-
 def validate_yuque_dir(url):
     """校验语雀目录链接格式，返回 (账号, 知识库slug, 目录路径) 或 None"""
     url = (url or '').strip()
@@ -866,51 +1126,70 @@ def validate_yuque_dir(url):
     return m.group(1), m.group(2), m.group(3).strip('/')
 
 
+def _mcp_config_file(token):
+    """生成临时 MCP 配置文件（yuque MCP + 该用户的语雀令牌），返回路径；用完由调用方删除"""
+    fd, path = tempfile.mkstemp(prefix='yuque-mcp-', suffix='.json')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump({'mcpServers': {'yuque': {
+            'command': 'npx', 'args': ['-y', 'yuque-mcp'],
+            'env': {'YUQUE_PERSONAL_TOKEN': token}}}}, f)
+    return path
+
+
 MCP_NOT_READY_KW = ('未就绪', '未连接', 'MCP 未', '没有加载', '不可用', '无法使用 yuque')
 
 
-def _spawn_claude(prompt, attempts=2):
+def _spawn_claude(prompt, token, attempts=2):
     """调用无头 claude CLI（AI 总结 + 语雀 MCP 建文档），返回 (ok, 输出文本)。
+    令牌经临时 --mcp-config 文件注入（多用户各用各的），调用结束即删除。
     yuque MCP 是 npx 冷启动、可能比模型慢，首次调用若提示 MCP 未就绪则重试一次。"""
     exe = find_claude()
     if not exe:
         return False, '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'
+    cfg_path = _mcp_config_file(token)
     last = (False, 'claude 未返回结果')
-    for i in range(attempts):
+    try:
+        for i in range(attempts):
+            try:
+                proc = subprocess.Popen(
+                    [exe, '-p', '-', '--output-format', 'json',
+                     '--mcp-config', cfg_path,
+                     '--allowedTools', 'mcp__yuque__*'],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, cwd=BASE_DIR,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                out, _ = proc.communicate(prompt.encode('utf-8'), timeout=SYNC_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return False, '同步超时（claude 调用超过 %d 秒）' % SYNC_TIMEOUT
+            except Exception as e:
+                return False, '调用 claude 失败：%s' % e
+            text = out.decode('utf-8', 'replace')
+            res = None
+            for line in text.splitlines():      # 解析最后的 type=result 事件，取 result 文本
+                line = line.strip()
+                if not line.startswith('{'):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get('type') == 'result':
+                    res = str(ev.get('result') or '')
+            if res is None:
+                return False, 'claude 返回无法解析：%s' % text[:300]
+            if i < attempts - 1 and any(kw in res for kw in MCP_NOT_READY_KW):
+                last = (False, '语雀 MCP 未就绪，重试后仍失败：%s' % res[:150])
+                continue
+            return True, res
+    finally:
         try:
-            proc = subprocess.Popen(
-                [exe, '-p', '-', '--output-format', 'json',
-                 '--allowedTools', 'mcp__yuque__*'],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, cwd=BASE_DIR,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            out, _ = proc.communicate(prompt.encode('utf-8'), timeout=SYNC_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return False, '同步超时（claude 调用超过 %d 秒）' % SYNC_TIMEOUT
-        except Exception as e:
-            return False, '调用 claude 失败：%s' % e
-        text = out.decode('utf-8', 'replace')
-        res = None
-        for line in text.splitlines():      # 解析最后的 type=result 事件，取 result 文本
-            line = line.strip()
-            if not line.startswith('{'):
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            if ev.get('type') == 'result':
-                res = str(ev.get('result') or '')
-        if res is None:
-            return False, 'claude 返回无法解析：%s' % text[:300]
-        if i < attempts - 1 and any(kw in res for kw in MCP_NOT_READY_KW):
-            last = (False, '语雀 MCP 未就绪，重试后仍失败：%s' % res[:150])
-            continue
-        return True, res
+            os.unlink(cfg_path)
+        except OSError:
+            pass
     return last
 
 
@@ -985,21 +1264,24 @@ def _extract_sync_result(out):
     raise ApiError('claude 未返回文档链接：%s' % out[:150])
 
 
-def run_archive(ids):
+def run_archive(user_id, ids, token):
     """批量归档：读模板 → 并发调 claude（AI 总结 + 建语雀文档，默认 2 路）→ 写回归档状态"""
+    prog = sync_prog(user_id)
     try:
         with open(TEMPLATE_PATH, 'r', encoding='utf-8') as f:
             template = f.read()
     except Exception as e:
-        SYNC['msg'] = '读取同步模板失败：%s' % e
-        SYNC['done'] = SYNC['total']
+        prog['msg'] = '读取同步模板失败：%s' % e
+        prog['done'] = prog['total']
+        clear_arch_state(user_id)
         return
     done_lock = threading.Lock()
 
     def archive_one(pid):
         try:
             row = db('SELECT p.*, b.nickname, b.yuque_dir FROM posts p '
-                     'LEFT JOIN bloggers b ON b.uid=p.uid WHERE p.id=?', (pid,)).fetchone()
+                     'LEFT JOIN bloggers b ON b.user_id=p.user_id AND b.uid=p.uid '
+                     'WHERE p.user_id=? AND p.id=?', (user_id, pid)).fetchone()
             if not row:
                 raise ApiError('微博不存在')
             if not row['yuque_dir']:
@@ -1007,20 +1289,22 @@ def run_archive(ids):
             is_update = bool(row['archived'])
             prompt = _build_archive_prompt(row, template,
                                            update_doc_url=row['yuque_doc_url'] if is_update else None)
-            ok, out = _spawn_claude(prompt)
+            ok, out = _spawn_claude(prompt, token)
             if not ok:
                 raise ApiError(out)
             url = _extract_sync_result(out)
             db('UPDATE posts SET archived=1, yuque_doc_url=?, archived_at=?, '
-               "arch_fail='', arch_state='' WHERE id=?", (url, now_str(), pid))
+               "arch_fail='', arch_state='' WHERE user_id=? AND id=?",
+               (url, now_str(), user_id, pid))
             return (pid, 'ok', is_update)
         except Exception as e:  # noqa: BLE001
             reason = str(e)
-            db("UPDATE posts SET arch_fail=?, arch_state='' WHERE id=?", (reason, pid))
+            db("UPDATE posts SET arch_fail=?, arch_state='' WHERE user_id=? AND id=?",
+               (reason, user_id, pid))
             return (pid, 'err', reason)
         finally:
             with done_lock:                  # 多路并发，进度计数要加锁
-                SYNC['done'] += 1
+                prog['done'] += 1
 
     created = updated = 0
     reasons = []
@@ -1028,7 +1312,7 @@ def run_archive(ids):
     cancelled = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_WORKERS) as ex:
         futs = []
-        while pending and not SYNC_CANCEL.is_set():
+        while pending and user_id not in SYNC_CANCEL:
             while pending and len(futs) < SYNC_WORKERS:
                 futs.append(ex.submit(archive_one, pending.pop(0)))
             done_set, _ = concurrent.futures.wait(
@@ -1043,7 +1327,7 @@ def run_archive(ids):
                         created += 1
                 else:
                     reasons.append('%s：%s' % (pid, info))
-        cancelled = SYNC_CANCEL.is_set()
+        cancelled = user_id in SYNC_CANCEL
         for f in futs:                        # 取消/收尾：把已提交的结果统计进去
             pid, status, info = f.result()
             if status == 'ok':
@@ -1054,40 +1338,50 @@ def run_archive(ids):
             else:
                 reasons.append('%s：%s' % (pid, info))
     with done_lock:                          # 累计到本轮同步会话，供整队跑完后汇总
-        SYNC['created'] += created
-        SYNC['updated'] += updated
-        SYNC['failed'] += len(reasons)
+        prog['created'] += created
+        prog['updated'] += updated
+        prog['failed'] += len(reasons)
         if reasons:
-            SYNC['reasons'] = (SYNC['reasons'] + reasons)[:5]
+            prog['reasons'] = (prog['reasons'] + reasons)[:5]
     if cancelled:                            # 用户取消：清标记、清掉没跑到的瞬态、收尾
-        SYNC_CANCEL.clear()
-        db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")
-        SYNC['msg'] = '已取消：已归档 %d 条，其余未同步' % (created + updated)
-        SYNC['done'] = SYNC['total']
+        SYNC_CANCEL.discard(user_id)
+        clear_arch_state(user_id)
+        prog['msg'] = '已取消：已归档 %d 条，其余未同步' % (created + updated)
+        prog['done'] = prog['total']
         return
-    if SYNC['done'] >= SYNC['total']:        # 等待队列全部跑完（可能含后续入队的批次）才给最终汇总
-        if SYNC['failed']:
-            SYNC['msg'] = '同步完成：新增 %d 条、更新 %d 条，失败 %d 条（%s）' % (
-                SYNC['created'], SYNC['updated'], SYNC['failed'], '；'.join(SYNC['reasons']))
+    if prog['done'] >= prog['total']:        # 等待队列全部跑完（可能含后续入队的批次）才给最终汇总
+        if prog['failed']:
+            prog['msg'] = '同步完成：新增 %d 条、更新 %d 条，失败 %d 条（%s）' % (
+                prog['created'], prog['updated'], prog['failed'], '；'.join(prog['reasons']))
         else:
-            SYNC['msg'] = '同步完成：新增 %d 条、更新 %d 条' % (SYNC['created'], SYNC['updated'])
+            prog['msg'] = '同步完成：新增 %d 条、更新 %d 条' % (prog['created'], prog['updated'])
 
 
 def archive_worker():
     """归档 worker：一次处理一个批次（不限条数，批内 SYNC_WORKERS 路并发）"""
     while True:
         with SYNC_COND:
-            while not SYNC_QUEUE and not SYNC_CANCEL.is_set():
+            while not SYNC_QUEUE and not SYNC_CANCEL:
                 SYNC_COND.wait()
-            ids = SYNC_QUEUE.popleft() if SYNC_QUEUE else None
-        if ids is None:                     # 取消时队列被清空 → 清标记继续待命
+            item = SYNC_QUEUE.popleft() if SYNC_QUEUE else None
+        if item is None:                    # 取消时队列被清空 → 清标记继续待命
             SYNC_CANCEL.clear()
             continue
+        user_id, ids = item
+        token = ukv_get(user_id, 'yuque_token')
+        prog = sync_prog(user_id)
+        if not token:
+            prog['msg'] = '请先在个人设置中填写语雀令牌'
+            prog['done'] = prog['total']
+            # 入队时已把微博标成同步中/更新中，这里整批跳过 → 瞬态要跟着清掉，否则永远卡在「同步中」
+            clear_arch_state(user_id)
+            continue
         try:
-            run_archive(ids)
+            run_archive(user_id, ids, token)
         except Exception as e:  # noqa: BLE001 —— 兜底，不能卡死归档通道
-            SYNC['msg'] = '同步出错：%s' % e
-            SYNC['done'] = SYNC['total']
+            prog['msg'] = '同步出错：%s' % e
+            prog['done'] = prog['total']
+            clear_arch_state(user_id)
 
 
 def sync_worker():
@@ -1096,19 +1390,23 @@ def sync_worker():
         with Q_COND:
             while not TASKQ:
                 Q_COND.wait()
-            uid, mode = TASKQ.popleft()
+            user_id, uid, mode = TASKQ.popleft()
         try:
-            run_sync(uid, mode)
+            run_sync(user_id, uid, mode)
         except Exception as e:  # noqa: BLE001 —— 兜底：任何异常都要落到人话状态，不能卡死队列
-            set_blogger(uid, state='error', note='拉取出错：%s' % e)
+            set_blogger(user_id, uid, state='error', note='拉取出错：%s' % e)
 
 
 # ---------------------------------------------------------------- API ----
-def blogger_rows():
-    counts = {r['uid']: r['c'] for r in db('SELECT uid, COUNT(*) c FROM posts GROUP BY uid').fetchall()}
-    earliest = {r['uid']: r['t'] for r in db('SELECT uid, MIN(created_ts) t FROM posts GROUP BY uid').fetchall()}
-    latest = {r['uid']: r['t'] for r in db('SELECT uid, MAX(created_ts) t FROM posts GROUP BY uid').fetchall()}
-    rows = db('SELECT * FROM bloggers ORDER BY sort_order, created_at, rowid').fetchall()
+def blogger_rows(user_id):
+    counts = {r['uid']: r['c'] for r in db(
+        'SELECT uid, COUNT(*) c FROM posts WHERE user_id=? GROUP BY uid', (user_id,)).fetchall()}
+    earliest = {r['uid']: r['t'] for r in db(
+        'SELECT uid, MIN(created_ts) t FROM posts WHERE user_id=? GROUP BY uid', (user_id,)).fetchall()}
+    latest = {r['uid']: r['t'] for r in db(
+        'SELECT uid, MAX(created_ts) t FROM posts WHERE user_id=? GROUP BY uid', (user_id,)).fetchall()}
+    rows = db('SELECT * FROM bloggers WHERE user_id=? ORDER BY sort_order, created_at',
+              (user_id,)).fetchall()
     out = []
     for r in rows:
         out.append({
@@ -1122,75 +1420,82 @@ def blogger_rows():
     return out
 
 
-def api_state():
-    cookie_status = kv_get('cookie_status') or ('unknown' if kv_get('cookie') else 'none')
-    busy = any(b['state'] in ('queued', 'fulling') for b in blogger_rows())
-    on, minutes = sched_cfg()
-    return {'ok': True, 'cookie_status': cookie_status, 'cookie_set': bool(kv_get('cookie')),
-            'bloggers': blogger_rows(), 'busy': busy,
+def api_state(user):
+    user_id = user['id']
+    cookie_status = ukv_get(user_id, 'cookie_status') or ('unknown' if ukv_get(user_id, 'cookie') else 'none')
+    bloggers = blogger_rows(user_id)
+    busy = any(b['state'] in ('queued', 'fulling') for b in bloggers)
+    on, minutes = sched_cfg(user_id)
+    rp, sp = refresh_prog(user_id), sync_prog(user_id)
+    return {'ok': True, 'cookie_status': cookie_status, 'cookie_set': bool(ukv_get(user_id, 'cookie')),
+            'bloggers': bloggers, 'busy': busy,
             'schedule': {'on': on, 'minutes': minutes},
-            'refresh_total': REFRESH['total'], 'refresh_done': REFRESH['done'],
-            'yuque_total': SYNC['total'], 'yuque_done': SYNC['done'], 'yuque_msg': SYNC['msg']}
+            'refresh_total': rp['total'], 'refresh_done': rp['done'],
+            'yuque_total': sp['total'], 'yuque_done': sp['done'], 'yuque_msg': sp['msg'],
+            'user': _user_public(user)}
 
 
 COOKIE_EXPIRED_MSG = '已保存，但这份登录信息无效或已过期：请用浏览器登录 m.weibo.cn 小号，把请求头里 Cookie: 后面那一整串复制过来'
 
 
-def api_cookie(body):
+def api_cookie(user, body):
+    user_id = user['id']
     value = (body.get('value') or '').strip()
     if not value:
         return {'ok': False, 'error': '粘贴的内容是空的'}
-    kv_set('cookie', value)
-    kv_set('cookie_status', 'unknown')
+    ukv_set(user_id, 'cookie', value)
+    ukv_set(user_id, 'cookie_status', 'unknown')
     try:
-        session = MSession()
+        session = MSession(user_id)
     except CookieExpired:
-        mark_cookie_expired()
+        mark_cookie_expired(user_id)
         return {'ok': True, 'cookie_status': 'expired', 'message': COOKIE_EXPIRED_MSG}
     try:
         ok = validate_cookie(session)
     except Blocked:
-        kv_set('cookie_status', 'limited')
+        ukv_set(user_id, 'cookie_status', 'limited')
         return {'ok': True, 'cookie_status': 'limited',
                 'message': '已保存，但微博暂时限制了访问频率，稍后会自动重试验证'}
     except Exception:
-        kv_set('cookie_status', 'unknown')
+        ukv_set(user_id, 'cookie_status', 'unknown')
         return {'ok': True, 'cookie_status': 'unknown',
                 'message': '已保存，暂时无法联网验证，会自动重试'}
     if ok:
-        kv_set('cookie_status', 'ok')
+        ukv_set(user_id, 'cookie_status', 'ok')
         return {'ok': True, 'cookie_status': 'ok', 'message': '已保存，登录信息有效'}
     if ok is None:
-        kv_set('cookie_status', 'unknown')
+        ukv_set(user_id, 'cookie_status', 'unknown')
         return {'ok': True, 'cookie_status': 'unknown', 'message': '已保存，验证结果待确认'}
-    mark_cookie_expired()
+    mark_cookie_expired(user_id)
     return {'ok': True, 'cookie_status': 'expired', 'message': COOKIE_EXPIRED_MSG}
 
 
-def api_preview(body):
+def api_preview(user, body):
+    user_id = user['id']
     uid = parse_uid(body.get('input'))
     if not uid:
         return {'ok': False, 'error': '没认出这是哪位博主，请粘贴主页链接（形如 weibo.com/u/一串数字）'}
-    exists = db('SELECT uid FROM bloggers WHERE uid=?', (uid,)).fetchone()
+    exists = db('SELECT uid FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone()
     try:
-        profile = fetch_profile(MSession(), uid)
+        profile = fetch_profile(MSession(user_id), uid)
     except CookieExpired:
-        mark_cookie_expired()
-        return {'ok': False, 'error': '登录信息未填写或已过期，请先在页面顶部粘贴', 'need_cookie': True}
+        mark_cookie_expired(user_id)
+        return {'ok': False, 'error': '登录信息未填写或已过期，请先在个人设置里粘贴', 'need_cookie': True}
     except Blocked:
         return {'ok': False, 'error': '微博暂时限制了访问频率，请稍后再试'}
     except ApiError as e:
         return {'ok': False, 'error': str(e)}
-    kv_set('cookie_status', 'ok')            # 能取到博主资料 = 登录信息有效
+    ukv_set(user_id, 'cookie_status', 'ok')            # 能取到博主资料 = 登录信息有效
     profile['exists'] = bool(exists)
     return {'ok': True, 'profile': profile}
 
 
-def api_add(body):
+def api_add(user, body):
+    user_id = user['id']
     uid = parse_uid(body.get('input'))
     if not uid:
         return {'ok': False, 'error': '没认出这是哪位博主，请粘贴主页链接（形如 weibo.com/u/一串数字）'}
-    if db('SELECT uid FROM bloggers WHERE uid=?', (uid,)).fetchone():
+    if db('SELECT uid FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone():
         return {'ok': False, 'error': '这位博主已经在列表里了'}
     start = (body.get('start') or '').strip()
     start_ts = 0
@@ -1202,32 +1507,35 @@ def api_add(body):
         if start_ts > time.time():
             return {'ok': False, 'error': '起始日期不能是未来'}
     try:
-        profile = fetch_profile(MSession(), uid)
+        profile = fetch_profile(MSession(user_id), uid)
     except CookieExpired:
-        mark_cookie_expired()
-        return {'ok': False, 'error': '登录信息未填写或已过期，请先在页面顶部粘贴', 'need_cookie': True}
+        mark_cookie_expired(user_id)
+        return {'ok': False, 'error': '登录信息未填写或已过期，请先在个人设置里粘贴', 'need_cookie': True}
     except Blocked:
         return {'ok': False, 'error': '微博暂时限制了访问频率，请稍后再试'}
     except ApiError as e:
         return {'ok': False, 'error': str(e)}
-    kv_set('cookie_status', 'ok')
-    sort_order = db('SELECT COALESCE(MAX(sort_order),0)+1 s FROM bloggers').fetchone()['s']
-    db('INSERT INTO bloggers(uid,nickname,avatar,intro,homepage,state,note,created_at,sort_order,pull_from) '
-       'VALUES(?,?,?,?,?,?,?,?,?,?)',
-       (uid, profile['nickname'], profile['avatar'], profile['intro'],
+    ukv_set(user_id, 'cookie_status', 'ok')
+    sort_order = db('SELECT COALESCE(MAX(sort_order),0)+1 s FROM bloggers WHERE user_id=?',
+                    (user_id,)).fetchone()['s']
+    db('INSERT INTO bloggers(user_id,uid,nickname,avatar,intro,homepage,state,note,created_at,sort_order,pull_from) '
+       'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+       (user_id, uid, profile['nickname'], profile['avatar'], profile['intro'],
         'https://weibo.com/u/%s' % uid, 'idle', '已添加，准备开始拉取', now_str(), sort_order, start_ts))
-    enqueue(uid, 'full')
+    enqueue(user_id, uid, 'full')
     return {'ok': True}
 
 
-def api_blogger_move(body):
+def api_blogger_move(user, body):
     """上下移动博主在列表中的顺序"""
+    user_id = user['id']
     uid = str(body.get('uid') or '')
     d = body.get('dir')
     if d not in ('up', 'down'):
         return {'ok': False, 'error': '移动方向不对'}
     ids = [r['uid'] for r in db(
-        'SELECT uid FROM bloggers ORDER BY sort_order, created_at, rowid').fetchall()]
+        'SELECT uid FROM bloggers WHERE user_id=? ORDER BY sort_order, created_at',
+        (user_id,)).fetchall()]
     if uid not in ids:
         return {'ok': False, 'error': '博主不存在'}
     i = ids.index(uid)
@@ -1236,27 +1544,29 @@ def api_blogger_move(body):
         return {'ok': True}                          # 已在最前/最后，无需移动
     ids[i], ids[j] = ids[j], ids[i]
     for k, u in enumerate(ids):                      # 重排序号，保证连续不重复
-        db('UPDATE bloggers SET sort_order=? WHERE uid=?', (k + 1, u))
+        db('UPDATE bloggers SET sort_order=? WHERE user_id=? AND uid=?', (k + 1, user_id, u))
     return {'ok': True}
 
 
-def api_sync(body):
+def api_sync(user, body):
+    user_id = user['id']
     uid = str(body.get('uid') or '')
-    row = db('SELECT next_page FROM bloggers WHERE uid=?', (uid,)).fetchone()
+    row = db('SELECT next_page FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone()
     if not row:
         return {'ok': False, 'error': '博主不存在'}
     mode = 'full' if row['next_page'] else 'incr'    # 有断点页码 → 续全量；否则增量
-    enqueue(uid, mode)
+    enqueue(user_id, uid, mode)
     return {'ok': True}
 
 
-def api_sync_all(body):
+def api_sync_all(user, body):
     """一键为全部博主拉取新微博：入队规则见 enqueue_all；返回本次实际启动的博主清单，供前端跟踪批量进度"""
-    if not db('SELECT uid FROM bloggers LIMIT 1').fetchone():
+    user_id = user['id']
+    if not db('SELECT uid FROM bloggers WHERE user_id=? LIMIT 1', (user_id,)).fetchone():
         return {'ok': False, 'error': '还没有添加博主，先添加一位再拉取'}
-    if not kv_get('cookie'):
-        return {'ok': False, 'error': '还没有填写登录信息，请先在页面顶部粘贴'}
-    started, skipped = enqueue_all()
+    if not ukv_get(user_id, 'cookie'):
+        return {'ok': False, 'error': '还没有填写登录信息，请先在个人设置里粘贴'}
+    started, skipped = enqueue_all(user_id)
     if not started:
         return {'ok': False, 'error': '所有博主都在拉取中，稍后再点'}
     msg = '已开始为 %d 位博主拉取新微博' % len(started)
@@ -1265,10 +1575,11 @@ def api_sync_all(body):
     return {'ok': True, 'total': len(started), 'started': started, 'skipped': skipped, 'message': msg}
 
 
-def api_schedule(body):
+def api_schedule(user, body):
     """定时拉取设置：开关 + 间隔（分钟）；开启即从当前时刻起算一个新周期"""
+    user_id = user['id']
     if not body.get('on'):
-        kv_set('sched_on', '0')
+        ukv_set(user_id, 'sched_on', '0')
         return {'ok': True}
     try:
         minutes = int(body.get('minutes'))
@@ -1277,16 +1588,17 @@ def api_schedule(body):
     if minutes < SCHED_MIN_MINUTES or minutes > SCHED_MAX_MINUTES:
         return {'ok': False, 'error': '间隔需在 %d 分钟到 %d 分钟（24 小时）之间'
                 % (SCHED_MIN_MINUTES, SCHED_MAX_MINUTES)}
-    kv_set('sched_minutes', str(minutes))
-    kv_set('sched_on', '1')
-    kv_set('sched_last', str(int(time.time())))
+    ukv_set(user_id, 'sched_minutes', str(minutes))
+    ukv_set(user_id, 'sched_on', '1')
+    ukv_set(user_id, 'sched_last', str(int(time.time())))
     return {'ok': True}
 
 
-def api_refull(body):
+def api_refull(user, body):
     """重拉全量：从头（或所选起始日期起）全量重拉并覆盖；不删数据，范围内微博已删的标记（ADR-0007）"""
+    user_id = user['id']
     uid = str(body.get('uid') or '')
-    row = db('SELECT state FROM bloggers WHERE uid=?', (uid,)).fetchone()
+    row = db('SELECT state FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone()
     if not row:
         return {'ok': False, 'error': '博主不存在'}
     if row['state'] in ('queued', 'fulling'):
@@ -1300,52 +1612,55 @@ def api_refull(body):
             return {'ok': False, 'error': '起始日期格式不对，示例：2024-01-01'}
         if start_ts > time.time():
             return {'ok': False, 'error': '起始日期不能是未来'}
-    set_blogger(uid, next_page=1, pull_from=start_ts)   # 从头（或所选日期）开始
-    enqueue(uid, 'full')
+    set_blogger(user_id, uid, next_page=1, pull_from=start_ts)   # 从头（或所选日期）开始
+    enqueue(user_id, uid, 'full')
     return {'ok': True}
 
 
-def api_pause(body):
+def api_pause(user, body):
+    user_id = user['id']
     uid = str(body.get('uid') or '')
     with Q_COND:                                     # 还在排队：直接出队
-        for i, (u, m) in enumerate(TASKQ):
-            if u == uid:
+        for i, (uu, u, m) in enumerate(TASKQ):
+            if uu == user_id and u == uid:
                 del TASKQ[i]
-                set_blogger(uid, state='paused', note='已暂停，点击继续接着拉',
+                set_blogger(user_id, uid, state='paused', note='已暂停，点击继续接着拉',
                             next_page=m == 'full' and 1 or None)
                 break
         else:
-            STOP.setdefault(uid, threading.Event()).set()
+            STOP.setdefault((user_id, uid), threading.Event()).set()
     return {'ok': True}
 
 
-def api_cancel(body):
+def api_cancel(user, body):
     """取消本次拉取：保留已拉取数据，丢弃断点（之后为增量/重拉全量，不再续拉）"""
+    user_id = user['id']
     uid = str(body.get('uid') or '')
     with Q_COND:                                     # 还在排队：直接出队并标记已取消
-        for i, (u, _) in enumerate(TASKQ):
-            if u == uid:
+        for i, (uu, u, __) in enumerate(TASKQ):
+            if uu == user_id and u == uid:
                 del TASKQ[i]
-                set_blogger(uid, state='done', next_page=None, pull_from=0, note='已取消')
+                set_blogger(user_id, uid, state='done', next_page=None, pull_from=0, note='已取消')
                 break
         else:
-            CANCEL.add(uid)
-            STOP.setdefault(uid, threading.Event()).set()
+            CANCEL.add((user_id, uid))
+            STOP.setdefault((user_id, uid), threading.Event()).set()
     return {'ok': True}
 
 
-def api_delete(body):
+def api_delete(user, body):
+    user_id = user['id']
     uid = str(body.get('uid') or '')
-    row = db('SELECT state FROM bloggers WHERE uid=?', (uid,)).fetchone()
+    row = db('SELECT state FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone()
     if not row:
         return {'ok': False, 'error': '博主不存在'}
     if row['state'] in ('queued', 'fulling'):
         return {'ok': False, 'error': '正在拉取中，请先暂停再删除'}
-    db('DELETE FROM bloggers WHERE uid=?', (uid,))
-    db('DELETE FROM posts WHERE uid=?', (uid,))
+    db('DELETE FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid))
+    db('DELETE FROM posts WHERE user_id=? AND uid=?', (user_id, uid))
     with Q_COND:
-        for i, (u, _) in enumerate(TASKQ):
-            if u == uid:
+        for i, (uu, u, __) in enumerate(TASKQ):
+            if uu == user_id and u == uid:
                 del TASKQ[i]
     return {'ok': True}
 
@@ -1354,71 +1669,88 @@ def _clean_ids(body):
     return [str(i).strip() for i in (body.get('ids') or []) if str(i).strip()]
 
 
-def api_batch_delete(body):
+def api_batch_delete(user, body):
     """批量删除：只删勾选的博文，不碰其他博主的数据"""
+    user_id = user['id']
     ids = _clean_ids(body)
     if not ids:
         return {'ok': False, 'error': '没有选中要删除的微博'}
     ph = ','.join('?' * len(ids))
-    n = db('DELETE FROM posts WHERE id IN (%s)' % ph, tuple(ids)).rowcount
+    n = db('DELETE FROM posts WHERE user_id=? AND id IN (%s)' % ph, (user_id,) + tuple(ids)).rowcount
     return {'ok': True, 'deleted': n}
 
 
-def api_batch_update(body):
+def api_batch_update(user, body):
     """批量更新：勾选博文整条重拉覆盖（正文/长文全文/计数/媒体），进独立更新通道即跑"""
+    user_id = user['id']
     ids = _clean_ids(body)
     if not ids:
         return {'ok': False, 'error': '没有选中要更新的微博'}
-    if REFRESH['total'] > REFRESH['done']:
+    prog = refresh_prog(user_id)
+    if prog['total'] > prog['done']:
         return {'ok': False, 'error': '上一批更新还在进行，请稍候'}
     with RQ_COND:
-        REFRESH_CANCEL.clear()          # 新一轮更新：清除残留的取消标记
-        REFRESH_QUEUE.append(ids)
-        REFRESH['total'] = len(ids)      # 只统计本次操作：新批次从 0 开始
-        REFRESH['done'] = 0
+        REFRESH_CANCEL.discard(user_id)   # 新一轮更新：清除残留的取消标记
+        REFRESH_QUEUE.append((user_id, ids))
+        prog['total'] = len(ids)          # 只统计本次操作：新批次从 0 开始
+        prog['done'] = 0
         RQ_COND.notify()
     return {'ok': True, 'queued': len(ids)}
 
 
-def api_update_cancel(body=None):
+def api_update_cancel(user, body=None):
     """取消正在进行的批量更新：停新任务、清排队、进度收尾"""
+    user_id = user['id']
     with RQ_COND:
-        REFRESH_CANCEL.set()
-        REFRESH_QUEUE.clear()
+        REFRESH_CANCEL.add(user_id)
+        for i in range(len(REFRESH_QUEUE) - 1, -1, -1):
+            if REFRESH_QUEUE[i][0] == user_id:
+                del REFRESH_QUEUE[i]
         RQ_COND.notify_all()
     return {'ok': True}
 
 
-def api_yuque_cancel(body=None):
+def api_yuque_cancel(user, body=None):
     """取消正在进行的语雀同步：清排队、停新任务、清掉没跑到的「同步中」瞬态"""
+    user_id = user['id']
     with SYNC_COND:
-        SYNC_CANCEL.set()
-        SYNC_QUEUE.clear()
+        SYNC_CANCEL.add(user_id)
+        for i in range(len(SYNC_QUEUE) - 1, -1, -1):
+            if SYNC_QUEUE[i][0] == user_id:
+                del SYNC_QUEUE[i]
         SYNC_COND.notify_all()
-    db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")
+    clear_arch_state(user_id)
+    prog = sync_prog(user_id)
+    prog['total'] = prog['done'] = 0
+    prog['msg'] = '已取消'
     return {'ok': True}
 
 
-def api_blogger_yuque_dir(body):
+def api_blogger_yuque_dir(user, body):
     """设置博主语雀归档目录链接（可留空）；格式不符合给出提示"""
+    user_id = user['id']
     uid = str(body.get('uid') or '')
     url = str(body.get('dir') or '').strip()
-    if not db('SELECT uid FROM bloggers WHERE uid=?', (uid,)).fetchone():
+    if not db('SELECT uid FROM bloggers WHERE user_id=? AND uid=?', (user_id, uid)).fetchone():
         return {'ok': False, 'error': '博主不存在'}
     if url and not validate_yuque_dir(url):
         return {'ok': False, 'error': '语雀目录链接格式不对，示例：https://www.yuque.com/账号/知识库/目录'}
-    db('UPDATE bloggers SET yuque_dir=? WHERE uid=?', (url, uid))
+    db('UPDATE bloggers SET yuque_dir=? WHERE user_id=? AND uid=?', (url, user_id, uid))
     return {'ok': True}
 
 
-def api_yuque_sync(body):
+def api_yuque_sync(user, body):
     """归档勾选的微博到语雀：不限条数；单个与批量互不拦截，已在同步中的自动跳过、其余进等待队列、顶部计数累加"""
+    user_id = user['id']
+    if not user['can_archive']:
+        return {'ok': False, 'error': '当前账号没有归档权限，请联系管理员开通'}
     ids = _clean_ids(body)
     if not ids:
         return {'ok': False, 'error': '没有选中要同步的微博'}
     rows = db('SELECT p.id, p.retweeted_json, p.archived, p.arch_skip, b.nickname, b.yuque_dir '
-              'FROM posts p LEFT JOIN bloggers b ON b.uid=p.uid '
-              'WHERE p.id IN (%s)' % ','.join('?' * len(ids)), tuple(ids)).fetchall()
+              'FROM posts p LEFT JOIN bloggers b ON b.user_id=p.user_id AND b.uid=p.uid '
+              'WHERE p.user_id=? AND p.id IN (%s)' % ','.join('?' * len(ids)),
+              (user_id,) + tuple(ids)).fetchall()
     wanted, no_dir = [], set()
     for r in rows:
         if r['retweeted_json'] or r['arch_skip']:
@@ -1433,39 +1765,41 @@ def api_yuque_sync(body):
         return {'ok': False, 'error': '勾选的微博都是转发微博或无需归档，不支持同步'}
     if not find_claude():
         return {'ok': False, 'error': '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'}
-    if not find_yuque_mcp():
-        return {'ok': False, 'error': '未配置语雀 MCP，请先用 claude mcp add 注册 yuque 服务'}
+    if not ukv_get(user_id, 'yuque_token'):
+        return {'ok': False, 'error': '还没有填写语雀令牌，请先在个人设置中粘贴'}
+    prog = sync_prog(user_id)
     with SYNC_COND:                          # 入队原子化：跳过已在同步/等待中的微博，其余追加到等待队列
         busy = {r['id'] for r in db(
-            'SELECT id FROM posts WHERE id IN (%s) AND arch_state IN (?,?)'
+            'SELECT id FROM posts WHERE user_id=? AND id IN (%s) AND arch_state IN (?,?)'
             % ','.join('?' * len(wanted)),
-            tuple(wanted) + ('syncing', 'updating')).fetchall()}
+            (user_id,) + tuple(wanted) + ('syncing', 'updating')).fetchall()}
         todo = [pid for pid in wanted if pid not in busy]
         if not todo:
             return {'ok': False, 'error': '选中的微博都在同步中，稍等完成后再试'}
         todo_set = set(todo)
         todo_archived = {r['id'] for r in rows if r['id'] in todo_set and r['archived']}
-        if SYNC['total'] == SYNC['done']:    # 空闲 → 新一轮同步会话：计数清零，会话内再累加排队
-            SYNC['total'] = 0
-            SYNC['done'] = 0
-            SYNC['created'] = SYNC['updated'] = SYNC['failed'] = 0
-            SYNC['reasons'] = []
-        SYNC_CANCEL.clear()                  # 新一轮同步：清除残留的取消标记
-        SYNC_QUEUE.append(todo)
-        SYNC['total'] += len(todo)           # 顶部计数累加：已完成数不动
-        SYNC['msg'] = ''
+        if prog['total'] == prog['done']:    # 空闲 → 新一轮同步会话：计数清零，会话内再累加排队
+            prog['total'] = 0
+            prog['done'] = 0
+            prog['created'] = prog['updated'] = prog['failed'] = 0
+            prog['reasons'] = []
+        SYNC_CANCEL.discard(user_id)         # 新一轮同步：清除残留的取消标记
+        SYNC_QUEUE.append((user_id, todo))
+        prog['total'] += len(todo)           # 顶部计数累加：已完成数不动
+        prog['msg'] = ''
         SYNC_COND.notify()
         for pid in todo:                     # 瞬态落库：刷新页面仍显示同步中/更新中
-            db('UPDATE posts SET arch_state=? WHERE id=?',
-               ('updating' if pid in todo_archived else 'syncing', pid))
+            db('UPDATE posts SET arch_state=? WHERE user_id=? AND id=?',
+               ('updating' if pid in todo_archived else 'syncing', user_id, pid))
     create_n = sum(1 for pid in todo if pid not in todo_archived)
     update_n = len(todo_archived)
     return {'ok': True, 'queued': len(todo), 'created': create_n, 'updated': update_n,
             'skipped_busy': len(busy)}
 
 
-def api_yuque_mark(body):
+def api_yuque_mark(user, body):
     """批量改归档状态：to='skip' 改为无需归档 / to='pending' 改回待归档"""
+    user_id = user['id']
     ids = _clean_ids(body)
     to = str(body.get('to') or '')
     if not ids:
@@ -1475,10 +1809,10 @@ def api_yuque_mark(body):
     ph = ','.join('?' * len(ids))
     if to == 'skip':
         cur = db("UPDATE posts SET arch_skip=1, archived=0, arch_fail='', arch_state='', yuque_doc_url='' "
-                 'WHERE id IN (%s)' % ph, tuple(ids))
+                 'WHERE user_id=? AND id IN (%s)' % ph, (user_id,) + tuple(ids))
     else:
         cur = db("UPDATE posts SET arch_skip=0, archived=0, arch_fail='', arch_state='', yuque_doc_url='' "
-                 'WHERE id IN (%s)' % ph, tuple(ids))
+                 'WHERE user_id=? AND id IN (%s)' % ph, (user_id,) + tuple(ids))
     return {'ok': True, 'updated': cur.rowcount}
 
 
@@ -1486,7 +1820,7 @@ YUQUE_API = 'https://www.yuque.com/api/v2'
 
 
 def load_yuque_token():
-    """运行时读取语雀个人令牌：复用归档 MCP 配置的 YUQUE_PERSONAL_TOKEN（不入代码、不入库）"""
+    """一次性导入：从本机 claude 配置读语雀令牌（仅存量迁移时用，之后各用户令牌存各自库里）"""
     home = os.path.expanduser('~')
     for path in (os.path.join(home, '.claude', 'settings.json'),
                  os.path.join(home, '.claude.json'),
@@ -1556,17 +1890,18 @@ def yuque_delete_doc(url, token):
         return
 
 
-def api_yuque_delete(body):
+def api_yuque_delete(user, body):
     """归档删除：逐条删语雀文档，成功后该微博重置为「待归档」；远端失败原样保留可重试。
     串行执行，中途失败继续删其余，最后汇总成功/失败数"""
+    user_id = user['id']
     ids = _clean_ids(body)
     if not ids:
         return {'ok': False, 'error': '没有选中要删除的微博'}
-    token = load_yuque_token()
+    token = ukv_get(user_id, 'yuque_token')
     if not token:
-        return {'ok': False, 'error': '未找到语雀令牌：请在 ~/.claude/settings.json 配置 YUQUE_PERSONAL_TOKEN'}
-    rows = db('SELECT id, yuque_doc_url, arch_state FROM posts WHERE id IN (%s)'
-              % ','.join('?' * len(ids)), tuple(ids)).fetchall()
+        return {'ok': False, 'error': '还没有填写语雀令牌，请先在个人设置中粘贴'}
+    rows = db('SELECT id, yuque_doc_url, arch_state FROM posts WHERE user_id=? AND id IN (%s)'
+              % ','.join('?' * len(ids)), (user_id,) + tuple(ids)).fetchall()
     todo = [r for r in rows if r['yuque_doc_url'] and r['arch_state'] not in ('syncing', 'updating')]
     if not todo:
         return {'ok': False, 'error': '选中的微博没有可删除的语雀文档（未归档或正在同步中）'}
@@ -1576,7 +1911,7 @@ def api_yuque_delete(body):
         try:
             yuque_delete_doc(r['yuque_doc_url'], token)
             db("UPDATE posts SET archived=0, arch_skip=0, arch_fail='', arch_state='', "
-               "yuque_doc_url='', archived_at='' WHERE id=?", (r['id'],))
+               "yuque_doc_url='', archived_at='' WHERE user_id=? AND id=?", (user_id, r['id']))
             ok += 1
         except Exception as e:  # noqa: BLE001 —— 单条失败不阻断其余
             failed += 1
@@ -1588,7 +1923,8 @@ def api_yuque_delete(body):
     return res
 
 
-def api_posts(query):
+def api_posts(user, query):
+    user_id = user['id']
     try:
         page = max(1, int(query.get('page', ['1'])[0]))
     except ValueError:
@@ -1597,7 +1933,7 @@ def api_posts(query):
         size = min(24, max(1, int(query.get('page_size', ['9'])[0])))
     except ValueError:
         size = 9
-    where, params = [], []
+    where, params = ['p.user_id=?'], [user_id]
     uid = query.get('uid', [''])[0]
     if uid:
         where.append('p.uid=?')
@@ -1640,11 +1976,11 @@ def api_posts(query):
     w = ('WHERE ' + ' AND '.join(where)) if where else ''
     wid = query.get('id', [''])[0].strip()
     if wid:                              # 微博ID直达：忽略其他筛选，精确匹配状态id或bid
-        w = 'WHERE (p.id=? OR lower(p.bid)=lower(?))'
-        params = [wid, wid]
+        w = 'WHERE p.user_id=? AND (p.id=? OR lower(p.bid)=lower(?))'
+        params = [user_id, wid, wid]
     total = db('SELECT COUNT(*) c FROM posts p %s' % w, tuple(params)).fetchone()['c']
     rows = db('SELECT p.*, b.nickname, b.avatar FROM posts p '
-              'LEFT JOIN bloggers b ON b.uid=p.uid %s '
+              'LEFT JOIN bloggers b ON b.user_id=p.user_id AND b.uid=p.uid %s '
               'ORDER BY p.created_ts DESC, p.id DESC LIMIT ? OFFSET ?' % w,
               tuple(params) + (size, (page - 1) * size)).fetchall()
     items = []
@@ -1660,7 +1996,7 @@ def api_posts(query):
             'arch_fail': r['arch_fail'], 'arch_skip': r['arch_skip'], 'arch_state': r['arch_state'],
         })
     years = [r[0] for r in db("SELECT DISTINCT strftime('%Y', created_ts, 'unixepoch') y "
-                              'FROM posts ORDER BY y DESC').fetchall()]
+                              'FROM posts WHERE user_id=? ORDER BY y DESC', (user_id,)).fetchall()]
     if query.get('all_ids', [''])[0] == '1':          # 全选当前筛选结果用：返回全部匹配 id
         ids = [r[0] for r in db('SELECT id FROM posts p %s '
                                 'ORDER BY p.created_ts DESC, p.id DESC' % w,
@@ -1684,21 +2020,281 @@ def proxy_image(url):
         raise ApiError('图片取不到：%s' % e)
 
 
+# ------------------------------------------------------- 账号与管理 ----
+def _user_public(u):
+    return {'id': u['id'], 'username': u['username'], 'role': u['role'],
+            'can_archive': bool(u['can_archive']), 'disabled': bool(u['disabled']),
+            'deactivated_at': u['deactivated_at'],
+            'created_at': u['created_at'], 'last_login_at': u['last_login_at']}
+
+
+def _auth_user(username, pw):
+    """账号密码校验（登录与注销反悔共用，限流也共用）：返回 (用户行 or None, 错误信息 or None)"""
+    wait = login_throttled(username)
+    if wait:
+        return None, '连续失败次数过多，请 %d 秒后再试' % wait
+    u = db('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+    if not u or not _verify_password(u, pw):
+        login_fail(username)
+        return None, '用户名或密码错误'
+    return u, None
+
+
+def api_login(body):
+    username = str(body.get('username') or '').strip()
+    u, err = _auth_user(username, str(body.get('password') or ''))
+    if err:
+        return {'ok': False, 'error': err}
+    if u['disabled']:
+        return {'ok': False, 'error': '账号已被停用，请联系管理员'}
+    if u['deactivated_at']:
+        if u['deactivated_at'] + DEACTIVATE_GRACE < time.time():
+            login_fail(username)                 # 已注销超 7 天：视同不存在（清除任务兜底，spec §2.4）
+            return {'ok': False, 'error': '用户名或密码错误'}
+        days = max(0, int((u['deactivated_at'] + DEACTIVATE_GRACE - time.time()) // 86400) + 1)
+        return {'ok': False, 'deactivated': True, 'days_left': days,
+                'error': '该账号已申请注销（约 %d 天后清除数据），如想继续使用请选择取消注销' % days}
+    login_ok(username)
+    db('UPDATE users SET last_login_at=? WHERE id=?', (now_str(), u['id']))
+    return {'ok': True, 'token': new_session(u['id'])}
+
+
+def api_register(body):
+    username = str(body.get('username') or '').strip()
+    pw = str(body.get('password') or '')
+    invite = str(body.get('invite') or '').strip()
+    if not USERNAME_RE.match(username):
+        return {'ok': False, 'error': '用户名需 3~16 位，只能含字母、数字、下划线或中文'}
+    if len(pw) < 8:
+        return {'ok': False, 'error': '密码至少 8 位'}
+    if invite != (kv_get('invite_code') or ''):
+        return {'ok': False, 'error': '邀请码不对'}
+    if db('SELECT id FROM users WHERE username=?', (username,)).fetchone():
+        return {'ok': False, 'error': '这个用户名已被占用'}
+    salt = secrets.token_hex(16)
+    cur = db('INSERT INTO users(username,pass_hash,pass_salt,role,can_archive,created_at) '
+             "VALUES(?,?,?,'user',0,?)",
+             (username, _hash_password(pw, salt), salt, now_str()))
+    return {'ok': True, 'token': new_session(cur.lastrowid)}
+
+
+def api_cancel_deactivate(body):
+    """注销反悔：验证密码 → 清注销标记 → 直接发会话进系统（spec §2.5）"""
+    username = str(body.get('username') or '').strip()
+    u, err = _auth_user(username, str(body.get('password') or ''))
+    if err:
+        return {'ok': False, 'error': err}
+    if not u['deactivated_at']:
+        return {'ok': False, 'error': '该账号不在注销流程中'}
+    login_ok(username)
+    db('UPDATE users SET deactivated_at=0 WHERE id=?', (u['id'],))
+    return {'ok': True, 'token': new_session(u['id']), 'message': '已取消注销，账号已恢复正常'}
+
+
+def api_deactivate(user, body):
+    """申请注销：验证密码后进入 7 天反悔期，期间数据保留、会话全失效"""
+    if user['role'] == 'admin':
+        return {'ok': False, 'error': '管理员账号不能注销'}
+    pw = str(body.get('password') or '')
+    if not _verify_password(user, pw):
+        return {'ok': False, 'error': '密码不对'}
+    db('UPDATE users SET deactivated_at=? WHERE id=?', (int(time.time()), user['id']))
+    kill_sessions(user['id'])
+    purge_user_tasks(user['id'])
+    return {'ok': True, 'message': '账号已进入注销流程，7 天内重新登录可反悔，超期后数据将被清除'}
+
+
+def _mask_token(tok):
+    return ('****' + tok[-4:]) if len(tok) >= 4 else ''      # 仅显示末 4 位（ADR-0010）
+
+
+def api_me(user, body=None):
+    d = _user_public(user)
+    tok = ukv_get(user['id'], 'yuque_token') or ''
+    d['yuque_token_set'] = bool(tok)
+    d['yuque_token_masked'] = _mask_token(tok)
+    d['cookie_set'] = bool(ukv_get(user['id'], 'cookie'))          # 是否配置微博 Cookie（spec §3.2）
+    d['cookie_status'] = ukv_get(user['id'], 'cookie_status') \
+        or ('unknown' if ukv_get(user['id'], 'cookie') else 'none')
+    return {'ok': True, 'user': d}
+
+
+def api_me_password(user, body):
+    old = str(body.get('old_password') or '')
+    new = str(body.get('new_password') or '')
+    if not _verify_password(user, old):
+        return {'ok': False, 'error': '当前密码不对'}
+    if len(new) < 8:
+        return {'ok': False, 'error': '新密码至少 8 位'}
+    salt = secrets.token_hex(16)
+    db('UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?',
+       (salt, _hash_password(new, salt), user['id']))
+    return {'ok': True}
+
+
+def api_me_yuque_token(user, body):
+    tok = str(body.get('token') or '').strip()
+    ukv_set(user['id'], 'yuque_token', tok)
+    return {'ok': True, 'yuque_token_set': bool(tok), 'masked': _mask_token(tok)}
+
+
+def api_template(user, body=None):
+    """同步模板只读查看（全局一份，暂不支持自定义）"""
+    try:
+        with open(TEMPLATE_PATH, 'r', encoding='utf-8') as f:
+            return {'ok': True, 'template': f.read()}
+    except Exception as e:
+        return {'ok': False, 'error': '读取同步模板失败：%s' % e}
+
+
+def api_admin_users(user, qs=None):
+    params = qs or {}
+    kw = (params.get('kw') or [''])[0].strip()
+    status = (params.get('status') or [''])[0].strip()
+    can_archive = (params.get('can_archive') or [''])[0].strip()
+    role = (params.get('role') or [''])[0].strip()
+
+    sql = 'SELECT * FROM users WHERE 1=1'
+    args = []
+    if kw:
+        sql += ' AND username LIKE ?'
+        args.append('%' + kw + '%')
+    if status == 'normal':
+        sql += ' AND disabled=0 AND deactivated_at=0'
+    elif status == 'disabled':
+        sql += ' AND disabled=1'
+    elif status == 'deactivated':
+        sql += ' AND deactivated_at>0'
+    if can_archive == 'yes':
+        sql += ' AND can_archive=1'
+    elif can_archive == 'no':
+        sql += ' AND can_archive=0'
+    if role:
+        sql += ' AND role=?'
+        args.append(role)
+    sql += ' ORDER BY id'
+
+    out = []
+    for r in db(sql, args).fetchall():
+        d = _user_public(r)
+        d['bloggers'] = db('SELECT COUNT(*) c FROM bloggers WHERE user_id=?',
+                           (r['id'],)).fetchone()['c']
+        d['posts'] = db('SELECT COUNT(*) c FROM posts WHERE user_id=?',
+                        (r['id'],)).fetchone()['c']
+        out.append(d)
+    return {'ok': True, 'users': out, 'invite_code': kv_get('invite_code') or ''}
+
+
+def api_admin_stats(user):
+    today = datetime.date.today().isoformat()
+    seven_days_ago = datetime.datetime.now() - datetime.timedelta(days=7)
+    seven_str = seven_days_ago.strftime('%Y-%m-%d %H:%M:%S')
+    total_users = db('SELECT COUNT(*) c FROM users').fetchone()['c']
+    active_users = db("SELECT COUNT(*) c FROM users WHERE last_login_at >= ?",
+                      (seven_str,)).fetchone()['c']
+    total_bloggers = db('SELECT COUNT(*) c FROM bloggers').fetchone()['c']
+    total_posts = db('SELECT COUNT(*) c FROM posts').fetchone()['c']
+    today_posts = db("SELECT COUNT(*) c FROM posts WHERE fetched_at >= ?",
+                     (today,)).fetchone()['c']
+    try:
+        db_size = os.path.getsize(DB_PATH)
+    except OSError:
+        db_size = 0
+    return {'ok': True, 'total_users': total_users, 'active_users': active_users,
+            'total_bloggers': total_bloggers, 'total_posts': total_posts,
+            'today_posts': today_posts, 'db_size': db_size}
+
+
+def api_admin_user(user, body):
+    """管理操作：disable/enable 禁用启用，grant_archive/revoke_archive 归档权限，delete 连数据删除"""
+    op = str(body.get('op') or '')
+    u = db('SELECT * FROM users WHERE id=?', (body.get('id'),)).fetchone()
+    if not u:
+        return {'ok': False, 'error': '用户不存在'}
+    if u['id'] == user['id']:
+        return {'ok': False, 'error': '不能操作自己的账号'}
+    if u['role'] == 'admin':
+        return {'ok': False, 'error': '不能操作其他管理员'}
+    if op == 'delete':
+        delete_user_data(u['id'])
+        db('DELETE FROM users WHERE id=?', (u['id'],))
+        return {'ok': True}
+    if op == 'disable':
+        db('UPDATE users SET disabled=1 WHERE id=?', (u['id'],))
+        kill_sessions(u['id'])
+        purge_user_tasks(u['id'])
+        return {'ok': True}
+    if op == 'enable':
+        db('UPDATE users SET disabled=0 WHERE id=?', (u['id'],))
+        return {'ok': True}
+    if op in ('grant_archive', 'revoke_archive'):
+        db('UPDATE users SET can_archive=? WHERE id=?',
+           (1 if op == 'grant_archive' else 0, u['id']))
+        return {'ok': True}
+    if op == 'reset_password':
+        pw = secrets.token_urlsafe(10)
+        salt = secrets.token_hex(16)
+        db('UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?',
+           (salt, _hash_password(pw, salt), u['id']))
+        kill_sessions(u['id'])                      # 旧会话作废，强制用新密码登录
+        return {'ok': True, 'new_password': pw}     # 只在此响应里出现这一次
+    return {'ok': False, 'error': '操作不对'}
+
+
+def api_admin_invite(user, body=None):
+    code = secrets.token_urlsafe(8)
+    kv_set('invite_code', code)
+    return {'ok': True, 'invite_code': code}
+
+
 # -------------------------------------------------------------- HTTP ----
+COOKIE_NAME = 'wb_session'
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):               # 安静模式：不再每请求刷屏
         pass
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, cookie=None):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
+        ck = cookie or getattr(self, '_sess_cookie', None)   # 显式 cookie（登录/登出）优先，否则滑动续期
+        if ck:
+            self.send_header('Set-Cookie', ck)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj, code=200):
+    def _json(self, obj, code=200, cookie=None):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode('utf-8'),
-                   'application/json; charset=utf-8')
+                   'application/json; charset=utf-8', cookie)
+
+    def _session_cookie(self, token):
+        # SameSite=Lax 挡掉跨站 POST 携带 Cookie（无独立 CSRF token 的替代）；
+        # 反代带 HTTPS 时经 X-Forwarded-Proto 补 Secure
+        secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
+        return '%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s' % (
+            COOKIE_NAME, token, SESSION_TTL, secure)
+
+    _CLEAR_COOKIE = '%s=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' % COOKIE_NAME
+
+    def _token(self):
+        c = http.cookies.SimpleCookie(self.headers.get('Cookie') or '')
+        m = c.get(COOKIE_NAME)
+        return m.value if m else ''
+
+    def _user(self):
+        tok = self._token()
+        u = session_user(tok)
+        if u and tok:                                # 滑动过期：每次有效请求都重发会话 cookie，浏览器端不掉线
+            self._sess_cookie = self._session_cookie(tok)
+        return u
+
+    def _admin(self, user):
+        if user['role'] != 'admin':
+            self._json({'ok': False, 'error': '需要管理员权限'}, 403)
+            return False
+        return True
 
     def do_GET(self):
         path, _, qs = self.path.partition('?')
@@ -1706,10 +2302,27 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/':
                 with open(HTML_PATH, 'rb') as f:
                     self._send(200, f.read(), 'text/html; charset=utf-8')
-            elif path == '/api/state':
-                self._json(api_state())
+                return
+            user = self._user()
+            if not user:
+                return self._json({'ok': False, 'error': '请先登录'}, 401)
+            if path == '/api/state':
+                self._json(api_state(user))
             elif path == '/api/posts':
-                self._json(api_posts(urllib.parse.parse_qs(qs)))
+                self._json(api_posts(user, urllib.parse.parse_qs(qs)))
+            elif path == '/api/auth/me':
+                self._json(api_me(user))
+            elif path == '/api/template':
+                self._json(api_template(user))
+            elif path == '/api/admin/stats':
+                if self._admin(user):
+                    self._json(api_admin_stats(user))
+            elif path == '/api/admin/users':
+                if self._admin(user):
+                    self._json(api_admin_users(user, urllib.parse.parse_qs(qs)))
+            elif path == '/api/admin/invite_code':
+                if self._admin(user):
+                    self._json({'ok': True, 'invite_code': kv_get('invite_code') or ''})
             elif path == '/img':
                 data, ctype = proxy_image(urllib.parse.parse_qs(qs).get('u', [''])[0])
                 self.send_response(200)
@@ -1732,44 +2345,73 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok': False, 'error': '请求体解析失败'}, 400)
             return
         try:
+            if path in ('/api/auth/login', '/api/auth/register'):
+                res = api_login(body) if path.endswith('/login') else api_register(body)
+                cookie = self._session_cookie(res.pop('token')) if res.get('ok') else None
+                return self._json(res, cookie=cookie)
+            if path == '/api/auth/cancel_deactivate':
+                res = api_cancel_deactivate(body)
+                cookie = self._session_cookie(res.pop('token')) if res.get('ok') else None
+                return self._json(res, cookie=cookie)
+            user = self._user()
+            if path == '/api/auth/logout':
+                if self._token():
+                    db('DELETE FROM sessions WHERE token=?', (self._token(),))
+                return self._json({'ok': True}, cookie=self._CLEAR_COOKIE)
+            if not user:
+                return self._json({'ok': False, 'error': '请先登录'}, 401)
             if path == '/api/cookie':
-                self._json(api_cookie(body))
+                self._json(api_cookie(user, body))
             elif path == '/api/blogger/preview':
-                self._json(api_preview(body))
+                self._json(api_preview(user, body))
             elif path == '/api/blogger/add':
-                self._json(api_add(body))
+                self._json(api_add(user, body))
             elif path == '/api/sync':
-                self._json(api_sync(body))
+                self._json(api_sync(user, body))
             elif path == '/api/sync_all':
-                self._json(api_sync_all(body))
+                self._json(api_sync_all(user, body))
             elif path == '/api/schedule':
-                self._json(api_schedule(body))
+                self._json(api_schedule(user, body))
             elif path == '/api/pause':
-                self._json(api_pause(body))
+                self._json(api_pause(user, body))
             elif path == '/api/blogger/delete':
-                self._json(api_delete(body))
+                self._json(api_delete(user, body))
             elif path == '/api/blogger/move':
-                self._json(api_blogger_move(body))
+                self._json(api_blogger_move(user, body))
             elif path == '/api/batch/delete':
-                self._json(api_batch_delete(body))
+                self._json(api_batch_delete(user, body))
             elif path == '/api/batch/update':
-                self._json(api_batch_update(body))
+                self._json(api_batch_update(user, body))
             elif path == '/api/refull':
-                self._json(api_refull(body))
+                self._json(api_refull(user, body))
             elif path == '/api/cancel':
-                self._json(api_cancel(body))
+                self._json(api_cancel(user, body))
             elif path == '/api/blogger/yuque_dir':
-                self._json(api_blogger_yuque_dir(body))
+                self._json(api_blogger_yuque_dir(user, body))
             elif path == '/api/yuque/sync':
-                self._json(api_yuque_sync(body))
+                self._json(api_yuque_sync(user, body))
             elif path == '/api/yuque/mark':
-                self._json(api_yuque_mark(body))
+                self._json(api_yuque_mark(user, body))
             elif path == '/api/yuque/delete':
-                self._json(api_yuque_delete(body))
+                self._json(api_yuque_delete(user, body))
             elif path == '/api/yuque/cancel':
-                self._json(api_yuque_cancel(body))
+                self._json(api_yuque_cancel(user, body))
             elif path == '/api/update/cancel':
-                self._json(api_update_cancel(body))
+                self._json(api_update_cancel(user, body))
+            elif path == '/api/auth/deactivate':
+                res = api_deactivate(user, body)
+                cookie = self._CLEAR_COOKIE if res.get('ok') else None
+                self._json(res, cookie=cookie)
+            elif path == '/api/me/password':
+                self._json(api_me_password(user, body))
+            elif path == '/api/me/yuque_token':
+                self._json(api_me_yuque_token(user, body))
+            elif path == '/api/admin/user':
+                if self._admin(user):
+                    self._json(api_admin_user(user, body))
+            elif path == '/api/admin/invite_code/regenerate':
+                if self._admin(user):
+                    self._json(api_admin_invite(user))
             else:
                 self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:  # noqa: BLE001
@@ -1807,11 +2449,12 @@ def main():
     backup_db()                     # 先备份现有数据，再初始化
     init_db()
     # 工具重启：把上次没跑完的任务标记为「已暂停」，用户点继续即断点续爬
-    for r in db("SELECT uid, state FROM bloggers WHERE state IN ('queued','fulling')").fetchall():
-        set_blogger(r['uid'], state='paused', note='工具重启过，点击继续接着拉')
-        db('UPDATE posts SET deleted=0 WHERE uid=?', (r['uid'],))    # 中断的拉取不留下临时「已删除」标记
-        db('DELETE FROM pull_seen WHERE uid=?', (r['uid'],))
-    db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")   # 中断的归档不留假「同步中」
+    for r in db("SELECT user_id, uid FROM bloggers WHERE state IN ('queued','fulling')").fetchall():
+        set_blogger(r['user_id'], r['uid'], state='paused', note='工具重启过，点击继续接着拉')
+        db('UPDATE posts SET deleted=0 WHERE user_id=? AND uid=?', (r['user_id'], r['uid']))
+        db('DELETE FROM pull_seen WHERE user_id=? AND uid=?', (r['user_id'], r['uid']))
+    clear_arch_state()   # 中断的归档不留假「同步中」
+    purge_stale_users()             # 启动清一次：注销超期账号、过期会话
     for _ in range(2):                                  # 最多 2 路同时拉博主
         threading.Thread(target=sync_worker, daemon=True).start()
     threading.Thread(target=refresh_worker, daemon=True).start()   # 专职批量更新通道
@@ -1826,6 +2469,8 @@ def main():
             sys.stdout = sys.stderr = log
         except Exception:
             pass
+    if MIGRATE_MSG:
+        print(MIGRATE_MSG)          # 首次迁移的 admin 初始密码，只提示这一次
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8766
     try:
         srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
@@ -1839,7 +2484,7 @@ def main():
         except Exception:
             pass
         if not os.environ.get('WEIBO_NO_BROWSER'):
-            webbrowser.open(url)          # 已运行则直接打开页面
+            webbrowser.open('http://127.0.0.1:%d/' % port)   # 已运行则直接打开页面
         return
     url = 'http://127.0.0.1:%d/' % port
     print('=' * 56)

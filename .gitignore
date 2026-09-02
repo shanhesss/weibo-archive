@@ -6,6 +6,7 @@ weibo-backup-*.db
 weibo-backup-*.db-wal
 weibo-backup-*.db-shm
 weibo_server.log
+_migrate.log
 __pycache__/
 dist/
 build/
