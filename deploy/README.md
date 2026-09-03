@@ -78,6 +78,13 @@ install.sh **会自动新建系统用户 `weibo` 和目录 `/opt/weibo`，无需
 4. 装成 systemd 服务 `weibo` 并启动，健康检查通过为止
 5. 安装 nginx 反代（`SKIP_NGINX=1` 可跳过），监听 80 → 127.0.0.1:8766
 
+**为什么进程要跑在专用用户 `weibo` 下，而不是 ubuntu？**——最小权限。这是公网 HTTP 服务，且
+`weibo.db` 明文存着各用户微博 cookie / 语雀 token（ADR-0010 的信任边界 = 专用用户 + 数据目录
+700/600）。若用 `ubuntu`（有 sudo、近乎 root）跑服务，网页一旦被攻破 = 攻击者能读 `~/.ssh`
+私钥 = 整机沦陷；改用 `weibo`（nologin、无 sudo、只能摸 `/opt/weibo`）跑，最坏情况被限制在一个
+数据目录里。隔离由 install.sh 免费顺带建立，日常使用也不需要跟该用户打交道（全程
+`sudo systemctl` / `sudo -u weibo`）。**不要改成 `User=ubuntu`。**
+
 可调变量：
 
 | 变量 | 作用 |
