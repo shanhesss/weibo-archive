@@ -62,9 +62,24 @@ weibo/
 ├── weibo_archive.spec     # PyInstaller 配置（datas 含 weibo_web.html 等运行时资源）
 ├── smoke_test.py          # 冒烟测试
 ├── yuque-sync-template.md # 语雀归档文档模板
+├── deploy/                # 部署到 Linux 云服务器（见下方「部署」）
 ├── CONTEXT.md             # 领域术语表
 └── docs/adr/              # 架构决策记录（ADR-0001 ~ 0010）
 ```
+
+## 部署到云服务器
+
+工具可按 ADR-0010 部署到 Linux 云服务器（Ubuntu/Debian）：服务器装成 systemd 服务、只监听
+回环端口，公网经 nginx 反代，数据目录权限收紧。操作入口：**读 `deploy/README.md`**。
+
+> 注意：`deploy/` 在 git 里**只是说明文档**。服务器上跑的代码和数据一律来自**本机打包上传的
+> `weibo-deploy.tar.gz`**（含 `weibo.db`，而 `weibo.db` 不进 git、仓库里根本没有）——让任何
+> 部署 AI 执行时都**只准用服务器上的包，禁止去 git / GitHub 拉代码**（拉了 = 全新空库 = 丢数据）。
+
+简要流程：本机 `bash deploy/pack.sh` 打包（连带本地 `weibo.db` 一起迁移）→ `scp` 上传到
+服务器的 `/tmp` → `tar xzf` 解包 → `sudo bash weibo-deploy/deploy/install.sh` → 浏览器访问
+`http://<服务器IP>/` 用原 admin 密码登录。注意当前为「裸 IP + HTTP」快跑形态，长期使用应补
+域名 + HTTPS 并收紧来源。
 
 ## 数据与隐私
 

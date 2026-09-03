@@ -10,3 +10,7 @@ _migrate.log
 __pycache__/
 dist/
 build/
+
+# 部署产物（含敏感数据 weibo.db，严禁入库）
+weibo-deploy.tar.gz
+.deploy_stage/

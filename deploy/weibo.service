@@ -1,0 +1,25 @@
+# 微博存档工具 systemd 服务单元
+# 由 deploy/install.sh 安装到 /etc/systemd/system/weibo.service
+# 运行环境变量从 /etc/weibo.env 读取（install.sh 生成，仅 root 可读）
+
+[Unit]
+Description=weibo archive tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=weibo
+Group=weibo
+WorkingDirectory=/opt/weibo
+EnvironmentFile=/etc/weibo.env
+ExecStart=/usr/bin/python3 /opt/weibo/weibo_server.py 8766
+Restart=on-failure
+RestartSec=3
+
+# 基础加固：禁止提权、隐藏部分信息
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
