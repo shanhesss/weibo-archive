@@ -1954,6 +1954,21 @@ function gotoPage(n){
   loadPosts();
 }
 
+/* ── 跨断点守卫：手机↔桌面切换时重建分页、收起手机浮层 ── */
+window.addEventListener('resize', function(){
+  clearTimeout(window.__rz);
+  window.__rz = setTimeout(function(){
+    if(innerWidth > 900){                        // 回到桌面：清掉手机侧浮层
+      pgOpen = false;
+      $('pgSheet').classList.remove('on'); $('pgMask').classList.remove('on');
+      $('pgPill').classList.remove('on'); clearTimeout(pgTimer);
+      $('filters').classList.remove('flt-open');
+    }
+    renderPager(curPage, curPages);              // 依当前宽度重建（桌面恢复分页条）
+    markFlt();
+  }, 160);
+});
+
 /* ── 图片灯箱 ─────────────────────────────── */
 var lbScale = 1, lbTx = 0, lbTy = 0;          // 缩放与平移状态
 var lbDrag = false, lbDragMoved = false;      // 拖拽平移
