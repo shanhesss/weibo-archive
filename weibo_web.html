@@ -476,7 +476,8 @@
     /* 卡片单列、高度自然 */
     #grid{grid-template-columns:1fr; grid-auto-rows:auto; overflow:visible; gap:10px;}
     .post{min-height:0; border-radius:12px; padding:10px 12px 8px;
-          box-shadow:0 1px 3px rgba(15,23,42,.05);}
+          box-shadow:0 1px 3px rgba(15,23,42,.05);
+          touch-action:manipulation;}         /* 双击不触发浏览器缩放 */
     .p-text{min-height:0; font-size:14px; position:relative;}
     /* 长文默认收起（截断至约 8 行）+ 底部渐隐 + 可展开全文 */
     .p-text.tx-cap{overflow:hidden;}
@@ -1688,7 +1689,40 @@ function buildYears(years){
   sel.value = cur;
   sel.dataset.key = key;
 }
-/* ── 手机端长文收放：超过约 5 行的正文默认截断，可点「展开全文」── */
+/* ── 展开状态记忆：刷新/切页/切博主后尽量还原已展开的长文 ── */
+var openIds = loadOpenIds();
+function loadOpenIds(){
+  try{
+    var s = sessionStorage.getItem('wb_tx_open');
+    var a = s ? JSON.parse(s) : [];
+    return Array.isArray(a) ? a : [];
+  }catch(e){ return []; }
+}
+function saveOpenIds(){
+  try{ sessionStorage.setItem('wb_tx_open', JSON.stringify(openIds)); }catch(e){}
+}
+function postIdOf(post){
+  var c = post && post.querySelector('.chk');
+  return c ? c.dataset.id : null;
+}
+function addOpenId(id){ if(openIds.indexOf(id) < 0){ openIds.push(id); saveOpenIds(); } }
+function delOpenId(id){ var i = openIds.indexOf(id); if(i >= 0){ openIds.splice(i, 1); saveOpenIds(); } }
+function restoreOpenPosts(){
+  if(innerWidth > 900 || !openIds.length) return;
+  for(var i = openIds.length - 1; i >= 0; i--){
+    var id = openIds[i];
+    var chk = document.querySelector('.chk[data-id="' + id + '"]');
+    if(!chk) continue;                              // 数据里已没有这条 → 跳过（保留记录也行）
+    var post = chk.closest('.post');
+    var t = post && post.querySelector('.p-text');
+    if(t && t._btn){
+      if(!t.classList.contains('tx-open')) togglePostText(t._btn);   // 重新展开
+    } else {
+      delOpenId(id);                                // 已不是长文 → 清理记忆
+    }
+  }
+}
+/* ── 手机端长文收放：超过约 8 行的正文默认截断，可点「展开全文」── */
 function setupPostText(){
   if(innerWidth > 900) return;
   var ps = document.querySelectorAll('#grid .post .p-text');
@@ -1717,13 +1751,18 @@ function setupPostText(){
     if(counts) counts.insertBefore(b, counts.firstChild);
     t.onclick = function(ev){                  // 点正文也可展开
       if(ev.target.closest('a')) return;
-      if(this.classList.contains('tx-cap') && this._btn) togglePostText(this._btn);
+      if(this.classList.contains('tx-cap') && this._btn){
+        try{ ev._expandTap = true; }catch(err){}   // 标记：本次用于展开，不参与双击收起
+        togglePostText(this._btn);
+      }
     };
   }
 }
 function togglePostText(btn){
   var t = btn.closest('.post').querySelector('.p-text');
   var open = t.classList.toggle('tx-open');
+  var pid = postIdOf(t.closest('.post'));
+  if(open) addOpenId(pid); else delOpenId(pid);     // 记忆展开状态
   if(open){
     t.classList.remove('tx-cap');
     t.style.maxHeight = 'none';
@@ -1736,6 +1775,24 @@ function togglePostText(btn){
     btn.textContent = '展开全文';
   }
 }
+/* ── 手机端：双击卡片收起已展开的长文（点在按钮/图/链接上不算）── */
+var lastTap = {post: null, t: 0};
+$('grid').addEventListener('click', function(e){
+  if(innerWidth > 900) return;
+  if(e._expandTap){ lastTap.post = null; lastTap.t = 0; return; }   // 展开点击不算双击
+  if(e.target.closest('button,a,img,input,label')) return;
+  var post = e.target.closest('.post');
+  if(!post) return;
+  var t = post.querySelector('.p-text');
+  if(!t || !t._btn || t.classList.contains('tx-cap')){ lastTap.post = null; return; }  // 仅展开态参与双击收起
+  var now = Date.now();
+  if(lastTap.post === post && now - lastTap.t < 320){
+    lastTap.post = null; lastTap.t = 0;
+    togglePostText(t._btn);                         // 第二次 → 收起
+  } else {
+    lastTap.post = post; lastTap.t = now;
+  }
+});
 function renderPosts(r){
   if(!r || !r.items) return;
   buildYears(r.years);
@@ -1807,6 +1864,7 @@ function renderPosts(r){
   }
   grid.innerHTML = html;
   setupPostText();
+  restoreOpenPosts();
   renderPager(r.page, r.pages);
   syncSelection();
 }
