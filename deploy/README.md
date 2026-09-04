@@ -27,7 +27,53 @@ bash weibo-deploy/deploy/install.sh
 
 ---
 
-## 第 1 步 本机打包（已在开发机做好的话可跳过）
+## 先分清：全新部署还是更新已有服务器
+
+- **第一次装 / 换新服务器**（服务器上还没有 `weibo.db`）→ 走下方「第 1~3 步」的**带库包**
+  （`pack.sh` 默认带库）。
+- **已部署过、只是改功能代码**（服务器 `/opt/weibo/weibo.db` 已存在）→ 直接看下面的
+  「更新已有服务器（非首次部署）」，用 **`pack.sh --no-db`**。
+
+## 更新已有服务器（非首次部署，只改功能代码）
+
+服务器上线后，数据（账号、博主/微博、cookie、语雀令牌与同步记录）以服务器上的
+`/opt/weibo/weibo.db` 为准，**本地那份会越来越旧**。日常升级**只传代码、不背本地库**：
+
+```bash
+# 本机（仓库根，git-bash）——不必停本地服务（不带库的包不检查 weibo.db-wal）
+bash deploy/pack.sh --no-db
+scp weibo-deploy.tar.gz ubuntu@服务器IP:/tmp/
+```
+
+```bash
+# 服务器
+cd /tmp && tar xzf weibo-deploy.tar.gz
+sudo bash weibo-deploy/deploy/install.sh      # 别加 FORCE_DB / ALLOW_FRESH
+```
+
+install.sh 只覆盖 3 个运行文件、**复用服务器已有库**。第 69 行的防呆只在
+「服务器没库 **且** 包里也没库」时触发；已部署的服务器库存在，所以**无需 `ALLOW_FRESH`**。
+（`pack.sh --no-db` 结尾提示加 ALLOW_FRESH 是给全新空库的通用话术，本场景请忽略。）
+
+更新后核对：
+
+```bash
+sudo -u weibo ls -lh /opt/weibo/weibo.db      # 大小不变 = 库没被动
+curl -sI http://服务器IP/ | head -1            # 出口 200
+curl -s http://127.0.0.1:8766/ | grep -c bloggerStrip   # ≥1 = 新版页面已生效
+systemctl is-active weibo                      # active
+```
+
+**回滚到上一版**：把上一次的 `weibo-deploy.tar.gz`（或解压后的 `weibo-deploy/`）
+重跑一遍上面的 install.sh 即可——代码覆盖回去，库仍不动。
+
+**什么时候才要带库打包**：只有整套迁移（换机器 / 服务器重建）才用带库包，且带的是
+**服务器上的库**而不是本地旧库——先 `sudo systemctl stop weibo` 再拷
+`/opt/weibo/weibo.db`，做法见文末「备份数据 · 退服务器」。
+
+---
+
+## 第 1 步 本机打包（首次部署；已在开发机做好的话可跳过）
 
 在仓库根目录（git-bash）：
 
@@ -143,7 +189,7 @@ sudo -u weibo ls -lh /opt/weibo/weibo.db        # 应恢复到 ~90MB
 | `curl 127.0.0.1:8766` 不通 | `journalctl -u weibo -n 50` 看报错；端口被占改 `weibo.service` 里 ExecStart 端口 |
 | 打开是 nginx 欢迎页 | install.sh 已删 default 站点，手动 `rm /etc/nginx/sites-enabled/default && systemctl reload nginx` |
 | 拉到一半 432 暂停 | 正常反爬保护，换小号或等退避；见 CONTEXT.md |
-| 想升级代码 | 重新 `pack.sh` → 上传 → 重跑 `install.sh`（自动覆盖代码，库不动） |
+| 想升级代码 | 已部署服务器走上文「更新已有服务器」：`pack.sh --no-db` → 上传 → 重跑 `install.sh`（覆盖代码，复用库） |
 
 ## 备份数据 · 退服务器
 
