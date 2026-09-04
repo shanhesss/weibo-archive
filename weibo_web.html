@@ -128,6 +128,7 @@
        padding:10px 14px 12px; overflow:hidden;}
   #filters{flex:none; display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;}
   #kw{width:200px;}
+  #kw::placeholder{font-size:12px;}         /* 提示尽量不截断，输字仍是正常字号 */
   #total{color:var(--sub); font-size:13px;}
 
   /* ── 翻页条（与筛选同一行，位于总数左边）── */
@@ -139,6 +140,8 @@
   #batchBar{flex:none; display:none; align-items:center; gap:10px; margin-bottom:8px;
             font-size:13px; color:var(--sub); flex-wrap:wrap;}
   #batchBar.show{display:flex;}
+  #batchBar .bb-scope{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  #batchBar .bb-acts{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-left:auto;}
   #selCount{color:var(--txt); font-weight:600;}
 
   /* ── 卡片网格 ─────────────────────────── */
@@ -360,6 +363,11 @@
   #bloggerStrip{display:none;}
   #filtersCtl{display:contents;}          /* 桌面：包裹层不产生视觉变化 */
   #pagerBottom{display:none;}
+  #toTop{display:none;}                   /* 桌面不需要返回顶部 */
+  #fltToggle{display:none;}               /* 桌面直接展示筛选，不用折叠按钮 */
+  #fltDone{display:none;}
+  #fltMask{display:none;}
+  #pgPill,#pgMask,#pgSheet{display:none;} /* 手机分页浮层（桌面无） */
 
   /* ── 移动端（≤900px）：整页纵向滚动 + 博主抽屉 + 底部操作条 ── */
   @media (max-width:900px){
@@ -417,30 +425,53 @@
 
     /* 主区与筛选 */
     main{overflow:visible; padding:0 12px 76px; min-height:0;}
-    #filters{flex-wrap:wrap; gap:6px; margin-bottom:6px;}
-    #kw{order:0; flex:1 1 auto; min-width:0;}
-    #total{order:1; margin-left:auto; flex:none; align-self:center;}
-    #filtersCtl{order:2; display:flex; align-items:center; gap:6px; overflow-x:auto; flex:1 1 100%;
-                padding:2px 0 4px; scrollbar-width:none;}
-    #filtersCtl > *{flex:none; white-space:nowrap;}   /* 不被压缩换行，横滑查看全部 */
-    #filtersCtl::-webkit-scrollbar{display:none;}
-    #pager{order:3; flex:1 1 100%; display:flex; align-items:center; justify-content:center;
-           gap:6px; flex-wrap:wrap; margin:0 0 4px; color:var(--sub); font-size:13px;}
-    #pager button{min-height:34px; flex:none;}
-    #pager input{width:60px; padding:4px 6px; text-align:center; font-size:16px;}
-    #pager:empty{display:none;}            /* 只有一页时不占行 */
-    #pagerBottom{display:none;}            /* 移动端翻页放顶部，底部不再显示 */
+    #filters{flex-wrap:wrap; gap:8px; margin-bottom:6px;}
+    /* 搜索框缩短放左；筛选与页码胶囊靠右（一条工具栏） */
+    #kw{order:0; flex:none; width:min(56%, 300px); min-width:110px;}
+    #fltToggle{order:1; flex:none; margin-left:auto; display:inline-flex; align-items:center;
+           min-height:34px; padding:0 13px; font-size:13px; line-height:1;
+           border-radius:999px; color:var(--sub); background:#fff; border:1px solid var(--line);}
+    #fltToggle.on{background:#e8f4fd; border-color:#b7dff7; color:#1d6fb8; font-weight:600;}
+    #total{display:none;}                 /* 移动端总数折叠（省空间），展开筛选时一并可见 */
+    /* 手机分页：顶栏不常驻；左右滑切页，底部临时页码浮层点开可跳页 */
+    #pager{display:none;}
+    #pagerBottom{display:none;}
+    /* 点「筛选」→ 底部悬浮筛选面板（不动正文、不占高度） */
+    #filtersCtl{display:none;}
+    #filters.flt-open #filtersCtl{display:flex; flex-wrap:wrap; align-items:flex-start;
+           align-content:flex-start; gap:10px 12px; position:fixed; left:8px; right:8px;
+           bottom:calc(8px + env(safe-area-inset-bottom)); z-index:68;
+           max-height:58vh; overflow-y:auto; padding:14px 12px 16px;
+           background:var(--card); border:1px solid var(--line); border-radius:16px;
+           box-shadow:0 -6px 26px rgba(15,23,42,.16);}
+    #filtersCtl > *{flex:none; white-space:nowrap;}
+    #fltMask{display:none; position:fixed; inset:0; z-index:61; background:rgba(15,17,20,.2);}
+    #filters.flt-open #fltMask{display:block;}
+    /* 筛选面板排版：两列选择、日期一行、底部清空/完成 */
+    #filters.flt-open #filtersCtl{gap:10px 10px; padding:14px 14px 12px;}
+    #filters.flt-open #filtersCtl select{flex:1 1 calc(50% - 5px); min-width:0;
+           padding:4px 8px; height:36px;}
+    #filters.flt-open #filtersCtl input[type=date]{flex:1 1 130px; min-width:80px;
+           padding:4px 6px; height:36px;}
+    #filters.flt-open #filtersCtl span{flex:none; margin:0 6px; color:var(--sub); font-size:12px;}
+    #filters.flt-open #clearF,#filters.flt-open #fltDone{flex:none; font-size:13px;
+           padding:0 16px; min-height:34px; line-height:1; align-items:center;}
+    #filters.flt-open #fltDone{margin-left:auto; display:inline-flex; align-items:center;}
 
-    /* 批量操作 → 底部操作条 */
-    #batchBar{position:fixed; left:0; right:0; bottom:0; z-index:66; margin:0;
-          padding:8px 10px calc(8px + env(safe-area-inset-bottom));
-          background:var(--card); border-top:1px solid var(--line);
-          flex-wrap:nowrap; overflow-x:auto; gap:8px; align-items:center;
-          box-shadow:0 -6px 20px rgba(0,0,0,.08); scrollbar-width:none;}
+    /* 批量操作 → 底部操作面板（分行 + 宫格，不横滑） */
+    #batchBar{position:fixed; left:8px; right:8px; z-index:66; margin:0;
+          bottom:calc(8px + env(safe-area-inset-bottom));
+          padding:10px 10px 12px; border-radius:14px; border:1px solid var(--line);
+          background:var(--card); flex-direction:column; align-items:stretch; gap:8px;
+          box-shadow:0 -6px 24px rgba(15,23,42,.16);
+          max-height:64vh; overflow-y:auto;}
     #batchBar.show{display:flex;}
-    #batchBar::-webkit-scrollbar{display:none;}
-    #batchBar .mini{min-height:34px; flex:none; font-size:13px; white-space:nowrap;}
-    #batchBar #selCount{flex:none; white-space:nowrap;}
+    #batchBar .bb-scope{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+    #batchBar .bb-acts{display:flex; flex-wrap:wrap; gap:8px; margin-left:0;}
+    #batchBar .bb-scope .mini{min-height:30px; font-size:12px; white-space:nowrap;}
+    #batchBar .bb-acts .mini{min-height:30px; font-size:12px; padding:0 12px; margin:0;
+          border-radius:8px; display:inline-flex; align-items:center; white-space:nowrap;}
+    #batchBar #selCount{white-space:nowrap;}
 
     /* 卡片单列、高度自然 */
     #grid{grid-template-columns:1fr; grid-auto-rows:auto; overflow:visible; gap:10px;}
@@ -486,6 +517,39 @@
     /* 灯箱 / 提示 */
     #lbCtrl button{width:44px; height:44px; font-size:20px;}
     #lbInfo{font-size:12px;}
+
+    /* 返回顶部悬浮钮：下滑一段才出现，有批量条时让位 */
+    #toTop{display:block; position:fixed; right:14px;
+           bottom:calc(18px + env(safe-area-inset-bottom)); z-index:64;
+           width:42px; height:42px; border-radius:50%; border:1px solid var(--line);
+           background:var(--card); color:var(--sub); font-size:19px; line-height:1;
+           box-shadow:0 4px 14px rgba(15,23,42,.16); cursor:pointer;
+           opacity:0; visibility:hidden; transform:translateY(8px);
+           transition:opacity .18s, transform .18s, visibility .18s;}
+    #toTop.on{opacity:1; visibility:visible; transform:none;}
+    #toTop:active{background:#f2f3f5;}
+    #batchBar.show ~ #toTop{opacity:0; visibility:hidden; pointer-events:none;}
+
+    /* 页码浮层：底部临时小药丸 + 点开后的跳页面板 */
+    #pgPill{position:fixed; left:50%; transform:translateX(-50%);
+            bottom:calc(24px + env(safe-area-inset-bottom)); z-index:63;
+            display:none; align-items:center; padding:7px 16px; font-size:13px;
+            border-radius:999px; background:var(--card); border:1px solid var(--line);
+            box-shadow:0 4px 16px rgba(15,23,42,.16); color:var(--txt); cursor:pointer;}
+    #pgPill.on{display:inline-flex;}
+    #pgMask{display:none; position:fixed; inset:0; z-index:62; background:rgba(15,17,20,.2);}
+    #pgMask.on{display:block;}
+    #pgSheet{display:none; align-items:center; justify-content:center; flex-wrap:nowrap; gap:6px;
+          position:fixed; left:8px; right:8px;
+          bottom:calc(10px + env(safe-area-inset-bottom)); z-index:69; padding:9px 10px;
+          background:var(--card); border:1px solid var(--line); border-radius:16px;
+          box-shadow:0 -6px 26px rgba(15,23,42,.16);}
+    #pgSheet.on{display:flex;}
+    #pgSheet span{font-size:12px; white-space:nowrap;}
+    #pgSheet button{min-height:30px; font-size:12px; padding:0 8px; white-space:nowrap;}
+    #pgSheet input{width:54px; height:30px; padding:2px 4px; text-align:center; font-size:16px;}
+    /* 批量条弹出时，让出底部区域 */
+    #batchBar.show ~ #pgPill,#batchBar.show ~ #pgMask,#batchBar.show ~ #pgSheet{display:none;}
   }
 </style>
 </head>
@@ -585,7 +649,8 @@
       <span class="hint" id="yuqueEditHint"></span>
     </div>
     <div id="filters">
-      <input type="text" id="kw" placeholder="搜索关键词，或粘贴微博ID/链接直达" autocomplete="off" spellcheck="false">
+      <input type="text" id="kw" placeholder="搜索 / 粘贴链接或微博ID" title="输入关键词搜索；直接粘贴微博链接或博文 ID 可直达该微博" autocomplete="off" spellcheck="false">
+      <button id="fltToggle" type="button" title="展开 / 收起筛选条件">筛选</button>
       <div id="filtersCtl">
       <select id="yearSel"><option value="">全部年份</option></select>
       <select id="presetSel">
@@ -611,28 +676,37 @@
         <option value="skip">无需归档</option>
       </select>
       <button id="clearF" class="mini">清空筛选</button>
+      <button id="fltDone" class="mini primary">完成</button>
       </div>
+      <div id="fltMask"></div>
       <div id="pager"></div>
       <span id="total"></span>
     </div>
     <div id="batchBar">
-      <button id="selAllPage" class="mini">全选本页</button>
-      <button id="selAllFilter" class="mini">全选当前筛选结果</button>
-      <span id="selCount">已选 0 条</span>
-      <span style="flex:1"></span>
-      <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀，可随时在顶部取消">同步到语雀</button>
-      <button id="batchArchDel" class="mini danger" title="删除选中有语雀文档的微博对应的语雀文档，微博重置为待归档">删语雀档</button>
-      <button id="batchUpdate" class="mini primary">批量更新</button>
-      <button id="batchDelete" class="mini danger">批量删除</button>
-      <button id="batchMarkSkip" class="mini btn-skip" title="选中微博转为无需归档，不再参与语雀同步">转无需归档</button>
-      <button id="batchMarkPending" class="mini btn-pending" title="选中微博转回待归档">转待归档</button>
-      <button id="selClear" class="mini">清空选择</button>
+      <div class="bb-scope">
+        <span id="selCount">已选 0 条</span>
+        <button id="selAllPage" class="mini">全选本页</button>
+        <button id="selAllFilter" class="mini">全选当前筛选结果</button>
+        <button id="selClear" class="mini">清空选择</button>
+      </div>
+      <div class="bb-acts">
+        <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀，可随时在顶部取消">同步到语雀</button>
+        <button id="batchArchDel" class="mini danger" title="删除选中有语雀文档的微博对应的语雀文档，微博重置为待归档">删语雀档</button>
+        <button id="batchUpdate" class="mini primary">批量更新</button>
+        <button id="batchDelete" class="mini danger">批量删除</button>
+        <button id="batchMarkSkip" class="mini btn-skip" title="选中微博转为无需归档，不再参与语雀同步">转无需归档</button>
+        <button id="batchMarkPending" class="mini btn-pending" title="选中微博转回待归档">转待归档</button>
+      </div>
     </div>
     <div id="grid"></div>
     <div id="pagerBottom"></div>
     <div id="empty">
       <div class="big">还没有微博</div>
     </div>
+    <button id="toTop" type="button" title="回到顶部" aria-label="回到顶部">↑</button>
+    <div id="pgPill"></div>
+    <div id="pgMask"></div>
+    <div id="pgSheet"></div>
   </main>
 </div>
 </div>
@@ -1112,6 +1186,18 @@ $('scrim').onclick = closeNav;
 document.addEventListener('keydown', function(e){
   if(e.key === 'Escape') closeNav();
 });
+
+/* ── 返回顶部（移动端）────────────── */
+var toTopBtn = $('toTop');
+function toTopScroll(){
+  var y = window.scrollY || document.documentElement.scrollTop || 0;
+  toTopBtn.classList.toggle('on', y > 600);
+}
+toTopBtn.onclick = function(){
+  window.scrollTo({top: 0, behavior: 'smooth'});
+};
+window.addEventListener('scroll', toTopScroll, {passive: true});
+toTopScroll();
 /* ── 语雀目录编辑（主区全宽，链接完整可看）── */
 var YUQUE_URL_RX = /^https:\/\/www\.yuque\.com\/[^\s/?#]+\/[^\s/?#]+(?:\/[^\s/?#]+)*\/?$/;
 function openYuqueEdit(uid, nickname, dir){
@@ -1726,35 +1812,97 @@ function renderPosts(r){
 }
 
 /* ── 翻页条（事件委托，杜绝内联绑定失效）── */
+var pgOpen = false, pgTimer = null, pgAnnounced = false;   // 手机分页浮层状态
+function pgFill(){
+  var sheet = $('pgSheet'); if(!sheet) return;
+  if(curPages <= 1){ sheet.innerHTML = ''; return; }
+  sheet.innerHTML =
+      '<button class="mini" data-pp="prev">‹ 上一页</button>'
+    + '<span>第 ' + curPage + ' / ' + curPages + ' 页</span>'
+    + '<input type="number" min="1" max="'+curPages+'" value="'+curPage+'">'
+    + '<button class="mini" data-pp="go">跳转</button>'
+    + '<button class="mini" data-pp="next">下一页 ›</button>'
+    + '<button class="mini" data-pp="toggle">收起</button>';
+}
+function pgSetPill(){
+  var p = $('pgPill'); if(!p) return;
+  p.innerHTML = (curPages > 1) ? '第 ' + curPage + ' / ' + curPages + ' 页 ▾' : '';
+}
+function showPill(){
+  if(innerWidth > 900 || curPages <= 1 || pgOpen) return;
+  pgSetPill();
+  $('pgPill').classList.add('on');
+  clearTimeout(pgTimer);
+  pgTimer = setTimeout(function(){ if(!pgOpen) $('pgPill').classList.remove('on'); }, 2600);
+}
+function openPg(){
+  closeFilter();
+  pgOpen = true;
+  pgFill();
+  $('pgSheet').classList.add('on');
+  $('pgMask').classList.add('on');
+  $('pgPill').classList.remove('on');
+  clearTimeout(pgTimer);
+}
+function closePg(){
+  pgOpen = false;
+  $('pgSheet').classList.remove('on');
+  $('pgMask').classList.remove('on');
+  showPill();
+}
+$('pgPill').addEventListener('click', openPg);
+$('pgMask').addEventListener('click', closePg);
+$('pgSheet').addEventListener('click', function(e){
+  var b = e.target.closest('[data-pp]');
+  if(!b) return;
+  var act = b.dataset.pp;
+  if(act === 'toggle'){ closePg(); return; }
+  if(act === 'prev') gotoPage(curPage - 1);
+  else if(act === 'next') gotoPage(curPage + 1);
+  else if(act === 'go'){
+    var inp = $('pgSheet').querySelector('input');
+    if(inp) gotoPage(parseInt(inp.value, 10));
+  }
+});
 function renderPager(page, pages){
   curPages = pages;
-  var html = '';
-  if(pages > 1){
-    if(innerWidth <= 900){                 // 手机：一行内放「上一页/页码跳转/下一页」
-      html = '<button class="mini" data-pg="prev">‹ 上一页</button>'
-        + '<span>第 ' + page + ' / ' + pages + ' 页</span>'
-        + '<input type="number" min="1" max="'+pages+'" value="'+page+'">'
-        + '<button class="mini" data-pg="go">跳转</button>'
-        + '<button class="mini" data-pg="next">下一页 ›</button>';
-    } else {                              // 桌面：首页/末页都放出来
-      html = '<button class="mini" data-pg="first">首页</button>'
-        + '<button class="mini" data-pg="prev">上一页</button>'
-        + '<span>第 ' + page + ' / ' + pages + ' 页</span>'
-        + '<input type="number" min="1" max="'+pages+'" value="'+page+'">'
-        + '<button class="mini" data-pg="go">跳转</button>'
-        + '<button class="mini" data-pg="next">下一页</button>'
-        + '<button class="mini" data-pg="last">末页</button>';
-    }
+  if(innerWidth > 900){                   // 桌面：完整分页条照旧
+    var html = (pages > 1)
+      ? '<button class="mini" data-pg="first">首页</button>'
+      + '<button class="mini" data-pg="prev">上一页</button>'
+      + '<span>第 ' + page + ' / ' + pages + ' 页</span>'
+      + '<input type="number" min="1" max="'+pages+'" value="'+page+'">'
+      + '<button class="mini" data-pg="go">跳转</button>'
+      + '<button class="mini" data-pg="next">下一页</button>'
+      + '<button class="mini" data-pg="last">末页</button>'
+      : '';
+    $('pager').innerHTML = html;
+    $('pagerBottom').innerHTML = html;
+    return;
   }
-  $('pager').innerHTML = html;
-  $('pagerBottom').innerHTML = html;
+  // 手机：顶栏不常驻分页，交给底部临时浮层（左右滑切页）
+  $('pager').innerHTML = '';
+  $('pagerBottom').innerHTML = '';
+  if(pages <= 1){
+    pgOpen = false;
+    pgAnnounced = false;
+    $('pgSheet').classList.remove('on');
+    $('pgMask').classList.remove('on');
+    $('pgPill').classList.remove('on');
+    clearTimeout(pgTimer);
+  } else {
+    pgFill();
+    pgSetPill();
+    if(pgOpen){ $('pgSheet').classList.add('on'); $('pgMask').classList.add('on'); }
+    else if(!pgAnnounced){ pgAnnounced = true; showPill(); }   // 首次多页：亮一下页码小药丸
+  }
 }
 function bindPagerBar(bar){
   bar.addEventListener('click', function(e){
     var btn = e.target.closest('[data-pg]');
     if(!btn) return;
-    var input = bar.querySelector('input[type=number]');
     var act = btn.dataset.pg, n;
+    var input = bar.querySelector('input[type=number]');
     if(act === 'first') n = 1;
     else if(act === 'prev') n = curPage - 1;
     else if(act === 'next') n = curPage + 1;
@@ -1769,11 +1917,40 @@ function bindPagerBar(bar){
 }
 bindPagerBar($('filters'));
 bindPagerBar($('pagerBottom'));
+
+/* ── 手机端：在微博列表上左右滑动切上一页/下一页 ── */
+var sw = {x: 0, y: 0, id: -1, dir: 0, decided: false};
+document.addEventListener('touchstart', function(e){
+  if(innerWidth > 900 || !$('grid').contains(e.target) || e.touches.length !== 1) return;
+  var t = e.touches[0];
+  sw = {x: t.clientX, y: t.clientY, id: t.identifier, dir: 0, decided: false};
+}, {passive: true});
+document.addEventListener('touchmove', function(e){
+  if(innerWidth > 900 || sw.id === -1) return;
+  if(e.touches.length !== 1 || e.touches[0].identifier !== sw.id){ sw.id = -1; return; }
+  var t = e.touches[0], dx = t.clientX - sw.x, dy = t.clientY - sw.y;
+  if(!sw.decided){
+    if(Math.abs(dx) > 14 && Math.abs(dx) > Math.abs(dy) * 1.2){ sw.decided = true; sw.dir = dx < 0 ? 1 : -1; }
+    else if(Math.abs(dy) > 16){ sw.id = -1; }        // 纵向滚动 → 放弃本次
+    else return;
+  }
+  if(sw.decided) e.preventDefault();                  // 横向滑动时别再触发页面滚动
+}, {passive: false});
+document.addEventListener('touchend', function(e){
+  if(innerWidth > 900 || sw.id === -1) return;
+  var t = e.changedTouches[0];
+  var s = sw; sw = {x: 0, y: 0, id: -1, dir: 0, decided: false};
+  if(!s.decided || s.id !== t.identifier) return;
+  if(Math.abs(t.clientX - s.x) > 44){
+    if(curPages > 1) gotoPage(curPage + s.dir);
+  }
+});
 function gotoPage(n){
   if(!n || isNaN(n)) return;
   n = Math.min(curPages || 1, Math.max(1, n));
   if(n !== curPage && selMode === 'manual') clearSelection();   // 本页勾选翻页即清
   curPage = n;
+  if(innerWidth <= 900 && !pgOpen) showPill();                 // 切页后短暂亮出页码浮层
   loadPosts();
 }
 
@@ -1901,7 +2078,37 @@ $('clearF').onclick = function(){
   $('statusSel').value = '';
   $('archSel').value = '';
   resetAndLoad();
+  markFlt();
 };
+
+/* ── 高级筛选：移动端点「筛选」→ 底部悬浮筛选面板 ── */
+function markFlt(){
+  var f = $('filters');
+  var has = !!(f.querySelector('#yearSel').value || f.querySelector('#from').value
+    || f.querySelector('#to').value || f.querySelector('#statusSel').value
+    || f.querySelector('#archSel').value);
+  var open = f.classList.contains('flt-open');
+  $('fltToggle').classList.toggle('on', has || open);
+}
+function openFilter(){
+  pgOpen = false;                                   // 开筛选时收起分页浮层
+  $('pgSheet').classList.remove('on'); $('pgMask').classList.remove('on');
+  $('pgPill').classList.remove('on'); clearTimeout(pgTimer);
+  $('filters').classList.add('flt-open');
+  markFlt();
+}
+function closeFilter(){
+  $('filters').classList.remove('flt-open');
+  markFlt();
+}
+$('fltToggle').onclick = function(){
+  if($('filters').classList.contains('flt-open')) closeFilter();
+  else openFilter();
+};
+$('fltMask').onclick = closeFilter;
+$('fltDone').onclick = closeFilter;
+$('filters').addEventListener('change', markFlt);   // 筛选值变化 → 同步高亮
+markFlt();
 
 /* ── 登录 / 注册 / 注销视图 ──────────────── */
 function showAuthView(){
