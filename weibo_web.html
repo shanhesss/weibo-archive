@@ -353,6 +353,140 @@
               border-radius:6px; background:#fff;}
   .admin-filters input{width:160px;}
   .admin-filters select{min-width:100px;}
+
+  /* ── 移动端布局元素（桌面默认隐藏/融入）── */
+  #navBtn{display:none;}
+  #scrim{display:none;}
+  #bloggerStrip{display:none;}
+  #filtersCtl{display:contents;}          /* 桌面：包裹层不产生视觉变化 */
+  #pagerBottom{display:none;}
+
+  /* ── 移动端（≤900px）：整页纵向滚动 + 博主抽屉 + 底部操作条 ── */
+  @media (max-width:900px){
+    html,body{height:auto; min-height:100%;}
+    body{display:block; overflow-y:auto; overflow-x:hidden;
+         -webkit-tap-highlight-color:transparent;}
+    body.nav-open{overflow:hidden;}
+    input,select,textarea{font-size:16px;}      /* 避免 iOS 聚焦自动放大 */
+
+    /* 顶栏：贴顶、可换行、精简 */
+    header{position:sticky; top:0; z-index:80; flex-wrap:wrap; gap:2px 10px;
+           height:auto; padding:6px 10px;}
+    header h1{font-size:16px;}
+    #navBtn{display:inline-block; flex:none; order:-2; padding:2px 14px; line-height:2;
+            border-radius:999px; font-size:13px; color:var(--txt);
+            background:var(--bg); border:1px solid var(--line);}
+    #navBtn:active{background:#e9edf1;}
+    #wbLink{display:none;}
+    #taskHints{order:9; flex:1 1 100%; min-width:0; margin:0;}
+    #taskHints .busy{max-width:100%; overflow:hidden; text-overflow:ellipsis;
+                     white-space:nowrap; vertical-align:middle;}
+    #cookiePill{width:34px; height:34px; padding:0; margin-left:auto;
+                display:inline-flex; align-items:center; justify-content:center; flex:none;}
+    #cookiePill #cookiePillTxt{display:none;}
+    #cookiePill .dot{margin:0;}
+    #userArea{margin-left:0;}
+    #userArea #userNameTxt{display:none;}
+    #userArea button.mini{min-height:32px; padding:2px 10px; font-size:13px;}
+    #banner .howto{min-width:0;}
+
+    /* 博主抽屉 + 遮罩 */
+    #layout{display:block;}
+    aside{position:fixed; z-index:70; left:0; top:0; bottom:0; width:min(86vw,340px);
+          padding:58px 12px 14px; transform:translateX(-103%);
+          transition:transform .2s ease; border-right:0; border-radius:0 14px 14px 0;}
+    body.nav-open aside{transform:none; box-shadow:10px 0 36px rgba(15,17,20,.2);}
+    #scrim{display:none; position:fixed; inset:0; z-index:69; background:rgba(15,17,20,.36);}
+    body.nav-open #scrim{display:block;}
+
+    /* 博主切换胶囊条 */
+    #bloggerStrip{display:flex; gap:8px; overflow-x:auto; margin:2px 0 6px;
+                  padding:6px 2px 4px; scrollbar-width:none;}
+    #bloggerStrip::-webkit-scrollbar{display:none;}
+    #bloggerStrip .chip{display:inline-flex; align-items:center; gap:6px; flex:none;
+          max-width:142px; padding:3px 12px 3px 4px; border-radius:999px; cursor:pointer;
+          border:1px solid var(--line); background:var(--card); font-size:13px;
+          line-height:1.7; color:var(--txt);}
+    #bloggerStrip .chip:active{background:#f0f2f5;}
+    #bloggerStrip .chip img,#bloggerStrip .chip .init{width:22px; height:22px; border-radius:50%;
+          flex:none; object-fit:cover;}
+    #bloggerStrip .chip .init{display:inline-flex; align-items:center; justify-content:center;
+          background:var(--blue); color:#fff; font-size:11px;}
+    #bloggerStrip .chip .cn{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+    #bloggerStrip .chip.on{background:#e8f4fd; border-color:#b7dff7; color:#1d6fb8; font-weight:600;}
+
+    /* 主区与筛选 */
+    main{overflow:visible; padding:0 12px 76px; min-height:0;}
+    #filters{flex-wrap:wrap; gap:6px; margin-bottom:6px;}
+    #kw{order:0; flex:1 1 auto; min-width:0;}
+    #total{order:1; margin-left:auto; flex:none; align-self:center;}
+    #filtersCtl{order:2; display:flex; align-items:center; gap:6px; overflow-x:auto; flex:1 1 100%;
+                padding:2px 0 4px; scrollbar-width:none;}
+    #filtersCtl > *{flex:none; white-space:nowrap;}   /* 不被压缩换行，横滑查看全部 */
+    #filtersCtl::-webkit-scrollbar{display:none;}
+    #pager{order:3; flex:1 1 100%; display:flex; align-items:center; justify-content:center;
+           gap:6px; flex-wrap:wrap; margin:0 0 4px; color:var(--sub); font-size:13px;}
+    #pager button{min-height:34px; flex:none;}
+    #pager input{width:60px; padding:4px 6px; text-align:center; font-size:16px;}
+    #pager:empty{display:none;}            /* 只有一页时不占行 */
+    #pagerBottom{display:none;}            /* 移动端翻页放顶部，底部不再显示 */
+
+    /* 批量操作 → 底部操作条 */
+    #batchBar{position:fixed; left:0; right:0; bottom:0; z-index:66; margin:0;
+          padding:8px 10px calc(8px + env(safe-area-inset-bottom));
+          background:var(--card); border-top:1px solid var(--line);
+          flex-wrap:nowrap; overflow-x:auto; gap:8px; align-items:center;
+          box-shadow:0 -6px 20px rgba(0,0,0,.08); scrollbar-width:none;}
+    #batchBar.show{display:flex;}
+    #batchBar::-webkit-scrollbar{display:none;}
+    #batchBar .mini{min-height:34px; flex:none; font-size:13px; white-space:nowrap;}
+    #batchBar #selCount{flex:none; white-space:nowrap;}
+
+    /* 卡片单列、高度自然 */
+    #grid{grid-template-columns:1fr; grid-auto-rows:auto; overflow:visible; gap:10px;}
+    .post{min-height:0; border-radius:12px; padding:10px 12px 8px;
+          box-shadow:0 1px 3px rgba(15,23,42,.05);}
+    .p-text{min-height:0; font-size:14px; position:relative;}
+    /* 长文默认收起（截断至约 8 行）+ 底部渐隐 + 可展开全文 */
+    .p-text.tx-cap{overflow:hidden;}
+    .p-text .tx-fade{display:none; position:absolute; left:0; right:0; bottom:0; height:36px;
+           background:linear-gradient(rgba(255,255,255,0), var(--card) 82%); pointer-events:none;}
+    .p-text.tx-cap .tx-fade{display:block;}
+    .tx-btn{flex:none; font-size:12px; color:var(--blue); background:none; border:none;
+            padding:0 4px; cursor:pointer; line-height:1.8;}
+    .tx-btn:hover{color:#0b7ad1;}
+    .p-counts{margin-top:10px; padding-top:8px;}
+    .p-imgs{height:auto; grid-auto-rows:minmax(0,1fr);}
+    .p-imgs.n1{height:auto; min-height:0; max-height:none; padding:0 0 2px;}
+    .p-imgs.n1 img{max-height:58vh;}
+    .p-imgs.n2{height:auto;}
+    .post.mg-sm .p-imgs.n1{height:auto;}
+    .p-imgs img{min-height:0;}
+    #empty{min-height:42vh; padding:0 20px;}
+    #empty .big{font-size:16px;}
+
+    /* 弹窗 / 登录 / 设置 */
+    #authBox{width:min(92vw,352px); padding:24px 20px 18px;}
+    #refullBox{padding:18px 16px;}
+    #settingsBox,#tplBox{padding:16px 14px;}
+    #modalBox{padding:16px 14px;}
+    .s-sec .row input{flex:1 1 100%; min-width:0;}
+    #yuqueEdit input{flex:1 1 100%; min-width:0;}
+    #refullTitle,#schedTitle{font-size:15px;}
+
+    /* 管理后台 */
+    #adminView{padding:12px 0;}
+    #adminPage{width:100%; padding:16px 14px; border-radius:0;}
+    #statsRow{gap:8px;}
+    .stat-card{min-width:calc(50% - 8px); flex:none; padding:12px 8px;}
+    .stat-card .num{font-size:19px;}
+    #userTable{display:block; overflow-x:auto; white-space:nowrap;}
+    #adminPage h2{font-size:16px;}
+
+    /* 灯箱 / 提示 */
+    #lbCtrl button{width:44px; height:44px; font-size:20px;}
+    #lbInfo{font-size:12px;}
+  }
 </style>
 </head>
 <body>
@@ -390,6 +524,7 @@
 
 <div id="appView" style="display:contents">
 <header>
+  <button id="navBtn" type="button" title="我的博主：选择、拉取与管理">博主</button>
   <h1>微博存档</h1>
   <a id="wbLink" href="https://weibo.com" target="_blank" rel="noopener" title="打开微博官网">微博<span class="ic">↗</span></a>
   <div id="taskHints"></div>
@@ -408,6 +543,8 @@
     <button class="mini primary" id="bannerGoSet" style="flex:none">去粘贴微博 Cookie</button>
   </div>
 </div>
+
+<div id="scrim"></div>
 
 <div id="layout">
   <aside>
@@ -438,6 +575,7 @@
   </aside>
 
   <main>
+    <div id="bloggerStrip"></div>
     <div id="yuqueEdit">
       <span class="lbl" id="yuqueEditLabel"></span>
       <input type="text" id="yuqueEditInput" placeholder="https://www.yuque.com/账号/知识库/目录">
@@ -448,6 +586,7 @@
     </div>
     <div id="filters">
       <input type="text" id="kw" placeholder="搜索关键词，或粘贴微博ID/链接直达" autocomplete="off" spellcheck="false">
+      <div id="filtersCtl">
       <select id="yearSel"><option value="">全部年份</option></select>
       <select id="presetSel">
         <option value="">快捷时间</option>
@@ -472,6 +611,7 @@
         <option value="skip">无需归档</option>
       </select>
       <button id="clearF" class="mini">清空筛选</button>
+      </div>
       <div id="pager"></div>
       <span id="total"></span>
     </div>
@@ -489,6 +629,7 @@
       <button id="selClear" class="mini">清空选择</button>
     </div>
     <div id="grid"></div>
+    <div id="pagerBottom"></div>
     <div id="empty">
       <div class="big">还没有微博</div>
     </div>
@@ -919,11 +1060,57 @@ $('bloggerList').addEventListener('click', function(e){
     return;
   }
   var item = e.target.closest('[data-uid]');
-  if(item){
-    clearSelection();                 // 切换博主：之前勾选的清空，避免“已选 N 条”残留
-    selUid = item.dataset.uid;
-    loadState(); loadPosts();
+  if(item) pickUid(item.dataset.uid);
+});
+/* ── 博主选择（抽屉列表 + 移动端胶囊条共用）── */
+function pickUid(uid){
+  clearSelection();                   // 切换博主：之前勾选的清空，避免“已选 N 条”残留
+  selUid = uid || '';
+  loadState(); loadPosts();
+  setChipSel();
+  closeNav();
+}
+function closeNav(){ document.body.classList.remove('nav-open'); }
+function setChipSel(){
+  var strip = $('bloggerStrip');
+  if(!strip) return;
+  var cs = strip.querySelectorAll('.chip');
+  for(var i=0;i<cs.length;i++)
+    cs[i].classList.toggle('on', (cs[i].dataset.uid || '') === (selUid || ''));
+}
+function renderChips(list){
+  var strip = $('bloggerStrip');
+  if(!strip) return;
+  if(!list || !list.length){
+    strip.dataset.sig = '';
+    strip.innerHTML = '<button class="chip on" data-uid="" type="button"><span class="cn">全部微博</span></button>';
+    return;
   }
+  var sig = '';
+  for(var i=0;i<list.length;i++) sig += list[i].uid + '|';
+  if(sig !== strip.dataset.sig){                      // 博主增删/顺序变化才重建
+    var h = '<button class="chip'+(selUid===''?' on':'')+'" data-uid="" type="button">'
+      + '<span class="init">📋</span><span class="cn">全部微博</span></button>';
+    for(var j=0;j<list.length;j++){
+      var b = list[j];
+      var face = b.avatar
+        ? '<img src="'+esc(imgProxy(thumbUrl(b.avatar)))+'" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
+        : '<span class="init">'+esc((b.nickname || '?').slice(0,1))+'</span>';
+      h += '<button class="chip'+(selUid===b.uid?' on':'')+'" data-uid="'+esc(b.uid)+'" type="button">'
+        + face + '<span class="cn">'+esc(b.nickname)+'</span></button>';
+    }
+    strip.innerHTML = h;
+    strip.dataset.sig = sig;
+  }
+}
+$('bloggerStrip').addEventListener('click', function(e){
+  var chip = e.target.closest('.chip');
+  if(chip && chip.dataset.uid !== undefined) pickUid(chip.dataset.uid);
+});
+$('navBtn').onclick = function(){ document.body.classList.toggle('nav-open'); };
+$('scrim').onclick = closeNav;
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Escape') closeNav();
 });
 /* ── 语雀目录编辑（主区全宽，链接完整可看）── */
 var YUQUE_URL_RX = /^https:\/\/www\.yuque\.com\/[^\s/?#]+\/[^\s/?#]+(?:\/[^\s/?#]+)*\/?$/;
@@ -1317,6 +1504,7 @@ function loadState(){
     renderCookie(st.cookie_status);
     if(st.schedule) schedCfg = st.schedule;
     renderBloggers(st.bloggers);
+    renderChips(st.bloggers);
     for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒（一键批量时不逐条打扰）
       var b = st.bloggers[i];
       var old = prevState[b.uid];
@@ -1414,6 +1602,54 @@ function buildYears(years){
   sel.value = cur;
   sel.dataset.key = key;
 }
+/* ── 手机端长文收放：超过约 5 行的正文默认截断，可点「展开全文」── */
+function setupPostText(){
+  if(innerWidth > 900) return;
+  var ps = document.querySelectorAll('#grid .post .p-text');
+  for(var i=0;i<ps.length;i++){
+    var t = ps[i];
+    if(t.dataset.tx) continue;
+    t.dataset.tx = '1';
+    var cs = getComputedStyle(t);
+    var fs = parseFloat(cs.fontSize) || 14;
+    var lh = parseFloat(cs.lineHeight) || Math.round(fs * 1.6);
+    var cap = Math.round(lh * 8);                 // 收起高度 ≈ 8 行
+    var full = t.getBoundingClientRect().height;
+    if(full <= cap + 4) continue;                 // 正文不长，不用收
+    t._cap = cap;
+    t.classList.add('tx-cap');
+    t.style.maxHeight = cap + 'px';
+    t.style.overflow = 'hidden';
+    var fade = document.createElement('div'); fade.className = 'tx-fade';
+    t.appendChild(fade);
+    var post = t.closest('.post');
+    var counts = post && post.querySelector('.p-counts');
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'tx-btn'; b.textContent = '展开全文';
+    b.onclick = function(){ togglePostText(this); };
+    t._btn = b;
+    if(counts) counts.insertBefore(b, counts.firstChild);
+    t.onclick = function(ev){                  // 点正文也可展开
+      if(ev.target.closest('a')) return;
+      if(this.classList.contains('tx-cap') && this._btn) togglePostText(this._btn);
+    };
+  }
+}
+function togglePostText(btn){
+  var t = btn.closest('.post').querySelector('.p-text');
+  var open = t.classList.toggle('tx-open');
+  if(open){
+    t.classList.remove('tx-cap');
+    t.style.maxHeight = 'none';
+    t.style.overflow = 'visible';
+    btn.textContent = '收起';
+  } else {
+    t.classList.add('tx-cap');
+    t.style.maxHeight = t._cap + 'px';
+    t.style.overflow = 'hidden';
+    btn.textContent = '展开全文';
+  }
+}
 function renderPosts(r){
   if(!r || !r.items) return;
   buildYears(r.years);
@@ -1422,7 +1658,9 @@ function renderPosts(r){
   if(!r.items.length){
     grid.innerHTML = '';
     empty.innerHTML = (document.querySelectorAll('.b-item').length === 0)
-      ? '<div class="big">还没有添加博主</div>在左侧粘贴博主主页链接，添加后自动开始拉取全部历史微博'
+      ? (innerWidth <= 900
+          ? '<div class="big">还没有添加博主</div>点左上角「博主」，粘贴主页链接添加后会开始拉取历史微博'
+          : '<div class="big">还没有添加博主</div>在左侧粘贴博主主页链接，添加后自动开始拉取全部历史微博')
       : (looksLikeWeiboId($('kw').value)
           ? '<div class="big">库里没有这条微博</div>检查ID是否完整，或直接粘贴微博链接再试'
           : '<div class="big">没有符合条件的微博</div>换个关键词或放宽日期范围试试');
@@ -1482,6 +1720,7 @@ function renderPosts(r){
       + '</div>';
   }
   grid.innerHTML = html;
+  setupPostText();
   renderPager(r.page, r.pages);
   syncSelection();
 }
@@ -1489,33 +1728,47 @@ function renderPosts(r){
 /* ── 翻页条（事件委托，杜绝内联绑定失效）── */
 function renderPager(page, pages){
   curPages = pages;
-  var pg = $('pager');
-  if(pages <= 1){ pg.innerHTML = ''; return; }
-  pg.innerHTML =
-      '<button class="mini" data-pg="first">首页</button>'
-    + '<button class="mini" data-pg="prev">上一页</button>'
-    + '<span id="pgInfo">第 ' + page + ' / ' + pages + ' 页</span>'
-    + '<input id="pgJump" type="number" min="1" max="'+pages+'" value="'+page+'">'
-    + '<button class="mini" data-pg="go">跳转</button>'
-    + '<button class="mini" data-pg="next">下一页</button>'
-    + '<button class="mini" data-pg="last">末页</button>';
-}
-$('filters').addEventListener('click', function(e){
-  var btn = e.target.closest('[data-pg]');
-  if(!btn) return;
-  var act = btn.dataset.pg, n;
-  if(act === 'first') n = 1;
-  else if(act === 'prev') n = curPage - 1;
-  else if(act === 'next') n = curPage + 1;
-  else if(act === 'last') n = curPages;
-  else if(act === 'go') n = parseInt($('pgJump').value, 10);
-  gotoPage(n);
-});
-$('filters').addEventListener('keydown', function(e){
-  if(e.target && e.target.id === 'pgJump' && e.key === 'Enter'){
-    gotoPage(parseInt($('pgJump').value, 10));
+  var html = '';
+  if(pages > 1){
+    if(innerWidth <= 900){                 // 手机：一行内放「上一页/页码跳转/下一页」
+      html = '<button class="mini" data-pg="prev">‹ 上一页</button>'
+        + '<span>第 ' + page + ' / ' + pages + ' 页</span>'
+        + '<input type="number" min="1" max="'+pages+'" value="'+page+'">'
+        + '<button class="mini" data-pg="go">跳转</button>'
+        + '<button class="mini" data-pg="next">下一页 ›</button>';
+    } else {                              // 桌面：首页/末页都放出来
+      html = '<button class="mini" data-pg="first">首页</button>'
+        + '<button class="mini" data-pg="prev">上一页</button>'
+        + '<span>第 ' + page + ' / ' + pages + ' 页</span>'
+        + '<input type="number" min="1" max="'+pages+'" value="'+page+'">'
+        + '<button class="mini" data-pg="go">跳转</button>'
+        + '<button class="mini" data-pg="next">下一页</button>'
+        + '<button class="mini" data-pg="last">末页</button>';
+    }
   }
-});
+  $('pager').innerHTML = html;
+  $('pagerBottom').innerHTML = html;
+}
+function bindPagerBar(bar){
+  bar.addEventListener('click', function(e){
+    var btn = e.target.closest('[data-pg]');
+    if(!btn) return;
+    var input = bar.querySelector('input[type=number]');
+    var act = btn.dataset.pg, n;
+    if(act === 'first') n = 1;
+    else if(act === 'prev') n = curPage - 1;
+    else if(act === 'next') n = curPage + 1;
+    else if(act === 'last') n = curPages;
+    else if(act === 'go') n = input ? parseInt(input.value, 10) : curPage;
+    gotoPage(n);
+  });
+  bar.addEventListener('keydown', function(e){
+    if(e.target && e.target.type === 'number' && e.key === 'Enter')
+      gotoPage(parseInt(e.target.value, 10));
+  });
+}
+bindPagerBar($('filters'));
+bindPagerBar($('pagerBottom'));
 function gotoPage(n){
   if(!n || isNaN(n)) return;
   n = Math.min(curPages || 1, Math.max(1, n));
