@@ -55,6 +55,27 @@ install.sh 只覆盖 3 个运行文件、**复用服务器已有库**。第 69 �
 「服务器没库 **且** 包里也没库」时触发；已部署的服务器库存在，所以**无需 `ALLOW_FRESH`**。
 （`pack.sh --no-db` 结尾提示加 ALLOW_FRESH 是给全新空库的通用话术，本场景请忽略。）
 
+### 只改单文件时更省（可选轻量路径）
+
+服务器运行时读的是磁盘上的**单文件**（如 `/opt/weibo/weibo_web.html`，服务进程从磁盘读）。
+只改一个运行文件时，可不必打整包、连 `--no-db` 都省：
+
+```bash
+# 本机
+scp weibo_web.html ubuntu@服务器IP:/tmp/
+
+# 服务器
+sudo ls -l /opt/weibo/            # 先确认 weibo_web.html 确实在这层
+sudo install -o weibo -g weibo -m 0644 /tmp/weibo_web.html /opt/weibo/weibo_web.html
+sudo systemctl restart weibo
+# 验证：新版页面里应有移动端标记（旧版没有）
+curl -s http://127.0.0.1:8766/ | grep -c bloggerStrip    # ≥1 = 已生效
+```
+
+其余两个运行文件 `weibo_server.py`、`yuque-sync-template.md` 同理可按完整路径替换。该轻量路径
+同样只动运行文件、**不碰库**，但只适合替换某个已知单文件；它仍要守铁律——只传工作区里那一个
+文件即可，**不要 git clone / 同步整个仓库**（仓库无 db，拉了 = 空库）。
+
 更新后核对：
 
 ```bash
