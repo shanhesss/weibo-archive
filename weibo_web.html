@@ -351,12 +351,26 @@
   .admin-invite .lbl{font-size:13px; color:var(--sub);}
   #adminInviteCode{font-weight:700; letter-spacing:1px; font-size:14px;}
   .admin-invite .hint{font-size:12px; color:var(--sub); margin-left:4px;}
-  .admin-ai{display:flex; align-items:center; gap:8px; margin-bottom:18px; flex-wrap:wrap;
-            padding:10px 14px; background:var(--bg); border-radius:8px;}
+  .admin-ai{margin-bottom:18px; padding:10px 14px; background:var(--bg); border-radius:8px;}
   .admin-ai .lbl{font-size:13px; color:var(--sub); font-weight:600;}
-  .admin-ai input{font-size:13px; padding:5px 8px; border:1px solid var(--line);
-            border-radius:6px; background:#fff; width:200px;}
-  .admin-ai .hint{font-size:12px; color:var(--sub); margin-left:4px;}
+  .admin-ai .hint{font-size:12px; color:var(--sub);}
+  .admin-ai .ai-head{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+  .admin-ai .ai-head .hint{flex:1; min-width:120px;}
+  .ai-row{display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:7px 0 5px;
+          border-top:1px dashed var(--line); font-size:13px;}
+  .ai-row.off{opacity:.45;}
+  .ai-row .tag{font-size:11px; color:var(--blue); border:1px solid var(--blue);
+               border-radius:4px; padding:0 5px; flex:none;}
+  .ai-row .tag.off{color:var(--grey); border-color:var(--grey);}
+  .ai-row .nm{font-weight:600; flex:none;}
+  .ai-row .url{color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+               max-width:280px; min-width:0;}
+  .ai-row .cnt{font-size:12px; color:var(--grey); flex:none;}
+  .ai-row .acts{margin-left:auto; display:flex; gap:4px; flex-wrap:wrap;}
+  .ai-form{display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;}
+  .ai-form input[type=text],.ai-form input[type=password]{font-size:13px; padding:5px 8px;
+            border:1px solid var(--line); border-radius:6px; background:#fff; width:180px;}
+  .ai-form .cleark{font-size:12px; color:var(--sub); display:flex; align-items:center; gap:3px;}
   .admin-filters{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; align-items:center;}
   .admin-filters input,.admin-filters select{font-size:13px; padding:5px 8px; border:1px solid var(--line);
               border-radius:6px; background:#fff;}
@@ -818,13 +832,21 @@
     <span class="hint">注册新账号需要；重置后旧码立即失效，已注册用户不受影响</span>
   </div>
   <div class="admin-ai">
-    <span class="lbl">AI 归档服务</span>
-    <input type="text" id="aiBase" placeholder="服务地址">
-    <input type="password" id="aiKey" placeholder="密钥" autocomplete="off">
-    <input type="text" id="aiModel" placeholder="模型名">
-    <button id="aiSave" class="mini primary">保存</button>
-    <button id="aiClearKey" class="mini danger" style="display:none">清除密钥</button>
-    <span class="hint" id="aiHint"></span>
+    <div class="ai-head">
+      <span class="lbl">AI 归档服务</span>
+      <span class="hint" id="aiHint"></span>
+      <button id="aiAdd" class="mini primary">添加服务</button>
+    </div>
+    <div id="aiList"></div>
+    <div class="ai-form" id="aiForm" style="display:none">
+      <input type="text" id="aiName" placeholder="备注名（可选）">
+      <input type="text" id="aiBase" placeholder="服务地址">
+      <input type="password" id="aiKey" placeholder="密钥" autocomplete="off">
+      <input type="text" id="aiModel" placeholder="模型名">
+      <button id="aiSave" class="mini primary">保存</button>
+      <button id="aiCancel" class="mini">取消</button>
+      <label class="cleark" id="aiClearWrap" style="display:none"><input type="checkbox" id="aiClearKey">清除密钥</label>
+    </div>
   </div>
   <div class="admin-filters">
     <input type="text" id="adminKw" placeholder="搜索用户名">
@@ -2474,40 +2496,96 @@ $('inviteReset').onclick = function(){
   ]);
 };
 
-/* ── AI 归档服务配置（管理后台） ─────────────── */
+/* ── AI 归档服务配置池（管理后台，主用在前、自动降级） ─────── */
+var aiCfgs = [];          // 后台读来的配置（密钥只有掩码，永不回显原文）
+var aiEdit = -1;          // -1 无编辑态；-2 新增中；>=0 正在编辑第几项
+
 function loadAiConfig(){
   fetchJson('/api/admin/ai_config').then(function(r){
     if(!r.ok) return;
-    $('aiBase').value = r.base_url || '';
-    $('aiModel').value = r.model || '';
-    $('aiKey').value = '';
-    $('aiKey').placeholder = r.key_set ? ('已设置 ' + r.key_masked + '，留空则不修改') : '未设置，粘贴密钥';
-    $('aiClearKey').style.display = r.key_set ? '' : 'none';
-    $('aiHint').textContent = (r.base_url && r.key_set && r.model)
-      ? '已配置，用户点「同步」即可归档' : '未配置完整，语雀归档暂不可用';
+    aiCfgs = r.configs || [];
+    aiEdit = -1;
+    renderAiConfig();
   });
 }
+
+function renderAiConfig(){
+  var list = $('aiList');
+  list.innerHTML = '';
+  aiCfgs.forEach(function(c, i){
+    var row = document.createElement('div');
+    row.className = 'ai-row' + (c.enabled ? '' : ' off');
+    function add(cls, txt){ var s = document.createElement('span'); s.className = cls; s.textContent = txt; row.appendChild(s); return s; }
+    function btn(txt, fn, dis){ var b = document.createElement('button'); b.className = 'mini';
+      b.textContent = txt; b.onclick = fn; if(dis) b.disabled = true; row.querySelector('.acts').appendChild(b); return b; }
+    var acts = document.createElement('div'); acts.className = 'acts';
+    row.appendChild(add('nm', c.name || ('服务' + (i + 1))));
+    if(i === 0) add('tag', '主用');
+    if(!c.enabled) add('tag off', '已停用');
+    add('url', (c.base_url || '未填地址') + '　' + (c.model || '') + (c.key_set ? ('　' + c.key_masked) : '　未填密钥'));
+    add('cnt', '成功 ' + (c.ok_count || 0) + ' 次');
+    row.appendChild(acts);
+    btn('↑', function(){ aiAction('move', i, 'up'); }, i === 0);
+    btn('↓', function(){ aiAction('move', i, 'down'); }, i === aiCfgs.length - 1);
+    btn('编辑', function(){ aiAction('edit', i); });
+    btn(c.enabled ? '停用' : '启用', function(){ aiAction('toggle', i); });
+    btn('删除', function(){ aiAction('delete', i); });
+    list.appendChild(row);
+  });
+  var ok = aiCfgs.filter(function(c){ return c.enabled && c.base_url && c.key_set && c.model; }).length;
+  $('aiHint').textContent = ok ? ('已启用 ' + ok + ' 家，按顺序试，失败自动换下一家')
+                               : '还没配好，语雀归档暂不可用';
+  if(aiEdit === -1){ $('aiForm').style.display = 'none'; }
+}
+
+function aiAction(act, i, dir){
+  if(act === 'edit'){ aiEdit = i; showAiForm(aiCfgs[i]); return; }
+  if(act === 'delete'){
+    var c = aiCfgs[i];
+    showModal('删除「' + (c.name || ('服务' + (i + 1))) + '」这条归档服务配置？\n\n删除后用户若正在用它归档不受影响，但不再生效。', [
+      {text:'删除', cls:'danger', fn: function(){
+        post('/api/admin/ai_config', {action:'delete', index:i}).then(aiDone);
+      }},
+      {text:'取消', cls:'', fn: null}
+    ]);
+    return;
+  }
+  var body = {action: act, index: i};
+  if(dir) body.dir = dir;
+  post('/api/admin/ai_config', body).then(aiDone);
+}
+
+function aiDone(r){
+  if(!r.ok){ toast(r.error || '操作失败'); loadAiConfig(); return; }   // 条目可能已被改动，重拉对齐
+  loadAiConfig();
+}
+
+function showAiForm(c){
+  $('aiForm').style.display = '';
+  $('aiName').value  = c ? (c.name || '') : '';
+  $('aiBase').value  = c ? (c.base_url || '') : '';
+  $('aiModel').value = c ? (c.model || '') : '';
+  $('aiKey').value = '';
+  $('aiKey').placeholder = (c && c.key_set) ? ('已设置 ' + c.key_masked + '，留空则不修改') : '密钥';
+  $('aiClearWrap').style.display = (c && c.key_set) ? '' : 'none';
+  $('aiClearKey').checked = false;
+}
+$('aiAdd').onclick = function(){ aiEdit = -2; showAiForm(null); };
+$('aiCancel').onclick = function(){ aiEdit = -1; renderAiConfig(); };
 $('aiSave').onclick = function(){
-  var body = {base_url: $('aiBase').value.trim(), model: $('aiModel').value.trim()};
+  var body = {action: aiEdit < 0 ? 'add' : 'update',
+              name: $('aiName').value.trim(),
+              base_url: $('aiBase').value.trim(),
+              model: $('aiModel').value.trim()};
+  if(aiEdit >= 0) body.index = aiEdit;
   var k = $('aiKey').value.trim();
   if(k) body.key = k;
+  if(aiEdit >= 0 && $('aiClearKey').checked) body.clear_key = 1;
   post('/api/admin/ai_config', body).then(function(r){
     if(!r.ok){ toast(r.error || '保存失败'); return; }
     toast(r.configured ? '已保存，AI 归档可用' : (r.note || '已保存'));
     loadAiConfig();
   });
-};
-$('aiClearKey').onclick = function(){
-  showModal('清除 AI 服务密钥？\n\n清除后语雀归档将不可用，直到重新配置。', [
-    {text:'清除', cls:'danger', fn: function(){
-      post('/api/admin/ai_config', {clear_key: 1}).then(function(r){
-        if(!r.ok){ toast(r.error || '清除失败'); return; }
-        toast('密钥已清除');
-        loadAiConfig();
-      });
-    }},
-    {text:'取消', cls:'', fn: null}
-  ]);
 };
 
 /* ── 启动 ────────────────────────────────── */

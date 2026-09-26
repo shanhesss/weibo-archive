@@ -1100,21 +1100,69 @@ def validate_yuque_dir(url):
     return m.group(1), m.group(2), m.group(3).strip('/')
 
 
-def ai_cfg():
-    """AI 归档服务全局配置（管理员在后台设置填写，落 kv 表）；
-    三项齐了才可用，返回 (地址, key, 模型名)，否则 None"""
-    base = (kv_get('ai_base_url') or '').strip().rstrip('/')
-    key = (kv_get('ai_key') or '').strip()
-    model = (kv_get('ai_model') or '').strip()
-    if base and key and model:
-        return base, key, model
-    return None
+def ai_pool():
+    """AI 归档服务配置池（kv 存 JSON 有序列表，ADR-0012）：主用在前、备用在后。
+    每项 {name, base_url, key, model, enabled}；首次读取时从旧全局三键（ADR-0011）一次性迁移"""
+    raw = kv_get('ai_pool')
+    if not raw:
+        base = (kv_get('ai_base_url') or '').strip().rstrip('/')
+        key = (kv_get('ai_key') or '').strip()
+        model = (kv_get('ai_model') or '').strip()
+        if base and key and model:
+            legacy = [{'name': '主用', 'base_url': base, 'key': key, 'model': model, 'enabled': True}]
+            ai_pool_save(legacy)
+            for k in ('ai_base_url', 'ai_key', 'ai_model'):
+                kv_set(k, '')
+            return legacy
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def ai_pool_save(pool):
+    kv_set('ai_pool', json.dumps(pool, ensure_ascii=False))
+
+
+_ai_stats_lock = threading.Lock()
+
+
+def _ai_stat_key(cfg):
+    return '%s|%s|%s' % (cfg.get('name') or '', cfg.get('base_url') or '', cfg.get('model') or '')
+
+
+def ai_stats():
+    """各中转的生成成功次数（kv `ai_stats`，按 备注名|地址|模型 归并；改这三项等于换身份重新计数）"""
+    try:
+        return json.loads(kv_get('ai_stats') or '{}')
+    except Exception:
+        return {}
+
+
+def _ai_count_ok(cfg):
+    with _ai_stats_lock:
+        st = ai_stats()
+        k = _ai_stat_key(cfg)
+        st[k] = st.get(k, 0) + 1
+        kv_set('ai_stats', json.dumps(st))
+
+
+def ai_cfgs():
+    """按序返回「可用」配置（已启用且地址/密钥/模型齐全）；空列表 = AI 归档未开通"""
+    out = []
+    for c in ai_pool():
+        if (c.get('enabled', True) and (c.get('base_url') or '').strip()
+                and (c.get('key') or '').strip() and (c.get('model') or '').strip()):
+            out.append(c)
+    return out
 
 
 def _ai_complete(prompt, cfg):
-    """直调中转的 Anthropic 兼容接口做单发内容生成，返回模型输出文本"""
-    base, key, model = cfg
-    body = json.dumps({'model': model, 'max_tokens': 4000,
+    """直调一家中转的 Anthropic 兼容接口做单发内容生成，返回模型输出文本"""
+    base = cfg['base_url'].strip().rstrip('/')
+    key = cfg['key'].strip()
+    body = json.dumps({'model': cfg['model'].strip(), 'max_tokens': 4000,
                        'messages': [{'role': 'user', 'content': prompt}]}).encode('utf-8')
     req = urllib.request.Request(base + '/v1/messages', data=body, method='POST',
                                  headers={'content-type': 'application/json',
@@ -1133,12 +1181,40 @@ def _ai_complete(prompt, cfg):
         raise ApiError('AI 服务请求失败（%d）%s' % (e.code, ('：' + detail) if detail else ''))
     except (urllib.error.URLError, OSError) as e:
         raise ApiError('连接 AI 服务失败：%s' % e)
+    except Exception as e:  # noqa: BLE001 返回不是 JSON（网关吐了页面/空体）
+        raise ApiError('AI 服务返回了看不懂的响应：%s' % str(e)[:80])
+    if not isinstance(data, dict):
+        raise ApiError('AI 服务返回格式异常：%s' % str(data)[:120])
+    if data.get('error'):                      # 有些中转把错误装进 200 响应体里
+        raise ApiError('AI 服务返回错误：%s'
+                       % json.dumps(data['error'], ensure_ascii=False)[:150])
     parts = [b.get('text') or '' for b in (data.get('content') or [])
-             if b.get('type') == 'text']
+             if isinstance(b, dict) and b.get('type') == 'text']
     text = '\n'.join(parts).strip()
+    if not text:                               # 容错：部分中转按 OpenAI 形状回
+        ch = data.get('choices') or []
+        if ch and isinstance(ch[0], dict):
+            text = ((ch[0].get('message') or {}).get('content') or '').strip()
     if not text:
-        raise ApiError('AI 返回了空内容')
+        raise ApiError('AI 返回了空内容（stop_reason=%s，响应摘要：%s）'
+                       % (data.get('stop_reason') or '?',
+                          json.dumps(data, ensure_ascii=False)[:160]))
     return text
+
+
+def _ai_generate(prompt, cfgs):
+    """主→备整链试一遍：任何一家没成功就换下一家（不区分失败原因、不做熔断，ADR-0012）。
+    某家成功后累加其成功次数（落 kv ai_stats，按 name|base_url|model 归并）"""
+    errs = []
+    for c in cfgs:
+        try:
+            out = _parse_doc_md(_ai_complete(prompt, c))
+        except ApiError as e:
+            errs.append('%s：%s' % (c.get('name') or '备用', str(e)[:60]))
+            continue
+        _ai_count_ok(c)
+        return out
+    raise ApiError('AI 归档服务全部没成功（%s）' % '；'.join(errs))
 
 
 def _parse_doc_md(out):
@@ -1173,7 +1249,7 @@ def _build_archive_prompt(row, template):
            row['reposts'], row['comments'], row['atts'], nimgs, row['text']))
 
 
-def run_archive(user_id, ids, token, cfg):
+def run_archive(user_id, ids, token, cfgs):
     """批量归档：读模板 → 并发「AI 生成文档内容 + 语雀 OpenAPI 写入」（默认 2 路）→ 写回归档状态"""
     prog = sync_prog(user_id)
     try:
@@ -1200,9 +1276,9 @@ def run_archive(user_id, ids, token, cfg):
             ns = '%s/%s' % (acc, book)
             prompt = _build_archive_prompt(row, template)
             last_err = None
-            for _ in range(2):               # 单发调用：异常或格式漂移重试一次
+            for _ in range(2):               # 主→备整链试一遍，全败再走一轮（防格式漂移）
                 try:
-                    title, body_md = _parse_doc_md(_ai_complete(prompt, cfg))
+                    title, body_md = _ai_generate(prompt, cfgs)
                     break
                 except ApiError as e:
                     last_err = e
@@ -1298,8 +1374,8 @@ def archive_worker():
         user_id, ids = item
         token = ukv_get(user_id, 'yuque_token')
         prog = sync_prog(user_id)
-        cfg = ai_cfg()
-        if not cfg:
+        cfgs = ai_cfgs()
+        if not cfgs:
             prog['msg'] = 'AI 归档功能还没开通，请联系管理员在管理后台设置里配置'
             prog['done'] = prog['total']
             clear_arch_state(user_id)
@@ -1311,7 +1387,7 @@ def archive_worker():
             clear_arch_state(user_id)
             continue
         try:
-            run_archive(user_id, ids, token, cfg)
+            run_archive(user_id, ids, token, cfgs)
         except Exception as e:  # noqa: BLE001 —— 兜底，不能卡死归档通道
             prog['msg'] = '同步出错：%s' % e
             prog['done'] = prog['total']
@@ -1697,7 +1773,7 @@ def api_yuque_sync(user, body):
         return {'ok': False, 'error': '博主「%s」还没配置语雀同步目录，请先在左侧博主行设置' % '、'.join(sorted(no_dir))}
     if not wanted:
         return {'ok': False, 'error': '勾选的微博都是转发微博或无需归档，不支持同步'}
-    if not ai_cfg():
+    if not ai_cfgs():
         return {'ok': False, 'error': 'AI 归档功能还没开通，请联系管理员在管理后台设置里配置'}
     if not ukv_get(user_id, 'yuque_token'):
         return {'ok': False, 'error': '还没有填写语雀令牌，请先在个人设置中粘贴'}
@@ -2225,27 +2301,76 @@ def api_admin_invite(user, body=None):
 
 
 def api_admin_ai_config(user, body=None):
-    """AI 归档服务配置（全局一份，落 kv 表）：读取永不回显 key 原文，只回掩码"""
-    key = kv_get('ai_key') or ''
-    return {'ok': True, 'base_url': kv_get('ai_base_url') or '',
-            'model': kv_get('ai_model') or '',
-            'key_set': bool(key), 'key_masked': _mask_token(key)}
+    """AI 归档服务配置池（主用在前、备用在后，ADR-0012）：读取永不回显 key 原文，只回掩码"""
+    pool = ai_pool()
+    stats = ai_stats()
+    return {'ok': True, 'configs': [
+        {'name': c.get('name', ''), 'base_url': c.get('base_url', ''),
+         'model': c.get('model', ''), 'enabled': bool(c.get('enabled', True)),
+         'key_set': bool(c.get('key')), 'key_masked': _mask_token(c.get('key') or ''),
+         'ok_count': stats.get(_ai_stat_key(c), 0)}
+        for c in pool]}
 
 
 def api_admin_ai_config_save(user, body):
-    """保存配置：地址/模型名覆盖式更新；key 留空 = 保持原值，clear_key=1 才清除"""
-    if body.get('base_url') is not None:
-        kv_set('ai_base_url', str(body['base_url']).strip())
-    if body.get('model') is not None:
-        kv_set('ai_model', str(body['model']).strip())
-    if body.get('clear_key'):
-        kv_set('ai_key', '')
-    elif str(body.get('key') or '').strip():
-        kv_set('ai_key', str(body['key']).strip())
-    if not ai_cfg():
-        return {'ok': True, 'configured': False,
-                'note': '还差必填项，AI 归档暂不可用'}
-    return {'ok': True, 'configured': True}
+    """配置池管理：action = add / update / delete / toggle（停用）/ move（上移下移）。
+    编辑时 key 留空=保持原值，clear_key=1 才清除；每次改动即时生效"""
+    pool = ai_pool()
+    action = (body.get('action') or '').strip()
+
+    def clean(s):
+        return str(s if s is not None else '').strip()
+
+    def idx():
+        try:
+            return int(body.get('index', -1))
+        except (TypeError, ValueError):
+            return -1
+
+    if action == 'add':
+        base_url = clean(body.get('base_url')).rstrip('/')
+        key = clean(body.get('key'))
+        model = clean(body.get('model'))
+        if not (base_url and key and model):
+            return {'ok': False, 'error': '地址、密钥、模型名三项都要填'}
+        pool.append({'name': clean(body.get('name')) or '备用',
+                     'base_url': base_url, 'key': key, 'model': model, 'enabled': True})
+    elif action == 'update':
+        i = idx()
+        if not (0 <= i < len(pool)):
+            return {'ok': False, 'error': '这条配置已不存在，请刷新后重试'}
+        c = pool[i]
+        if body.get('base_url') is not None:
+            c['base_url'] = clean(body['base_url']).rstrip('/')
+        if body.get('model') is not None:
+            c['model'] = clean(body['model'])
+        if body.get('name') is not None:
+            c['name'] = clean(body['name']) or c.get('name') or '备用'
+        if body.get('clear_key'):
+            c['key'] = ''
+        elif clean(body.get('key')):
+            c['key'] = clean(body['key'])
+    elif action in ('delete', 'toggle'):
+        i = idx()
+        if not (0 <= i < len(pool)):
+            return {'ok': False, 'error': '这条配置已不存在，请刷新后重试'}
+        if action == 'delete':
+            pool.pop(i)
+        else:
+            pool[i]['enabled'] = not pool[i].get('enabled', True)
+    elif action == 'move':
+        i = idx()
+        j = i + (1 if body.get('dir') == 'down' else -1)
+        if not (0 <= i < len(pool)) or not (0 <= j < len(pool)):
+            return {'ok': False, 'error': '已经到顶/到底了'}
+        pool[i], pool[j] = pool[j], pool[i]
+    else:
+        return {'ok': False, 'error': '未知操作'}
+    ai_pool_save(pool)
+    avail = bool(ai_cfgs())
+    out = {'ok': True, 'configured': avail}
+    out['note'] = '' if avail else '还没填齐一套可用的（地址/密钥/模型名三项齐全且启用），AI 归档暂不可用'
+    return out
 
 
 # -------------------------------------------------------------- HTTP ----

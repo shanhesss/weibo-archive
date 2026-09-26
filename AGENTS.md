@@ -18,7 +18,7 @@
 - 数据全部在 `weibo.db`（SQLite 单文件）；接口原始 JSON 留底（ADR-0003）。
 - 拉取走 m.weibo.cn 非官方接口 + 小号 cookie（ADR-0002）；432 退避、断点续爬、增量 / 全量 / 重拉语义见 ADR-0006 / 0007。
 - 定时拉取 = 一键全部拉取的定时版：配置存 kv 表（开关 + 间隔，30~1440 分钟），调度线程到点入队，重启后超间隔补跑一次。
-- 语雀归档 = 直调 AI 接口 + 语雀 OpenAPI（ADR-0011，取代 ADR-0008 的 claude+MCP 链路）：模板驱动 AI 总结（Anthropic 兼容 `/v1/messages`，TITLE:/BODY: 契约）+ OpenAPI 建档/更新/挂目录/删除，纯 urllib 零外部二进制；AI 中转地址/密钥/模型为全局配置，管理员后台填写落 kv 表（密钥只显掩码，无环境变量兜底）；语雀 token 按用户存 `weibo.db` 的 `user_kv` 表（ADR-0010），不入 git；旧库迁移时一次性从 `~/.claude/settings.json` 导入。
+- 语雀归档 = 直调 AI 接口 + 语雀 OpenAPI（ADR-0011，取代 ADR-0008 的 claude+MCP 链路）：模板驱动 AI 总结（Anthropic 兼容 `/v1/messages`，TITLE:/BODY: 契约）+ OpenAPI 建档/更新/挂目录/删除，纯 urllib 零外部二进制；AI 中转支持多家配置池（ADR-0012）：kv `ai_pool` 有序 JSON（每项 备注名/地址/密钥/模型名/启用），数组序即优先级主→备，每次生成现走一遍链、任一失败即换下一家（不区分原因、无熔断）；管理员后台增删改/停用/排序、行末展示各家累计生成成功次数（kv `ai_stats`）（密钥只显掩码，无环境变量兜底）；语雀 token 按用户存 `weibo.db` 的 `user_kv` 表（ADR-0010），不入 git；旧库迁移时一次性从 `~/.claude/settings.json` 导入。
 - 语雀删除 = OpenAPI 直连（ADR-0009）：删除走 `DELETE /api/v2/repos/:namespace/docs/:id`，token 从该用户的 `user_kv` 读取（ADR-0010）。
 - 新增功能的全部产出（代码 / 文档 / 数据）放 weibo/ 内，后续相关文件也只往里加。
 

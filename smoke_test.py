@@ -232,7 +232,7 @@ check('未配目录报博主', r['ok'] is False and '博主' in r['error'])
 ws.api_blogger_yuque_dir(USER, {'uid': '1234567890', 'dir': 'https://www.yuque.com/aaa/bbb/ddd'})
 r = ws.api_yuque_sync(USER, {'ids': ['a2']})
 check('转发微博不可归档', r['ok'] is False)
-for _k in ('ai_base_url', 'ai_key', 'ai_model'):
+for _k in ('ai_base_url', 'ai_key', 'ai_model', 'ai_pool'):
     ws.kv_set(_k, '')
 r = ws.api_yuque_sync(USER, {'ids': ['a4']})
 check('AI未配置拒绝入队', r['ok'] is False and '还没开通' in r['error'])
@@ -268,16 +268,78 @@ sp['done'] = 0
 sp['msg'] = ''
 ws.db("UPDATE posts SET arch_state='' WHERE user_id=? AND id='a4'", (USER_ID,))
 
-# 22b. AI 归档配置管理 API：掩码读取 / 留空保持 / clear_key 清除
-cfg = ws.api_admin_ai_config(USER)
-check('ai_config 读取掩码不回显 key', cfg['key_set'] and 'sk-abcdefg1234567' not in str(cfg))
-ws.api_admin_ai_config_save(USER, {'base_url': 'https://ai2.example.com/v1/', 'model': 'm2', 'key': ''})
-check('ai_config key 留空保持原值', ws.kv_get('ai_key') == 'sk-abcdefg1234567'
-      and ws.kv_get('ai_base_url') == 'https://ai2.example.com/v1/')
-check('ai_config 保存后仍可用', ws.ai_cfg() is not None)
-ws.api_admin_ai_config_save(USER, {'clear_key': 1})
-check('ai_config clear_key 清除', ws.kv_get('ai_key') == '' and ws.ai_cfg() is None)
-ws.kv_set('ai_key', 'sk-abcdefg1234567')
+# 22b. AI 归档配置池管理 API（ADR-0012）：增/改/删/停用/排序；key 只回掩码永不原文
+r = ws.api_admin_ai_config(USER)
+check('旧三键已自动迁移进池', r['ok'] and len(r['configs']) == 1
+      and r['configs'][0]['base_url'] == 'https://ai.example.com'
+      and r['configs'][0]['key_set'] and ws.kv_get('ai_key') == '')
+check('ai_config 读取不回显 key 原文', 'sk-abcdefg1234567' not in str(r)
+      and r['configs'][0]['key_masked'])
+r = ws.api_admin_ai_config_save(USER, {'action': 'add', 'base_url': 'https://ai2.example.com/v1/',
+                                       'key': 'sk-second0000000', 'model': 'm2'})
+check('add 追加备用并去尾斜杠', r['ok'] and len(ws.api_admin_ai_config(USER)['configs']) == 2
+      and ws.api_admin_ai_config(USER)['configs'][1]['base_url'] == 'https://ai2.example.com/v1')
+r = ws.api_admin_ai_config_save(USER, {'action': 'add', 'base_url': 'https://ai3.example.com'})
+check('add 缺三项拒绝', r['ok'] is False)
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 1, 'model': 'm2b', 'key': ''})
+c1 = ws.api_admin_ai_config(USER)['configs'][1]
+check('update key 留空保持原值', c1['key_set'] and c1['model'] == 'm2b')
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 1, 'clear_key': 1})
+check('update clear_key 清除密钥', ws.api_admin_ai_config(USER)['configs'][1]['key_set'] is False)
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 1, 'key': 'sk-second0000000'})
+ws.api_admin_ai_config_save(USER, {'action': 'toggle', 'index': 1})
+check('停用备用后主用仍可用', ws.api_admin_ai_config(USER)['configs'][1]['enabled'] is False
+      and len(ws.ai_cfgs()) == 1)
+r = ws.api_admin_ai_config_save(USER, {'action': 'toggle', 'index': 0})
+check('全部停用即未开通', ws.ai_cfgs() == [] and r['configured'] is False)
+ws.api_admin_ai_config_save(USER, {'action': 'toggle', 'index': 0})
+ws.api_admin_ai_config_save(USER, {'action': 'toggle', 'index': 1})
+ws.api_admin_ai_config_save(USER, {'action': 'move', 'index': 1, 'dir': 'up'})
+check('move 上移换序（备用变主用）', ws.api_admin_ai_config(USER)['configs'][0]['model'] == 'm2b')
+r = ws.api_admin_ai_config_save(USER, {'action': 'move', 'index': 0, 'dir': 'up'})
+check('顶到头报错', r['ok'] is False)
+ws.api_admin_ai_config_save(USER, {'action': 'move', 'index': 0, 'dir': 'down'})
+check('move 换回原序', ws.api_admin_ai_config(USER)['configs'][0]['model'] == 'test-model')
+r = ws.api_admin_ai_config_save(USER, {'action': 'delete', 'index': 9})
+check('越界操作提示已不存在', r['ok'] is False and '刷新' in r['error'])
+ws.api_admin_ai_config_save(USER, {'action': 'delete', 'index': 1})
+check('delete 移除条目', len(ws.api_admin_ai_config(USER)['configs']) == 1)
+
+# 22d. 主备降级（ADR-0012）：主用任何失败自动试下一家，整链失败才报错
+seen = []
+_real_complete = ws._ai_complete
+def _fake_ok(prompt, c):
+    seen.append(c['name'])
+    return 'TITLE: 格式漂移没有正文' if c['name'] == '主用' else 'TITLE: 标题\nBODY: 正文'
+ws._ai_complete = _fake_ok
+title, body_md = ws._ai_generate('p', [{'name': '主用'}, {'name': '备用'}])
+check('主用失败自动换备用', title == '标题' and body_md == '正文' and seen == ['主用', '备用'])
+def _fake_down(prompt, c):
+    raise ws.ApiError('接口错误（500）')
+ws._ai_complete = _fake_down
+try:
+    ws._ai_generate('p', [{'name': '主用'}, {'name': '备用'}])
+    err = ''
+except ws.ApiError as e:
+    err = str(e)
+check('整链失败报全部没成功并带各家原因', '全部没成功' in err and '主用' in err and '备用' in err)
+# 成功次数：整链成功给成功那家累加（按 备注名|地址|模型 归并），失败不加
+ws._ai_complete = lambda prompt, c: 'TITLE: 标题\nBODY: 正文'
+cfg0 = ws.ai_cfgs()[0]
+n0 = ws.ai_stats().get(ws._ai_stat_key(cfg0), 0)
+ws._ai_generate('p', [cfg0])
+check('成功次数记在对应配置并回显管理接口',
+      ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1
+      and ws.api_admin_ai_config(USER)['configs'][0]['ok_count'] == n0 + 1)
+def _fake_down2(prompt, c):
+    raise ws.ApiError('挂了')
+ws._ai_complete = _fake_down2
+try:
+    ws._ai_generate('p', [cfg0])
+except ws.ApiError:
+    pass
+check('失败不计数', ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1)
+ws._ai_complete = _real_complete
 
 # 23. 失败状态筛选 + 原因返回
 ws.db("UPDATE posts SET arch_fail='目录不存在' WHERE user_id=? AND id='a4'", (USER_ID,))
