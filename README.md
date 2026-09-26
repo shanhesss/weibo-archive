@@ -2,7 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-拉取任意公开微博博主的全部历史微博，本地查询浏览，并可将单条微博 AI 总结后归档到语雀。支持多账号登录，每个账号各自配置微博登录信息、各自管理数据。
+拉取任意公开微博博主的全部历史微博，在线查询浏览，并可将单条微博 AI 总结后归档到语雀。支持多账号登录，每个账号各自配置微博登录信息、各自管理数据。
+
+> **本分支（cloudbase-cloudrun）= 腾讯云托管云托管形态**：常驻在线服务，浏览器直接访问，
+> 数据靠对象存储挂载盘快照持久化（ADR-0011）。与 `main` 分支（本地 exe / 云服务器 nginx 形态）
+> 是两条平行产品线，互不合并；exe 打包等本地线内容请去 main 看。
 
 ## 功能特性
 
@@ -27,9 +31,8 @@
 
 | 场景 | 操作 |
 | --- | --- |
-| 日常使用 | 双击 `weibo_start.vbs`，菜单含 启动 / 关闭 / 重启 |
-| 开发运行 | `python weibo_server.py [端口]`，默认 8766 |
-| 打包版 | `dist/weibo_archive.exe`；改代码后双击 `rebuild.bat` 重新打包 |
+| 日常使用 | 浏览器打开你自己的部署入口 `https://<你的备案域名>/weibo/`（见「部署」节） |
+| 本地开发 | `python weibo_server.py [端口]`，默认 8766，绑 127.0.0.1 |
 | 冒烟测试 | `python smoke_test.py`（用隔离临时数据库，不碰真实数据） |
 
 ## 语雀归档
@@ -54,37 +57,30 @@
 
 ```
 weibo/
-├── weibo_server.py        # 本地服务（纯标准库：http.server + sqlite3，含多用户账号与会话）
+├── weibo_server.py        # 服务本体（纯标准库：http.server + sqlite3，含多用户账号与会话）
 ├── weibo_web.html         # 前端单页
-├── weibo_start.vbs        # 启动 / 关闭 / 重启
-├── weibo_stop.vbs         # 关闭服务
-├── rebuild.bat            # 重新打包
-├── weibo_archive.spec     # PyInstaller 配置（datas 含 weibo_web.html 等运行时资源）
 ├── smoke_test.py          # 冒烟测试
 ├── yuque-sync-template.md # 语雀归档文档模板
-├── deploy/                # 部署到 Linux 云服务器（见下方「部署」）
+├── deploy/                # 云托管部署（pack.sh + cloudbase/，见下方「部署」）
 ├── CONTEXT.md             # 领域术语表
-└── docs/adr/              # 架构决策记录（ADR-0001 ~ 0010）
+└── docs/adr/              # 架构决策记录（ADR-0001 ~ 0012）
 ```
 
-## 部署到云服务器
+## 部署（腾讯云 CloudBase 云托管）
 
-工具可按 ADR-0010 部署到 Linux 云服务器（Ubuntu/Debian）：服务器装成 systemd 服务、只监听
-回环端口，公网经 nginx 反代，数据目录权限收紧。操作入口：**读 `deploy/README.md`**。
+服务常驻在腾讯云 CloudBase 云托管（环境 ID 与规格见 `deploy/cloudbase/README.md`，本文档中
+以 `prod-xxxxxxxxxxxxxxxx` 占位）。可与个人其他服务共用一个备案域名，按路径路由
+`/weibo` → 本服务，入口 `https://<你的备案域名>/weibo/`。运行库在容器本地盘，定期/停止信号时快照到对象
+存储挂载盘 `weibo/weibo.db`（新实例启动自动拉回，决策与实测见 ADR-0011）。
 
-> 注意：`deploy/` 在 git 里**只是说明文档**。服务器上跑的代码和数据一律来自**本机打包上传的
-> `weibo-deploy.tar.gz`**（含 `weibo.db`，而 `weibo.db` 不进 git、仓库里根本没有）——让任何
-> 部署 AI 执行时都**只准用服务器上的包，禁止去 git / GitHub 拉代码**（拉了 = 全新空库 = 丢数据）。
+操作入口：**读 `deploy/cloudbase/README.md`**（首次部署 / 数据播种 / 日常升级 / 验证清单）。
 
-简要流程：本机 `bash deploy/pack.sh` 打包（连带本地 `weibo.db` 一起迁移）→ `scp` 上传到
-服务器的 `/tmp` → `tar xzf` 解包 → `sudo bash weibo-deploy/deploy/install.sh` → 浏览器访问
-`http://<服务器IP>/` 用原 admin 密码登录。注意当前为「裸 IP + HTTP」快跑形态，长期使用应补
-域名 + HTTPS 并收紧来源。
+> 注意：镜像**只装代码，绝不含 `weibo.db`**（数据只走快照通道）；`weibo.db` 也不进 git。
 
 ## 数据与隐私
 
-- 数据全部保存在本地 `weibo.db`（SQLite 单文件），运行时产物不入 git
-- 每个用户的微博 Cookie、语雀令牌按用户存在本地库里，不入 git
+- 数据在 `weibo.db`（SQLite 单文件）：云托管形态下运行库在容器本地盘，每 5 分钟及实例停止时快照到对象存储挂载盘（该快照位文件即线上数据的最近备份，可随时从控制台下载）；运行时产物一律不入 git、不进镜像
+- 每个用户的微博 Cookie、语雀令牌按用户存在库里，不入 git；AI 归档中转密钥只在管理后台留掩码显示
 - 每条微博保留接口原始 JSON，后续补字段无需重爬
 - 拉取走 m.weibo.cn 移动端接口，需要小号 Cookie；触发反爬时工具自动暂停（432 退避）
 - 仅供个人学习与存档用途：请使用自己的微博小号（微博可能风控封号，风险自担），抓取内容勿商用或公开转载，勿批量抓取他人私密信息
@@ -93,7 +89,7 @@ weibo/
 
 - 断点续爬按页码记录，暂停期间博主新发一整页时恢复后可能漏几条，下次增量补回
 - 他人账号无官方接口（官方仅 5 条），走移动端接口，字段变更需跟进维护
-- 语雀归档依赖本机 Claude Code 与 yuque MCP；未配置 / 未连接时页面会提示具体原因
+- 语雀归档依赖管理员在后台配置 AI 中转服务（ADR-0012）；未配置时页面提示「AI 归档功能还没开通」
 - 账号需邀请码注册（由管理员开通），不是开放注册
 
 ## License

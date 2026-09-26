@@ -2,6 +2,12 @@
 
 微博拉取 + 查询 + 语雀归档工具。以下是开发、打包、协作的统一约定。
 
+## 产品线声明（本分支 = cloudbase-cloudrun 云托管线）
+
+- 本分支是 **CloudBase 云托管（CloudRun）容器形态**：快照持久化、`/weibo` 子路径、直调 API 归档（ADR-0011 / 0012）。
+- 与 `main`（本地 exe / PyInstaller / 云服务器 nginx 形态）是**两条永久平行的产品线：不合并、不互相 cherry-pick**。exe 打包、vbs 启停、tar 部署链等本地线专属文件已在本分支删除，需要时去 main。
+- 通用性修复（拉取逻辑、界面、归档语义）优先考虑两条线各改各的，接受一定重复。
+
 ## 命名
 
 - **文件名一律用英文**（代码 snake_case，文档 kebab-case）：如 `weibo_server.py`、`yuque-sync-template.md`、`docs/adr/0008-yuque-archive.md`。不新增中文文件名。
@@ -14,12 +20,12 @@
 
 ## 架构约束
 
-- `weibo_server.py` 保持**纯标准库**（http.server + sqlite3），尽量零第三方依赖；PyInstaller 打包 `weibo_archive.exe`。
+- `weibo_server.py` 保持**纯标准库**（http.server + sqlite3），零第三方依赖（云托管镜像 python:3.12-slim 直接跑）。
 - 数据全部在 `weibo.db`（SQLite 单文件）；接口原始 JSON 留底（ADR-0003）。
 - 拉取走 m.weibo.cn 非官方接口 + 小号 cookie（ADR-0002）；432 退避、断点续爬、增量 / 全量 / 重拉语义见 ADR-0006 / 0007。
 - 定时拉取 = 一键全部拉取的定时版：配置存 kv 表（开关 + 间隔，30~1440 分钟），调度线程到点入队，重启后超间隔补跑一次。
-- 语雀归档 = 无头 claude CLI + yuque MCP（ADR-0008）：weibo_server spawn `claude -p`，AI 总结 + 建语雀文档一体完成；语雀 token 按用户存 `weibo.db` 的 `user_kv` 表（ADR-0010），不入 git；旧库迁移时一次性从 `~/.claude/settings.json` 导入。
-- 语雀删除 = OpenAPI 直连（ADR-0009）：yuque MCP 无删除工具，删除走 `DELETE /api/v2/repos/:namespace/docs/:id`，token 从该用户的 `user_kv` 读取（ADR-0010）。
+- 语雀归档 = 直调 AI 接口 + 语雀 OpenAPI（ADR-0012，取代 ADR-0008 的 claude+MCP 链路）：模板驱动 AI 总结（Anthropic 兼容 `/v1/messages`，TITLE:/BODY: 契约）+ OpenAPI 建档/更新/挂目录/删除，纯 urllib 零外部二进制；AI 中转地址/密钥/模型为全局配置，管理员后台填写落 kv 表（密钥只显掩码，无环境变量兜底）；语雀 token 按用户存 `weibo.db` 的 `user_kv` 表（ADR-0010），不入 git；旧库迁移时一次性从 `~/.claude/settings.json` 导入。
+- 部署 = 腾讯云托管 CloudBase CloudRun（ADR-0011）：副本恒 1；运行库在容器本地盘，定期/停止信号时 sqlite backup 快照到对象存储挂载盘 `weibo/weibo.db`，新实例启动拉回；本地开发不受影响（不设 WEIBO_BIND 仍绑 127.0.0.1）。线上与同域名其他个人服务共用备案域名，走 `/weibo` 子路径（`WEIBO_BASE_PATH` 前缀感知，前端接口/图片请求必须经 fetchJson/imgProxy 拼 `WB_BASE`，不写根绝对路径）。
 - 新增功能的全部产出（代码 / 文档 / 数据）放 weibo/ 内，后续相关文件也只往里加。
 
 ## 易用性（五条硬承诺）
@@ -39,21 +45,21 @@
 - 批量不限条数、批内 2 路并发、可取消，显示「同步中 x/y」；文档格式由 `yuque-sync-template.md` 模板驱动
 - 归档状态：待归档 / 已归档 / 同步失败 / 更新失败 / 无需归档；失败记原因（悬浮提示），同步中 / 更新中瞬态落库；批量可改「无需归档 / 待归档」
 - 归档删除：单卡【删档】+ 批量【删语雀档】，先删语雀文档再重置为待归档；远端失败保留原状态可重试，404（已不存在）视为成功（ADR-0009）
-- 错误必须提示具体原因：未配置目录 / 本机没 claude / 未配置 yuque MCP / MCP 连接失败
+- 错误必须提示具体原因（零术语）：未配置归档目录 / AI 归档服务未开通（提示联系管理员在后台配置）/ 语雀令牌未填 / AI 接口或语雀接口报错带 HTTP 状态与摘要；不再有 claude / MCP 相关路径
 
 ## 已知推迟项（不要再主动做）
 
-导出、评论、图片本地化、PC 备份通道、FTS、部署。
+导出、评论、图片本地化、PC 备份通道、FTS、应用内周期备份（现靠快照位手工兜底）。
 
-## 开发与打包
+## 开发与部署
 
-- 开发：`python weibo_server.py [端口]`（默认 8766）；`weibo_start.vbs` 启动 / `weibo_stop.vbs` 停止
+- 本地开发：`python weibo_server.py [端口]`（默认 8766，不设 WEIBO_BIND 绑 127.0.0.1）
+- 云托管部署：`bash deploy/pack.sh`（产出 cloudbase-dist/）→ `cloudbase cloudrun deploy`（完整命令与流程见 `deploy/cloudbase/README.md`）；镜像只装代码，`weibo.db` 绝不进镜像
 - 冒烟测试：`python smoke_test.py`
-- 重新打包：双击 `rebuild.bat`（停旧进程 → 重新打包 → 清理中间文件）
-- `weibo_archive.spec` 的 datas 包含运行时资源（`weibo_web.html`、`yuque-sync-template.md`），新增资源记得同步 spec
+- 新增运行时资源记得同步 `deploy/cloudbase/Dockerfile` 的 COPY 清单（本地线已删 spec）
 
 ## Git
 
 - 本仓库用专用 GitHub 提交身份（匿名邮箱 + 专用 SSH 密钥），与内网 GitLab 的全局身份分开；具体账号与密钥不写进本仓库文件（个人隐私不入库），配置由会话记忆持有
 - 提交信息用中文
-- 运行时产物不入库：`weibo.db`、备份库、日志、`__pycache__`、`dist/`（`.gitignore` 已排除）
+- 运行时产物不入库：`weibo.db`、备份库、日志、`__pycache__`、`cloudbase-dist/`（`.gitignore` 已排除）
