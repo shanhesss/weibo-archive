@@ -2519,6 +2519,8 @@ function loadAiConfig(){
 function renderAiConfig(){
   var list = $('aiList');
   list.innerHTML = '';
+  var firstOn = -1;                          // 「主用」= 第一个启用的配置（停用即让位给下一个）
+  aiCfgs.forEach(function(c, i){ if(firstOn < 0 && c.enabled) firstOn = i; });
   aiCfgs.forEach(function(c, i){
     var row = document.createElement('div');
     row.className = 'ai-row' + (c.enabled ? '' : ' off');
@@ -2527,7 +2529,7 @@ function renderAiConfig(){
       b.textContent = txt; b.onclick = fn; if(dis) b.disabled = true; row.querySelector('.acts').appendChild(b); return b; }
     var acts = document.createElement('div'); acts.className = 'acts';
     row.appendChild(add('nm', c.name || ('服务' + (i + 1))));
-    if(i === 0) add('tag', '主用');
+    if(i === firstOn) add('tag', '主用');
     if(!c.enabled) add('tag off', '已停用');
     add('url', (c.base_url || '未填地址') + '　' + (c.model || '') + (c.key_set ? ('　' + c.key_masked) : '　未填密钥'));
     add('cnt', '成功 ' + (c.ok_count || 0) + ' 次');
