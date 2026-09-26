@@ -1143,6 +1143,29 @@ def ai_pool_save(pool):
     kv_set('ai_pool', json.dumps(pool, ensure_ascii=False))
 
 
+_ai_stats_lock = threading.Lock()
+
+
+def _ai_stat_key(cfg):
+    return '%s|%s|%s' % (cfg.get('name') or '', cfg.get('base_url') or '', cfg.get('model') or '')
+
+
+def ai_stats():
+    """各中转的生成成功次数（kv `ai_stats`，按 备注名|地址|模型 归并；改这三项等于换身份重新计数）"""
+    try:
+        return json.loads(kv_get('ai_stats') or '{}')
+    except Exception:
+        return {}
+
+
+def _ai_count_ok(cfg):
+    with _ai_stats_lock:
+        st = ai_stats()
+        k = _ai_stat_key(cfg)
+        st[k] = st.get(k, 0) + 1
+        kv_set('ai_stats', json.dumps(st))
+
+
 def ai_cfgs():
     """按序返回「可用」配置（已启用且地址/密钥/模型齐全）；空列表 = AI 归档未开通"""
     out = []
@@ -1176,22 +1199,39 @@ def _ai_complete(prompt, cfg):
         raise ApiError('AI 服务请求失败（%d）%s' % (e.code, ('：' + detail) if detail else ''))
     except (urllib.error.URLError, OSError) as e:
         raise ApiError('连接 AI 服务失败：%s' % e)
+    except Exception as e:  # noqa: BLE001 返回不是 JSON（网关吐了页面/空体）
+        raise ApiError('AI 服务返回了看不懂的响应：%s' % str(e)[:80])
+    if not isinstance(data, dict):
+        raise ApiError('AI 服务返回格式异常：%s' % str(data)[:120])
+    if data.get('error'):                      # 有些中转把错误装进 200 响应体里
+        raise ApiError('AI 服务返回错误：%s'
+                       % json.dumps(data['error'], ensure_ascii=False)[:150])
     parts = [b.get('text') or '' for b in (data.get('content') or [])
-             if b.get('type') == 'text']
+             if isinstance(b, dict) and b.get('type') == 'text']
     text = '\n'.join(parts).strip()
+    if not text:                               # 容错：部分中转按 OpenAI 形状回
+        ch = data.get('choices') or []
+        if ch and isinstance(ch[0], dict):
+            text = ((ch[0].get('message') or {}).get('content') or '').strip()
     if not text:
-        raise ApiError('AI 返回了空内容')
+        raise ApiError('AI 返回了空内容（stop_reason=%s，响应摘要：%s）'
+                       % (data.get('stop_reason') or '?',
+                          json.dumps(data, ensure_ascii=False)[:160]))
     return text
 
 
 def _ai_generate(prompt, cfgs):
-    """主→备整链试一遍：任何一家没成功就换下一家（不区分失败原因、不做熔断，ADR-0013）"""
+    """主→备整链试一遍：任何一家没成功就换下一家（不区分失败原因、不做熔断，ADR-0013）。
+    某家成功后累加其成功次数（落 kv ai_stats，按 name|base_url|model 归并）"""
     errs = []
     for c in cfgs:
         try:
-            return _parse_doc_md(_ai_complete(prompt, c))
+            out = _parse_doc_md(_ai_complete(prompt, c))
         except ApiError as e:
             errs.append('%s：%s' % (c.get('name') or '备用', str(e)[:60]))
+            continue
+        _ai_count_ok(c)
+        return out
     raise ApiError('AI 归档服务全部没成功（%s）' % '；'.join(errs))
 
 
@@ -2281,10 +2321,12 @@ def api_admin_invite(user, body=None):
 def api_admin_ai_config(user, body=None):
     """AI 归档服务配置池（主用在前、备用在后，ADR-0013）：读取永不回显 key 原文，只回掩码"""
     pool = ai_pool()
+    stats = ai_stats()
     return {'ok': True, 'configs': [
         {'name': c.get('name', ''), 'base_url': c.get('base_url', ''),
          'model': c.get('model', ''), 'enabled': bool(c.get('enabled', True)),
-         'key_set': bool(c.get('key')), 'key_masked': _mask_token(c.get('key') or '')}
+         'key_set': bool(c.get('key')), 'key_masked': _mask_token(c.get('key') or ''),
+         'ok_count': stats.get(_ai_stat_key(c), 0)}
         for c in pool]}
 
 

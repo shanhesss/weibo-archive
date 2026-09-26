@@ -352,6 +352,22 @@ try:
 except ws.ApiError as e:
     err = str(e)
 check('整链失败报全部没成功并带各家原因', '全部没成功' in err and '主用' in err and '备用' in err)
+# 成功次数：整链成功给成功那家累加（按 备注名|地址|模型 归并），失败不加
+ws._ai_complete = lambda prompt, c: 'TITLE: 标题\nBODY: 正文'
+cfg0 = ws.ai_cfgs()[0]
+n0 = ws.ai_stats().get(ws._ai_stat_key(cfg0), 0)
+ws._ai_generate('p', [cfg0])
+check('成功次数记在对应配置并回显管理接口',
+      ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1
+      and ws.api_admin_ai_config(USER)['configs'][0]['ok_count'] == n0 + 1)
+def _fake_down2(prompt, c):
+    raise ws.ApiError('挂了')
+ws._ai_complete = _fake_down2
+try:
+    ws._ai_generate('p', [cfg0])
+except ws.ApiError:
+    pass
+check('失败不计数', ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1)
 ws._ai_complete = _real_complete
 
 # 22e. 数据库备份下载（断点续传）：200 全量 / Range 206 / 越界 416，临时副本用完即删

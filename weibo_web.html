@@ -365,6 +365,7 @@
   .ai-row .nm{font-weight:600; flex:none;}
   .ai-row .url{color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
                max-width:280px; min-width:0;}
+  .ai-row .cnt{font-size:12px; color:var(--grey); flex:none;}
   .ai-row .acts{margin-left:auto; display:flex; gap:4px; flex-wrap:wrap;}
   .ai-form{display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;}
   .ai-form input[type=text],.ai-form input[type=password]{font-size:13px; padding:5px 8px;
@@ -2534,6 +2535,7 @@ function renderAiConfig(){
     if(i === 0) add('tag', '主用');
     if(!c.enabled) add('tag off', '已停用');
     add('url', (c.base_url || '未填地址') + '　' + (c.model || '') + (c.key_set ? ('　' + c.key_masked) : '　未填密钥'));
+    add('cnt', '成功 ' + (c.ok_count || 0) + ' 次');
     row.appendChild(acts);
     btn('↑', function(){ aiAction('move', i, 'up'); }, i === 0);
     btn('↓', function(){ aiAction('move', i, 'down'); }, i === aiCfgs.length - 1);
@@ -2598,8 +2600,21 @@ $('aiSave').onclick = function(){
   });
 };
 
+/* ── 备份下载：二次确认后再触发浏览器下载 ─────────── */
+$('dbBackup').onclick = function(ev){
+  ev.preventDefault();
+  showModal('下载完整数据库备份？\n\n会把全部数据（所有账号的博主、微博、设置）另存一份到你自己的电脑。文件较大，下载可能需要一段时间；中断可续传。', [
+    {text:'开始下载', cls:'primary', fn: function(){
+      var a = document.createElement('a');
+      a.href = WB_BASE + '/api/admin/db_backup'; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); a.remove();
+      toast('已开始下载，请查看浏览器下载列表');
+    }},
+    {text:'取消', cls:'', fn: null}
+  ]);
+};
+
 /* ── 启动 ────────────────────────────────── */
-$('dbBackup').href = WB_BASE + '/api/admin/db_backup';   // 浏览器直接下载，续传走 Range
 loadState();                                    // 未登录时 401 会自动切到登录视图
 loadPosts();
 setInterval(function(){ if(authed) loadState(); }, 2500);
