@@ -341,6 +341,33 @@ except ws.ApiError:
 check('失败不计数', ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1)
 ws._ai_complete = _real_complete
 
+# 22e. 数据库备份下载（断点续传）：200 全量 / Range 206 / 越界 416，临时副本用完即删
+import io as _io, email.message as _em
+def _dl(range_hdr=None):
+    h = ws.Handler.__new__(ws.Handler)
+    h.headers = _em.Message()
+    if range_hdr:
+        h.headers['Range'] = range_hdr
+    h.request_version = 'HTTP/1.0'
+    h.requestline = 'GET /api/admin/db_backup HTTP/1.0'
+    h.close_connection = True
+    h.wfile = _io.BytesIO()
+    ws.Handler._send_db_backup(h)
+    head, _, body = h.wfile.getvalue().partition(b'\r\n\r\n')
+    return head, body
+head, full = _dl()
+check('备份下载 200 带附件名与续传声明', head.startswith(b'HTTP/1.0 200 OK')
+      and b'weibo-backup-' in head and b'Accept-Ranges: bytes' in head)
+check('备份内容是完整 SQLite 库', full[:15] == b'SQLite format 3'
+      and ('Content-Length: %d' % len(full)).encode() in head)
+head2, part = _dl('bytes=10-29')
+check('Range 续传返回 206 与对应切片', head2.startswith(b'HTTP/1.0 206')
+      and part == full[10:30] and ('bytes 10-29/%d' % len(full)).encode() in head2)
+head3, _ = _dl('bytes=99999999999-')
+check('起点越界返回 416', head3.startswith(b'HTTP/1.0 416')
+      and ('bytes */%d' % len(full)).encode() in head3)
+check('临时副本用完即删', not os.path.exists(ws.DB_PATH + '.dl'))
+
 # 23. 失败状态筛选 + 原因返回
 ws.db("UPDATE posts SET arch_fail='目录不存在' WHERE user_id=? AND id='a4'", (USER_ID,))
 ws.db("UPDATE posts SET arch_fail='超时', arch_skip=0, archived=0 WHERE user_id=? AND id='a2'", (USER_ID,))

@@ -2422,6 +2422,64 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _send_db_backup(self):
+        """完整备份下载：sqlite backup 出临时副本（不碰运行库、不受并发写影响），用完即删。
+        支持单段 Range 断点续传，慢网/大库中断后能接着下"""
+        tmp = DB_PATH + '.dl'
+        con = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp)
+        try:
+            with dst:
+                con.backup(dst)
+        finally:
+            dst.close()
+            con.close()
+        try:
+            size = os.path.getsize(tmp)
+            start, end, code = 0, size - 1, 200
+            m = re.match(r'bytes=(\d*)-(\d*)$', self.headers.get('Range') or '')
+            if m and (m.group(1) or m.group(2)):
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = int(m.group(2)) if m.group(2) else size - 1
+                else:
+                    start = max(0, size - int(m.group(2)))
+                    end = size - 1
+                code = 206 if start <= end < size else 416
+            if code == 416:
+                self.send_response(416)
+                self.send_header('Content-Range', 'bytes */%d' % size)
+                self.end_headers()
+                return
+            length = end - start + 1
+            stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M')
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Disposition',
+                             'attachment; filename="weibo-backup-%s.db"' % stamp)
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Length', str(length))
+            if code == 206:
+                self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, size))
+            self.end_headers()
+            with open(tmp, 'rb') as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass                                              # 用户取消/断连：正常结束
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
     def do_GET(self):
         path, _, qs = self.path.partition('?')
         try:
@@ -2452,6 +2510,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/ai_config':
                 if self._admin(user):
                     self._json(api_admin_ai_config(user))
+            elif path == '/api/admin/db_backup':
+                if self._admin(user):
+                    self._send_db_backup()
             elif path == '/img':
                 data, ctype = proxy_image(urllib.parse.parse_qs(qs).get('u', [''])[0])
                 self.send_response(200)

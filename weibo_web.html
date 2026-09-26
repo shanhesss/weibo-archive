@@ -371,6 +371,8 @@
   .ai-form input[type=text],.ai-form input[type=password]{font-size:13px; padding:5px 8px;
             border:1px solid var(--line); border-radius:6px; background:#fff; width:180px;}
   .ai-form .cleark{font-size:12px; color:var(--sub); display:flex; align-items:center; gap:3px;}
+  a.mini{display:inline-block; padding:1px 8px; font-size:12px; color:var(--sub); line-height:1.6;
+         border:1px solid var(--line); border-radius:6px; background:#fff; text-decoration:none; cursor:pointer;}
   .admin-filters{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; align-items:center;}
   .admin-filters input,.admin-filters select{font-size:13px; padding:5px 8px; border:1px solid var(--line);
               border-radius:6px; background:#fff;}
@@ -847,6 +849,11 @@
       <button id="aiCancel" class="mini">取消</button>
       <label class="cleark" id="aiClearWrap" style="display:none"><input type="checkbox" id="aiClearKey">清除密钥</label>
     </div>
+  </div>
+  <div class="admin-ai">
+    <span class="lbl">数据备份</span>
+    <a id="dbBackup" class="mini" href="#">下载完整备份</a>
+    <span class="hint">把全部数据（所有账号的博主、微博、设置）下载一份，自己保存备份；中断可续传</span>
   </div>
   <div class="admin-filters">
     <input type="text" id="adminKw" placeholder="搜索用户名">
@@ -2586,6 +2593,20 @@ $('aiSave').onclick = function(){
     toast(r.configured ? '已保存，AI 归档可用' : (r.note || '已保存'));
     loadAiConfig();
   });
+};
+
+/* ── 备份下载：二次确认后再触发浏览器下载 ─────────── */
+$('dbBackup').onclick = function(ev){
+  ev.preventDefault();
+  showModal('下载完整数据库备份？\n\n会把全部数据（所有账号的博主、微博、设置）另存一份到你自己的电脑。文件较大，下载可能需要一段时间；中断可续传。', [
+    {text:'开始下载', cls:'primary', fn: function(){
+      var a = document.createElement('a');
+      a.href = '/api/admin/db_backup'; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); a.remove();
+      toast('已开始下载，请查看浏览器下载列表');
+    }},
+    {text:'取消', cls:'', fn: null}
+  ]);
 };
 
 /* ── 启动 ────────────────────────────────── */
