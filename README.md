@@ -4,6 +4,14 @@
 
 拉取任意公开微博博主的全部历史微博，本地查询浏览，并可将单条微博 AI 总结后归档到语雀。支持多账号登录，每个账号各自配置微博登录信息、各自管理数据。
 
+> **本分支 `main` = 本地产品线**：两种自用形态——双击 `weibo_start.vbs` 起本机服务，
+> 或按 `deploy/README.md` 用 nginx + systemd 部署到自己的 Linux 云服务器；`rebuild.bat`
+> 经 PyInstaller 打包成 `weibo_archive.exe`。
+>
+> 本仓库两条产品线**永久平行、互不合并**：云托管（CloudBase CloudRun 容器）形态在
+> **`cloudbase-cloudrun` 分支**，那是**现行线上部署**（浏览器直接访问），部署与运行时
+> 说明见该分支的 `deploy/cloudbase/README.md`。
+
 ## 功能特性
 
 - **多用户账号**：注册 + 邀请码加入；每个用户的微博 Cookie、语雀令牌、博主与微博数据相互独立；管理员可禁用账号、重置密码、开通归档权限、管理邀请码
