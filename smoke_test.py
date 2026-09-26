@@ -30,7 +30,9 @@ USER = ws.db('SELECT * FROM users WHERE id=?', (USER_ID,)).fetchone()
 ws.MSession = lambda user_id: None
 ws.validate_cookie = lambda session: True
 ws.fetch_profile = lambda session, uid: {'uid': uid, 'nickname': '新博主' + uid, 'avatar': '', 'intro': ''}
-ws.find_claude = lambda: 'claude'
+ws.kv_set('ai_base_url', 'https://ai.example.com')
+ws.kv_set('ai_key', 'sk-abcdefg1234567')
+ws.kv_set('ai_model', 'test-model')
 ws.ukv_set(USER_ID, 'yuque_token', 'test-token')
 
 t = int(time.time())
@@ -230,6 +232,13 @@ check('未配目录报博主', r['ok'] is False and '博主' in r['error'])
 ws.api_blogger_yuque_dir(USER, {'uid': '1234567890', 'dir': 'https://www.yuque.com/aaa/bbb/ddd'})
 r = ws.api_yuque_sync(USER, {'ids': ['a2']})
 check('转发微博不可归档', r['ok'] is False)
+for _k in ('ai_base_url', 'ai_key', 'ai_model'):
+    ws.kv_set(_k, '')
+r = ws.api_yuque_sync(USER, {'ids': ['a4']})
+check('AI未配置拒绝入队', r['ok'] is False and '还没开通' in r['error'])
+ws.kv_set('ai_base_url', 'https://ai.example.com')
+ws.kv_set('ai_key', 'sk-abcdefg1234567')
+ws.kv_set('ai_model', 'test-model')
 r = ws.api_yuque_sync(USER, {'ids': ['a4']})
 check('单条归档入队', r['ok'] is True and r['queued'] == 1)
 check('归档队列1条', len(ws.SYNC_QUEUE) == 1)
@@ -258,6 +267,17 @@ sp['total'] = 0
 sp['done'] = 0
 sp['msg'] = ''
 ws.db("UPDATE posts SET arch_state='' WHERE user_id=? AND id='a4'", (USER_ID,))
+
+# 22b. AI 归档配置管理 API：掩码读取 / 留空保持 / clear_key 清除
+cfg = ws.api_admin_ai_config(USER)
+check('ai_config 读取掩码不回显 key', cfg['key_set'] and 'sk-abcdefg1234567' not in str(cfg))
+ws.api_admin_ai_config_save(USER, {'base_url': 'https://ai2.example.com/v1/', 'model': 'm2', 'key': ''})
+check('ai_config key 留空保持原值', ws.kv_get('ai_key') == 'sk-abcdefg1234567'
+      and ws.kv_get('ai_base_url') == 'https://ai2.example.com/v1/')
+check('ai_config 保存后仍可用', ws.ai_cfg() is not None)
+ws.api_admin_ai_config_save(USER, {'clear_key': 1})
+check('ai_config clear_key 清除', ws.kv_get('ai_key') == '' and ws.ai_cfg() is None)
+ws.kv_set('ai_key', 'sk-abcdefg1234567')
 
 # 23. 失败状态筛选 + 原因返回
 ws.db("UPDATE posts SET arch_fail='目录不存在' WHERE user_id=? AND id='a4'", (USER_ID,))

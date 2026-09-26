@@ -239,85 +239,29 @@ sudo rm /tmp/weibo-backup.db
 拉回想接着在本地用：先停本地服务，把该文件改名覆盖本地 `weibo.db`，再 `weibo_start.vbs`。
 **提醒**：`weibo.db` 明文存各用户 cookie / 语雀 token，属敏感文件——别进 git、别随手传网盘。
 
-## （可选）在服务器开启语雀归档：claude + Node + 自定义 key
+## （可选）在服务器开启语雀归档：只需后台配置，无需装任何东西
 
-默认部署不含 claude；不装工具照常用——拉取/查询/定时、语雀【删档】（走 OpenAPI）都不依赖它，
-只有点【同步】把微博 AI 总结成语雀文档时才需要（会提示「本机没找到 claude」）。数据迁到服务器后，
-在服务器网页点【同步】就是在这台服务器上跑，所以要归档就得装。
+默认部署即可拉取/查询/定时；语雀【同步】归档需要 AI 归档服务，未配置时页面会提示
+「AI 归档功能还没开通，请联系管理员在管理后台设置里配置」。归档链路是纯标准库直调
+HTTP（ADR-0011：AI 中转 + 语雀 OpenAPI），**服务器上不需要安装 claude / Node / MCP**，
+数据迁到服务器后只需两步：
 
-几条铁律先记住：
+- 管理员登录网页 → 管理后台 →「AI 归档服务」一行填写：中转地址、密钥、模型名，保存。
+  密钥只存数据库 kv、界面只显掩码（留空则保持原值，可一键清除）。
+- 用户各自的语雀令牌在「个人设置」粘贴（ADR-0010，只认库中令牌，不入 git）。
 
-- 服务进程以系统用户 `weibo` 跑，它 spawn 的 claude / npx **必须装到系统路径 `/usr/local`**，别装在
-  ubuntu 家目录 / nvm 里（weibo 无权访问，会 Permission denied）。
-- 国内服务器连不上 Anthropic，用**自定义 key（中转）**，配在 `/etc/weibo.env`，重启 weibo 后由
-  子进程继承。**自定义 key 不需要交互式 claude 登录。**
-- npx 拉 `yuque-mcp` 看的是 weibo 用户自己的 npm 配置，镜像要设给 weibo。
-
-### 1) 装 Node 到 /usr/local（国内直连 npmmirror 下载，通用）
+国内服务器连不上 Anthropic 官方，中转地址用自定义 key 的兼容网关即可。想先在命令行
+试通中转（可选，不是部署必需）：
 
 ```bash
-cd /tmp
-VER=$(curl -fsSL https://registry.npmmirror.com/-/binary/node/latest-v22.x/ | grep -oE 'node-v22\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz' | sort -V | tail -1)
-[ -n "$VER" ] || { echo "版本列表拉不到，稍后再试或改用 latest-v20.x"; exit 1; }
-curl -fsSL -o "$VER" "https://registry.npmmirror.com/-/binary/node/latest-v22.x/$VER"
-sudo rm -rf /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/include/node /usr/local/lib/node_modules /usr/local/share/doc/node
-sudo tar -xJf "$VER" -C /usr/local --strip-components=1 && rm -f "$VER"
-node -v && npm -v
+curl -s https://你的中转地址/v1/messages \
+  -H 'content-type: application/json' -H 'x-api-key: sk-你的key' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"你的模型名","max_tokens":16,"messages":[{"role":"user","content":"回两个字：通了"}]}'
 ```
 
-> 若 node 是 **nvm** 装的（在 `/home/xxx/.nvm` 下）也一样处理——别去软链它，直接跑上面这条重装一份到
-> /usr/local。装完确认 `/usr/local/bin/npm` 是**指向内部的软链**（`ls -l` 显示
-> `npm -> ../lib/node_modules/npm/bin/npm-cli.js`），把它 -L 复制成真文件会报 cli.js 找不到。
-
-### 2) 换镜像 + 装 claude 到 /usr/local
-
-```bash
-sudo npm config set registry https://registry.npmmirror.com
-sudo npm i -g --prefix /usr/local @anthropic-ai/claude-code
-/usr/local/bin/claude --version
-# 确认 weibo 用户也能搜到（三条都要有输出）
-sudo -u weibo which node npm claude
-```
-
-### 3) 配自定义 key 并试通（把地址和 key 换成你的中转）
-
-```bash
-export ANTHROPIC_BASE_URL=https://你的中转地址
-export ANTHROPIC_AUTH_TOKEN=sk-你的key
-export ANTHROPIC_MODEL=你的中转支持的模型名     # 试通用到就必配，并原样带进第 4 步
-claude -p "回两个字：通了"
-```
-
-能回字即通。个别中转认 `x-api-key`（用 `ANTHROPIC_API_KEY=sk-...`）而非 AUTH_TOKEN，报 401 就换变量。
-
-### 4) 写进服务环境并重启（让归档的 claude 子进程继承）
-
-第 3 步试通用到几个变量，这里就原样写几个（**含模型**，你的中转认模型就必须带上）。采用**整体覆盖
-写入**，幂等、不会残留脏行；别用 heredoc（粘贴时结尾 `EOF` 容易丢，内容会混进文件）：
-
-```bash
-# 把下面几行改成第 3 步试通时用的真实值
-printf '%s\n' \
-  'WEIBO_NO_BROWSER=1' \
-  'ANTHROPIC_BASE_URL=https://你的中转地址' \
-  'ANTHROPIC_AUTH_TOKEN=sk-你的key' \
-  'ANTHROPIC_MODEL=你的中转支持的模型名' | sudo tee /etc/weibo.env >/dev/null
-sudo chmod 600 /etc/weibo.env
-sudo systemctl restart weibo
-sudo cat /etc/weibo.env    # 核对：应正好这几行、无占位符
-```
-
-`WEIBO_NO_BROWSER=1` 必须保留（服务无头运行靠它）。以后要加别的变量（如代理 `HTTPS_PROXY`），把对应行并进上面的 printf 清单再跑一次即可。
-
-### 5) 给 weibo 的 npx 换镜像 + 模拟服务调用验证
-
-```bash
-sudo -u weibo npm config set registry https://registry.npmmirror.com
-sudo -u weibo bash -c 'ANTHROPIC_BASE_URL=https://你的中转地址 ANTHROPIC_AUTH_TOKEN=sk-你的key claude -p "回两个字：通了"'
-```
-
-能回字，网页里点【同步】即可。语雀令牌不用配：迁移的库已按用户带着，用户也能在「个人设置」里重贴
-（ADR-0010，只认库中令牌，不入 git）。
+能回内容，后台填同样三项即可。`/etc/weibo.env` 保持 `WEIBO_NO_BROWSER=1`（服务无头运行
+靠它）即可，AI 配置不落环境变量、不再需要往里加 ANTHROPIC_* 变量。
 
 ## 想从裸 IP 快跑升级到 HTTPS
 

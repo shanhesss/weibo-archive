@@ -18,7 +18,6 @@
 import concurrent.futures
 import datetime
 import email.utils
-import glob
 import hashlib
 import html as html_mod
 import http.cookies
@@ -27,11 +26,8 @@ import os
 import random
 import re
 import secrets
-import shutil
 import sqlite3
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -54,7 +50,7 @@ HTML_PATH = os.path.join(BUNDLE_DIR, 'weibo_web.html')
 TEMPLATE_PATH = os.path.join(BUNDLE_DIR, 'yuque-sync-template.md')
 YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:/[^\s/?#]+)*)/?$')
 SYNC_WORKERS = 2                 # 批内并发路数：2 路并行跑，墙钟约减半
-SYNC_TIMEOUT = 240               # 单条 claude 调用超时（秒）
+SYNC_TIMEOUT = 240               # 单条 AI 生成调用超时（秒）
 
 SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
@@ -110,7 +106,7 @@ def init_db():
       role TEXT NOT NULL DEFAULT 'user',       -- admin / user
       disabled INTEGER NOT NULL DEFAULT 0,     -- 管理员强制停用
       deactivated_at INTEGER NOT NULL DEFAULT 0,  -- 注销时间戳，0=未注销，7 天后清除
-      can_archive INTEGER NOT NULL DEFAULT 0,  -- 语雀 AI 归档权限（消耗服务器 claude 配额）
+      can_archive INTEGER NOT NULL DEFAULT 0,  -- 语雀 AI 归档权限（消耗服务器的 AI 服务额度）
       created_at TEXT, last_login_at TEXT);
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
@@ -1095,28 +1091,6 @@ def clear_arch_state(user_id=None):
         clear_arch_state(user_id)
 
 
-def find_claude():
-    """找本机可调用的 claude CLI：PATH → VSCode 扩展内置二进制 → 常见安装位置"""
-    p = shutil.which('claude')
-    if p:
-        return p
-    home = os.path.expanduser('~')
-    cands = []
-    for pat in (os.path.join(home, '.claude', 'local', 'bin', 'claude*'),
-                os.path.join(home, '.vscode', 'extensions', 'anthropic.claude-code-*',
-                             'resources', 'native-binary', 'claude*'),
-                os.path.join(home, '.vscode-insiders', 'extensions', 'anthropic.claude-code-*',
-                             'resources', 'native-binary', 'claude*'),
-                os.path.join(os.environ.get('APPDATA', ''), 'npm', 'claude*'),
-                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs',
-                             'claude-code', 'claude*')):
-        cands += glob.glob(pat)
-    for c in cands:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
 def validate_yuque_dir(url):
     """校验语雀目录链接格式，返回 (账号, 知识库slug, 目录路径) 或 None"""
     url = (url or '').strip()
@@ -1126,146 +1100,81 @@ def validate_yuque_dir(url):
     return m.group(1), m.group(2), m.group(3).strip('/')
 
 
-def _mcp_config_file(token):
-    """生成临时 MCP 配置文件（yuque MCP + 该用户的语雀令牌），返回路径；用完由调用方删除"""
-    fd, path = tempfile.mkstemp(prefix='yuque-mcp-', suffix='.json')
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump({'mcpServers': {'yuque': {
-            'command': 'npx', 'args': ['-y', 'yuque-mcp'],
-            'env': {'YUQUE_PERSONAL_TOKEN': token}}}}, f)
-    return path
+def ai_cfg():
+    """AI 归档服务全局配置（管理员在后台设置填写，落 kv 表）；
+    三项齐了才可用，返回 (地址, key, 模型名)，否则 None"""
+    base = (kv_get('ai_base_url') or '').strip().rstrip('/')
+    key = (kv_get('ai_key') or '').strip()
+    model = (kv_get('ai_model') or '').strip()
+    if base and key and model:
+        return base, key, model
+    return None
 
 
-MCP_NOT_READY_KW = ('未就绪', '未连接', 'MCP 未', '没有加载', '不可用', '无法使用 yuque')
-
-
-def _spawn_claude(prompt, token, attempts=2):
-    """调用无头 claude CLI（AI 总结 + 语雀 MCP 建文档），返回 (ok, 输出文本)。
-    令牌经临时 --mcp-config 文件注入（多用户各用各的），调用结束即删除。
-    yuque MCP 是 npx 冷启动、可能比模型慢，首次调用若提示 MCP 未就绪则重试一次。"""
-    exe = find_claude()
-    if not exe:
-        return False, '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'
-    cfg_path = _mcp_config_file(token)
-    last = (False, 'claude 未返回结果')
+def _ai_complete(prompt, cfg):
+    """直调中转的 Anthropic 兼容接口做单发内容生成，返回模型输出文本"""
+    base, key, model = cfg
+    body = json.dumps({'model': model, 'max_tokens': 4000,
+                       'messages': [{'role': 'user', 'content': prompt}]}).encode('utf-8')
+    req = urllib.request.Request(base + '/v1/messages', data=body, method='POST',
+                                 headers={'content-type': 'application/json',
+                                          'x-api-key': key,
+                                          'authorization': 'Bearer ' + key,
+                                          'anthropic-version': '2023-06-01'})
     try:
-        for i in range(attempts):
-            try:
-                proc = subprocess.Popen(
-                    [exe, '-p', '-', '--output-format', 'json',
-                     '--mcp-config', cfg_path,
-                     '--allowedTools', 'mcp__yuque__*'],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, cwd=BASE_DIR,
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                out, _ = proc.communicate(prompt.encode('utf-8'), timeout=SYNC_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                return False, '同步超时（claude 调用超过 %d 秒）' % SYNC_TIMEOUT
-            except Exception as e:
-                return False, '调用 claude 失败：%s' % e
-            text = out.decode('utf-8', 'replace')
-            res = None
-            for line in text.splitlines():      # 解析最后的 type=result 事件，取 result 文本
-                line = line.strip()
-                if not line.startswith('{'):
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if ev.get('type') == 'result':
-                    res = str(ev.get('result') or '')
-            if res is None:
-                return False, 'claude 返回无法解析：%s' % text[:300]
-            if i < attempts - 1 and any(kw in res for kw in MCP_NOT_READY_KW):
-                last = (False, '语雀 MCP 未就绪，重试后仍失败：%s' % res[:150])
-                continue
-            return True, res
-    finally:
+        with urllib.request.urlopen(req, timeout=SYNC_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        detail = ''
         try:
-            os.unlink(cfg_path)
-        except OSError:
+            detail = e.read().decode('utf-8', 'replace')[:150]
+        except Exception:
             pass
-    return last
+        raise ApiError('AI 服务请求失败（%d）%s' % (e.code, ('：' + detail) if detail else ''))
+    except (urllib.error.URLError, OSError) as e:
+        raise ApiError('连接 AI 服务失败：%s' % e)
+    parts = [b.get('text') or '' for b in (data.get('content') or [])
+             if b.get('type') == 'text']
+    text = '\n'.join(parts).strip()
+    if not text:
+        raise ApiError('AI 返回了空内容')
+    return text
 
 
-def _build_archive_prompt(row, template, update_doc_url=None):
-    """组装单条微博的归档提示词：新建或按最新模板更新语雀文档 + 模板 + 微博内容"""
-    acc, book, folder = validate_yuque_dir(row['yuque_dir'])
+def _parse_doc_md(out):
+    """解析模型输出的 TITLE:/BODY: 契约 → (标题, Markdown 正文)；漂移抛 ApiError 触发重试"""
+    m = re.match(r'\s*TITLE[:：]\s*(.+?)\s*\n+BODY[:：]\s*', out, re.S)
+    if m:
+        return m.group(1).strip(), out[m.end():].strip()
+    m = re.match(r'\s*#\s+(.+?)\s*\n', out)      # 容错：直接给了带 H1 的 Markdown
+    if m and len(out) > 80:
+        return m.group(1).strip(), out
+    raise ApiError('AI 输出格式不对（没解析出标题/正文）：%s' % out[:120])
+
+
+def _build_archive_prompt(row, template):
+    """组装单条微博的归档提示词：只负责生成标题+正文（写语雀由代码走 OpenAPI 完成）"""
     media = json.loads(row['media_json'] or '{}')
     nimgs = len(media.get('imgs') or [])
     ts = row['created_ts']
     when = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else ''
-    if update_doc_url:
-        target = '已有语雀文档：%s（repo 为 %s/%s，doc slug 为链接最后一段）' % (update_doc_url, acc, book)
-        steps = (
-            '1. 先生成整篇文档的完整内容：按模板结构包含元信息块、AI 总结、关键要点、AI 分析。\n'
-            '2. 调用 yuque_update_doc 更新该文档：body 参数必须填完整生成的 Markdown 内容，禁止传空 body、禁止只传标题、禁止清空原有内容。\n'
-            '3. 若更新报错「文档不存在」，则调用 yuque_create_doc 在该知识库（repo_id 传「%s/%s」）新建文档并按模板生成。\n'
-            '4. 不要重复调用 yuque_update_doc；不要调用 get_doc / get_toc / 任何其他 yuque 工具。\n'
-            % (acc, book))
-    else:
-        if folder:
-            target = '语雀知识库链接：%s（账号 %s，知识库 %s，目录节点 slug 是「%s」，新文档要挂到它下面）' % (
-                row['yuque_dir'], acc, book, folder)
-            steps = (
-                '1. 调用 yuque_create_doc 创建文档：repo_id 传「%s/%s」，标题按模板，正文严格按模板生成。\n'
-                '2. 调用 yuque_get_toc 查看目录树：找到 slug 等于「%s」的节点（目录或普通文档都行），'
-                '记下它的 uuid；再找到刚创建文档的节点（slug 是文档链接最后一段），记下它的 uuid。\n'
-                '3. 调用 yuque_update_toc 把新文档挂到目标节点下，toc_data 传：'
-                '{"action":"appendChild","target_uuid":"<目标节点uuid>","node_uuid":"<新文档uuid>"}。\n'
-                '4. 如果第 2 步找不到目标节点或新文档节点，跳过第 3 步，不影响归档。\n'
-                '5. 创建成功后，最终输出一行：SYNC_OK|文档URL。\n'
-                '6. 如果创建文档失败（知识库不存在、没权限、限流等），最终输出一行：SYNC_ERR|具体错误原因，'
-                '不要重试，不要调用其他 yuque 工具。\n'
-                % (acc, book, folder))
-        else:
-            target = '语雀知识库链接：%s（账号 %s，知识库 %s，直接在该知识库下创建文档）' % (
-                row['yuque_dir'], acc, book)
-            steps = (
-                '1. 调用 yuque_create_doc 创建文档：repo_id 传「%s/%s」，标题按模板，正文严格按模板生成。\n'
-                '2. 创建成功后，最终输出一行：SYNC_OK|文档URL。\n'
-                '3. 如果创建失败（知识库不存在、没权限、限流等），最终输出一行：SYNC_ERR|具体错误原因，'
-                '不要重试，不要调用其他 yuque 工具。\n'
-                % (acc, book))
     return (
-        '你是一个「微博 → 语雀归档」助手。把下面这条微博按模板格式总结并同步到语雀。\n\n'
-        '【目标】%s\n'
-        '步骤：\n'
-        '0. 如果 yuque MCP 的工具还没就绪，先调用 WaitForMcpServers 等待所有 MCP 服务器连接完成，然后再用。\n'
-        '%s'
-        '最后：文档内容严格按模板生成，微博ID 必须保留；如果任何 yuque MCP 调用返回限流（Too Many Requests / 429 / rate limited / 请求过多），立即停止重试，直接输出 SYNC_ERR|语雀接口限流，请稍后再试；最终输出必须只有一行：SYNC_OK|文档URL 或 SYNC_ERR|原因，禁止输出任何其他文字或解释。\n\n'
+        '你是「微博 → 语雀归档」助手。严格按下面模板为这条微博生成归档文档。\n'
+        '输出契约（严格遵守，禁止任何解释、禁止用代码块包裹整体输出）：\n'
+        '第一行：TITLE: 后接文档标题（按模板「文档标题」规则）\n'
+        '随后一行：BODY: 后接整篇 Markdown 正文\n'
+        '正文严格按模板结构生成：微博ID 必须保留；「微博正文」章节原样保留全文、不改写不省略。\n\n'
         '【模板】\n%s\n\n'
         '【微博信息】\n'
         '微博ID：%s\n博主：%s\n发布时间：%s\n原文链接：https://m.weibo.cn/detail/%s\n'
         '互动：转发 %s · 评论 %s · 赞 %s\n图片：%s 张\n\n'
         '【微博正文】\n%s'
-        % (target, steps, template, row['id'], row['nickname'], when, row['bid'],
+        % (template, row['id'], row['nickname'], when, row['bid'],
            row['reposts'], row['comments'], row['atts'], nimgs, row['text']))
 
 
-def _extract_sync_result(out):
-    """从 claude 结果里提取结果：优先 SYNC_OK|url / SYNC_ERR|原因，散文输出做关键词容错"""
-    m = re.search(r'SYNC_OK\|\s*(\S+)', out)
-    if m:
-        return m.group(1).strip()
-    if 'SYNC_ERR|' in out:
-        m = re.search(r'SYNC_ERR\|\s*([^\n]*)', out)
-        raise ApiError(m.group(1).strip() if m and m.group(1).strip() else '归档被拒绝')
-    if '目录不存在' in out:
-        raise ApiError('目录不存在')
-    m = re.search(r'https://www\.yuque\.com/\S+', out)
-    if m:
-        return m.group(0).strip(').，,；;')
-    raise ApiError('claude 未返回文档链接：%s' % out[:150])
-
-
-def run_archive(user_id, ids, token):
-    """批量归档：读模板 → 并发调 claude（AI 总结 + 建语雀文档，默认 2 路）→ 写回归档状态"""
+def run_archive(user_id, ids, token, cfg):
+    """批量归档：读模板 → 并发「AI 生成文档内容 + 语雀 OpenAPI 写入」（默认 2 路）→ 写回归档状态"""
     prog = sync_prog(user_id)
     try:
         with open(TEMPLATE_PATH, 'r', encoding='utf-8') as f:
@@ -1278,6 +1187,7 @@ def run_archive(user_id, ids, token):
     done_lock = threading.Lock()
 
     def archive_one(pid):
+        title = None
         try:
             row = db('SELECT p.*, b.nickname, b.yuque_dir FROM posts p '
                      'LEFT JOIN bloggers b ON b.user_id=p.user_id AND b.uid=p.uid '
@@ -1286,13 +1196,31 @@ def run_archive(user_id, ids, token):
                 raise ApiError('微博不存在')
             if not row['yuque_dir']:
                 raise ApiError('博主未配置语雀同步目录')
+            acc, book, folder = validate_yuque_dir(row['yuque_dir'])
+            ns = '%s/%s' % (acc, book)
+            prompt = _build_archive_prompt(row, template)
+            last_err = None
+            for _ in range(2):               # 单发调用：异常或格式漂移重试一次
+                try:
+                    title, body_md = _parse_doc_md(_ai_complete(prompt, cfg))
+                    break
+                except ApiError as e:
+                    last_err = e
+            if title is None:
+                raise last_err
             is_update = bool(row['archived'])
-            prompt = _build_archive_prompt(row, template,
-                                           update_doc_url=row['yuque_doc_url'] if is_update else None)
-            ok, out = _spawn_claude(prompt, token)
-            if not ok:
-                raise ApiError(out)
-            url = _extract_sync_result(out)
+            url = row['yuque_doc_url']
+            doc = None
+            if is_update and url:
+                parsed = parse_yuque_doc_url(url)
+                doc = _yuque_find_doc(parsed[0], parsed[1], token) if parsed else None
+                if doc:
+                    yuque_update_doc(parsed[0], doc['id'], title, body_md, token)
+            if not doc:                      # 新建；更新时旧文档已不存在也落到这里重建
+                doc = yuque_create_doc(ns, title, body_md, token)
+                url = 'https://www.yuque.com/%s/%s' % (ns, doc['slug'])
+                if folder:
+                    yuque_mount_doc(ns, folder, doc['slug'], token)   # 挂不上不拦截归档
             db('UPDATE posts SET archived=1, yuque_doc_url=?, archived_at=?, '
                "arch_fail='', arch_state='' WHERE user_id=? AND id=?",
                (url, now_str(), user_id, pid))
@@ -1370,6 +1298,12 @@ def archive_worker():
         user_id, ids = item
         token = ukv_get(user_id, 'yuque_token')
         prog = sync_prog(user_id)
+        cfg = ai_cfg()
+        if not cfg:
+            prog['msg'] = 'AI 归档功能还没开通，请联系管理员在管理后台设置里配置'
+            prog['done'] = prog['total']
+            clear_arch_state(user_id)
+            continue
         if not token:
             prog['msg'] = '请先在个人设置中填写语雀令牌'
             prog['done'] = prog['total']
@@ -1377,7 +1311,7 @@ def archive_worker():
             clear_arch_state(user_id)
             continue
         try:
-            run_archive(user_id, ids, token)
+            run_archive(user_id, ids, token, cfg)
         except Exception as e:  # noqa: BLE001 —— 兜底，不能卡死归档通道
             prog['msg'] = '同步出错：%s' % e
             prog['done'] = prog['total']
@@ -1763,8 +1697,8 @@ def api_yuque_sync(user, body):
         return {'ok': False, 'error': '博主「%s」还没配置语雀同步目录，请先在左侧博主行设置' % '、'.join(sorted(no_dir))}
     if not wanted:
         return {'ok': False, 'error': '勾选的微博都是转发微博或无需归档，不支持同步'}
-    if not find_claude():
-        return {'ok': False, 'error': '本机没找到 claude，请先安装 Claude Code 或 npm i -g @anthropic-ai/claude-code'}
+    if not ai_cfg():
+        return {'ok': False, 'error': 'AI 归档功能还没开通，请联系管理员在管理后台设置里配置'}
     if not ukv_get(user_id, 'yuque_token'):
         return {'ok': False, 'error': '还没有填写语雀令牌，请先在个人设置中粘贴'}
     prog = sync_prog(user_id)
@@ -1840,21 +1774,76 @@ def load_yuque_token():
     return ''
 
 
-def _yuque_api(path, token, method='GET'):
+def _yuque_api(path, token, method='GET', payload=None):
     """语雀 OpenAPI 调用，返回 (data, status)；404 原样返回供上层判断「已不存在」"""
     req = urllib.request.Request(YUQUE_API + path, method=method,
                                  headers={'X-Auth-Token': token,
                                           'User-Agent': 'weibo-archive',
-                                          'Content-Type': 'application/json'})
+                                          'Content-Type': 'application/json'},
+                                 data=json.dumps(payload).encode('utf-8') if payload is not None else None)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode('utf-8', 'replace')), resp.status
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None, 404
+        if e.code in (429,):
+            raise ApiError('语雀接口限流，请稍后再试')
         raise ApiError('语雀接口错误（%d）' % e.code)
     except (urllib.error.URLError, OSError) as e:
         raise ApiError('连接语雀失败：%s' % e)
+
+
+def _yuque_find_doc(namespace, slug, token):
+    """按 slug 在知识库文档列表里查文档（返回含 id/slug 的 dict）；查不到返回 None"""
+    for offset in range(0, 2000, 100):
+        # ponytail: 线性翻页查 id（上限 2000 篇）；单库超过这个量再换语雀搜索接口
+        data, st = _yuque_api('/repos/%s/docs?limit=100&offset=%d' % (namespace, offset), token)
+        if st == 404:
+            return None
+        docs = (data or {}).get('data') or []
+        for d in docs:
+            if d.get('slug') == slug:
+                return d
+        if len(docs) < 100:
+            break
+    return None
+
+
+def yuque_create_doc(namespace, title, body_md, token):
+    """建语雀文档（私有、Markdown），返回含 id/slug 的文档信息"""
+    data, st = _yuque_api('/repos/%s/docs' % namespace, token, 'POST',
+                          {'title': title, 'public': 0, 'format': 'markdown',
+                           'body': body_md})
+    doc = (data or {}).get('data') or {}
+    if not doc.get('id') or not doc.get('slug'):
+        raise ApiError('语雀没有返回新建文档的信息（状态 %d）' % st)
+    return doc
+
+
+def yuque_update_doc(namespace, doc_id, title, body_md, token):
+    """按最新模板整篇更新已有语雀文档"""
+    _yuque_api('/repos/%s/docs/%s' % (namespace, doc_id), token, 'PUT',
+               {'title': title, 'public': 0, 'format': 'markdown', 'body': body_md})
+
+
+def yuque_mount_doc(namespace, folder_slug, doc_slug, token):
+    """把新文档挂到目录节点下。挂载是锦上添花：节点找不到或接口失败都不拦截归档，返回是否挂上"""
+    try:
+        data, st = _yuque_api('/repos/%s/toc' % namespace, token)
+        if st != 200:
+            return False
+        nodes = (data or {}).get('data') or []
+        target = next((n for n in nodes if n.get('slug') == folder_slug), None)
+        docnode = next((n for n in nodes if n.get('slug') == doc_slug), None)
+        if not target or not docnode:
+            return False
+        _yuque_api('/repos/%s/toc' % namespace, token, 'PUT',
+                   {'action': 'appendNode', 'action_mode': 'child',
+                    'target_uuid': target.get('uuid'), 'node_uuid': docnode.get('uuid')})
+        return True
+    except ApiError:
+        return False
 
 
 def parse_yuque_doc_url(url):
@@ -1870,22 +1859,10 @@ def yuque_delete_doc(url, token):
     if not parsed:
         raise ApiError('语雀文档链接格式不对：%s' % url)
     namespace, slug = parsed
-    doc_id = None
-    for offset in range(0, 2000, 100):
-        # ponytail: 线性翻页查 id（上限 2000 篇）；单库超过这个量再换语雀搜索接口
-        data, st = _yuque_api('/repos/%s/docs?limit=100&offset=%d' % (namespace, offset), token)
-        if st == 404:
-            return                                  # 知识库都没了 → 文档自然不在了
-        docs = (data or {}).get('data') or []
-        for d in docs:
-            if d.get('slug') == slug:
-                doc_id = d.get('id')
-                break
-        if doc_id or len(docs) < 100:
-            break
-    if not doc_id:
+    doc = _yuque_find_doc(namespace, slug, token)
+    if not doc:
         return                                      # 文档已不存在 → 视为删除成功
-    _, st = _yuque_api('/repos/%s/docs/%s' % (namespace, doc_id), token, method='DELETE')
+    _, st = _yuque_api('/repos/%s/docs/%s' % (namespace, doc['id']), token, method='DELETE')
     if st == 404:
         return
 
@@ -2247,6 +2224,30 @@ def api_admin_invite(user, body=None):
     return {'ok': True, 'invite_code': code}
 
 
+def api_admin_ai_config(user, body=None):
+    """AI 归档服务配置（全局一份，落 kv 表）：读取永不回显 key 原文，只回掩码"""
+    key = kv_get('ai_key') or ''
+    return {'ok': True, 'base_url': kv_get('ai_base_url') or '',
+            'model': kv_get('ai_model') or '',
+            'key_set': bool(key), 'key_masked': _mask_token(key)}
+
+
+def api_admin_ai_config_save(user, body):
+    """保存配置：地址/模型名覆盖式更新；key 留空 = 保持原值，clear_key=1 才清除"""
+    if body.get('base_url') is not None:
+        kv_set('ai_base_url', str(body['base_url']).strip())
+    if body.get('model') is not None:
+        kv_set('ai_model', str(body['model']).strip())
+    if body.get('clear_key'):
+        kv_set('ai_key', '')
+    elif str(body.get('key') or '').strip():
+        kv_set('ai_key', str(body['key']).strip())
+    if not ai_cfg():
+        return {'ok': True, 'configured': False,
+                'note': '还差必填项，AI 归档暂不可用'}
+    return {'ok': True, 'configured': True}
+
+
 # -------------------------------------------------------------- HTTP ----
 COOKIE_NAME = 'wb_session'
 
@@ -2323,6 +2324,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/invite_code':
                 if self._admin(user):
                     self._json({'ok': True, 'invite_code': kv_get('invite_code') or ''})
+            elif path == '/api/admin/ai_config':
+                if self._admin(user):
+                    self._json(api_admin_ai_config(user))
             elif path == '/img':
                 data, ctype = proxy_image(urllib.parse.parse_qs(qs).get('u', [''])[0])
                 self.send_response(200)
@@ -2412,6 +2416,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/invite_code/regenerate':
                 if self._admin(user):
                     self._json(api_admin_invite(user))
+            elif path == '/api/admin/ai_config':
+                if self._admin(user):
+                    self._json(api_admin_ai_config_save(user, body))
             else:
                 self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:  # noqa: BLE001
