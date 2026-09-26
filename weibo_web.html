@@ -351,6 +351,12 @@
   .admin-invite .lbl{font-size:13px; color:var(--sub);}
   #adminInviteCode{font-weight:700; letter-spacing:1px; font-size:14px;}
   .admin-invite .hint{font-size:12px; color:var(--sub); margin-left:4px;}
+  .admin-ai{display:flex; align-items:center; gap:8px; margin-bottom:18px; flex-wrap:wrap;
+            padding:10px 14px; background:var(--bg); border-radius:8px;}
+  .admin-ai .lbl{font-size:13px; color:var(--sub); font-weight:600;}
+  .admin-ai input{font-size:13px; padding:5px 8px; border:1px solid var(--line);
+            border-radius:6px; background:#fff; width:200px;}
+  .admin-ai .hint{font-size:12px; color:var(--sub); margin-left:4px;}
   .admin-filters{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; align-items:center;}
   .admin-filters input,.admin-filters select{font-size:13px; padding:5px 8px; border:1px solid var(--line);
               border-radius:6px; background:#fff;}
@@ -811,6 +817,15 @@
     <button id="inviteReset" class="mini danger">重置</button>
     <span class="hint">注册新账号需要；重置后旧码立即失效，已注册用户不受影响</span>
   </div>
+  <div class="admin-ai">
+    <span class="lbl">AI 归档服务</span>
+    <input type="text" id="aiBase" placeholder="服务地址">
+    <input type="password" id="aiKey" placeholder="密钥" autocomplete="off">
+    <input type="text" id="aiModel" placeholder="模型名">
+    <button id="aiSave" class="mini primary">保存</button>
+    <button id="aiClearKey" class="mini danger" style="display:none">清除密钥</button>
+    <span class="hint" id="aiHint"></span>
+  </div>
   <div class="admin-filters">
     <input type="text" id="adminKw" placeholder="搜索用户名">
     <select id="adminStatus"><option value="">全部状态</option><option value="normal">正常</option><option value="disabled">已禁用</option><option value="deactivated">注销中</option></select>
@@ -827,6 +842,10 @@
 
 <script>
 'use strict';
+/* WB_BASE：部署子路径前缀（如挂在本域名的 /weibo 路由下）。根路径部署时服务端注入为空串，
+   于是前端仍用 /api、/img 根绝对路径；子路径部署时注入 /weibo，接口与图片自动加前缀。
+   占位符 __WB_BASE__ 由 weibo_server 在返回 HTML 时替换。换到独立子域名根路径部署无需改代码。*/
+var WB_BASE = '__WB_BASE__';
 var $ = function(id){ return document.getElementById(id); };
 var selUid = '';                  // 当前筛选的博主（空 = 全部）
 var prevState = {};               // 上次轮询时的博主状态，用于检测「拉取完成」
@@ -851,7 +870,7 @@ function esc(s){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
   });
 }
-function imgProxy(u){ return '/img?u=' + encodeURIComponent(u); }
+function imgProxy(u){ return (WB_BASE || '') + '/img?u=' + encodeURIComponent(u); }
 function thumbUrl(u){             // 大图档位 → 缩略档，卡片加载更快（灯箱仍用原大图）
   return u.replace(/\/(?:large|orj\d+|mw\d+|woriginal|thumb\d+|bmiddle)\//, '/bmiddle/');
 }
@@ -949,6 +968,7 @@ function copyId(id, ev){
   toast('已复制博文 ID：' + id);
 }
 function fetchJson(url, opts){
+  if(WB_BASE && url.charAt(0) === '/') url = WB_BASE + url;    // 子路径部署：接口自动挂前缀
   return fetch(url, opts).then(function(r){
     if(r.status === 401) showAuthView();    // 会话失效 → 统一回登录视图
     return r.json();
@@ -2324,6 +2344,7 @@ function openAdmin(){
   $('adminView').classList.add('show');
   loadAdminStats();
   loadAdminList();
+  loadAiConfig();
 }
 function closeAdmin(){
   $('adminView').classList.remove('show');
@@ -2452,6 +2473,42 @@ $('inviteReset').onclick = function(){
         if(!r.ok){ toast(r.error || '重置失败'); return; }
         $('adminInviteCode').textContent = r.invite_code;
         toast('邀请码已重置');
+      });
+    }},
+    {text:'取消', cls:'', fn: null}
+  ]);
+};
+
+/* ── AI 归档服务配置（管理后台） ─────────────── */
+function loadAiConfig(){
+  fetchJson('/api/admin/ai_config').then(function(r){
+    if(!r.ok) return;
+    $('aiBase').value = r.base_url || '';
+    $('aiModel').value = r.model || '';
+    $('aiKey').value = '';
+    $('aiKey').placeholder = r.key_set ? ('已设置 ' + r.key_masked + '，留空则不修改') : '未设置，粘贴密钥';
+    $('aiClearKey').style.display = r.key_set ? '' : 'none';
+    $('aiHint').textContent = (r.base_url && r.key_set && r.model)
+      ? '已配置，用户点「同步」即可归档' : '未配置完整，语雀归档暂不可用';
+  });
+}
+$('aiSave').onclick = function(){
+  var body = {base_url: $('aiBase').value.trim(), model: $('aiModel').value.trim()};
+  var k = $('aiKey').value.trim();
+  if(k) body.key = k;
+  post('/api/admin/ai_config', body).then(function(r){
+    if(!r.ok){ toast(r.error || '保存失败'); return; }
+    toast(r.configured ? '已保存，AI 归档可用' : (r.note || '已保存'));
+    loadAiConfig();
+  });
+};
+$('aiClearKey').onclick = function(){
+  showModal('清除 AI 服务密钥？\n\n清除后语雀归档将不可用，直到重新配置。', [
+    {text:'清除', cls:'danger', fn: function(){
+      post('/api/admin/ai_config', {clear_key: 1}).then(function(r){
+        if(!r.ok){ toast(r.error || '清除失败'); return; }
+        toast('密钥已清除');
+        loadAiConfig();
       });
     }},
     {text:'取消', cls:'', fn: null}

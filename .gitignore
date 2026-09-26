@@ -5,12 +5,9 @@ weibo.db-shm
 weibo-backup-*.db
 weibo-backup-*.db-wal
 weibo-backup-*.db-shm
+weibo-server-final-*.db
 weibo_server.log
-_migrate.log
 __pycache__/
-dist/
-build/
 
-# 部署产物（含敏感数据 weibo.db，严禁入库）
-weibo-deploy.tar.gz
-.deploy_stage/
+# 部署产物（云托管打包目录，随时可由 pack.sh 重生成）
+cloudbase-dist/

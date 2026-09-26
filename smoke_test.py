@@ -30,8 +30,11 @@ USER = ws.db('SELECT * FROM users WHERE id=?', (USER_ID,)).fetchone()
 ws.MSession = lambda user_id: None
 ws.validate_cookie = lambda session: True
 ws.fetch_profile = lambda session, uid: {'uid': uid, 'nickname': '新博主' + uid, 'avatar': '', 'intro': ''}
-ws.find_claude = lambda: 'claude'
 ws.ukv_set(USER_ID, 'yuque_token', 'test-token')
+# AI 归档全局配置落 kv（ADR-0012），归档入队预检需三项齐备
+ws.kv_set('ai_base_url', 'https://ai.example.com')
+ws.kv_set('ai_key', 'sk-abcdefg1234567')
+ws.kv_set('ai_model', 'test-model')
 
 t = int(time.time())
 c = sqlite3.connect(DB)
@@ -210,7 +213,7 @@ check('目录格式 多层路径', ws.validate_yuque_dir('https://www.yuque.com/
 check('目录格式 仅知识库', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb') == ('aaa', 'bbb', ''))
 check('目录格式 非法协议', ws.validate_yuque_dir('http://yuque.com/aaa/bbb') is None)
 check('目录格式 缺知识库', ws.validate_yuque_dir('https://www.yuque.com/aaa') is None)
-check('目录格式 中文目录名', ws.validate_yuque_dir('https://www.yuque.com/shanhesss/study/其他') == ('shanhesss', 'study', '其他'))
+check('目录格式 中文目录名', ws.validate_yuque_dir('https://www.yuque.com/someone/study/其他') == ('someone', 'study', '其他'))
 check('目录格式 空格拒收', ws.validate_yuque_dir('https://www.yuque.com/aaa/bb b') is None)
 
 # 19. 博主语雀目录设置
@@ -230,6 +233,13 @@ check('未配目录报博主', r['ok'] is False and '博主' in r['error'])
 ws.api_blogger_yuque_dir(USER, {'uid': '1234567890', 'dir': 'https://www.yuque.com/aaa/bbb/ddd'})
 r = ws.api_yuque_sync(USER, {'ids': ['a2']})
 check('转发微博不可归档', r['ok'] is False)
+for _k in ('ai_base_url', 'ai_key', 'ai_model'):
+    ws.kv_set(_k, '')
+r = ws.api_yuque_sync(USER, {'ids': ['a4']})
+check('AI未配置拒绝入队', r['ok'] is False and '还没开通' in r['error'])
+ws.kv_set('ai_base_url', 'https://ai.example.com')
+ws.kv_set('ai_key', 'sk-abcdefg1234567')
+ws.kv_set('ai_model', 'test-model')
 r = ws.api_yuque_sync(USER, {'ids': ['a4']})
 check('单条归档入队', r['ok'] is True and r['queued'] == 1)
 check('归档队列1条', len(ws.SYNC_QUEUE) == 1)
@@ -257,6 +267,45 @@ sp = ws.sync_prog(USER_ID)
 sp['total'] = 0
 sp['done'] = 0
 sp['msg'] = ''
+
+# 22b. AI 归档配置管理 API（ADR-0012）：掩码读取 / 留空保持 / clear_key 清除
+cfg = ws.api_admin_ai_config(USER)
+check('ai_config 读取掩码不回显 key', cfg['key_set'] and 'sk-abcdefg1234567' not in str(cfg))
+ws.api_admin_ai_config_save(USER, {'base_url': 'https://ai2.example.com/v1/', 'model': 'm2', 'key': ''})
+check('ai_config key 留空保持原值', ws.kv_get('ai_key') == 'sk-abcdefg1234567'
+      and ws.kv_get('ai_base_url') == 'https://ai2.example.com/v1/')
+check('ai_config 保存后仍可用', ws.ai_cfg() is not None)
+ws.api_admin_ai_config_save(USER, {'clear_key': 1})
+check('ai_config clear_key 清除', ws.kv_get('ai_key') == '' and ws.ai_cfg() is None)
+ws.kv_set('ai_key', 'sk-abcdefg1234567')
+
+# 22c. 云托管快照恢复语义（ADR-0011）：seed.db 优先且一次性、无 seed 走快照
+import shutil as _shutil, tempfile as _tf
+_real_db, _real_cos = ws.DB_PATH, ws.COS_DIR
+_cos = _tf.mkdtemp(prefix='wb-cos-')
+_dbp = os.path.join(_cos, 'run', 'weibo.db')
+ws.COS_DIR, ws.DB_PATH = _cos, _dbp
+open(os.path.join(_cos, 'weibo.db'), 'wb').write(b'SNAP')
+open(os.path.join(_cos, 'seed.db'), 'wb').write(b'SEED')
+ws.cos_restore()
+check('恢复优先用 seed.db', os.path.exists(_dbp) and open(_dbp, 'rb').read() == b'SEED'
+      and os.path.exists(os.path.join(_cos, 'seed.db.used'))
+      and not os.path.exists(os.path.join(_cos, 'seed.db')))
+os.remove(_dbp)
+ws.cos_restore()
+check('无 seed 时走快照', open(_dbp, 'rb').read() == b'SNAP')
+open(_dbp, 'wb').write(b'LOCAL')
+open(os.path.join(_cos, 'weibo.db'), 'wb').write(b'SNAP2')
+ws.cos_restore()
+check('本地已有库不动', open(_dbp, 'rb').read() == b'LOCAL')
+os.remove(_dbp)
+os.remove(os.path.join(_cos, 'weibo.db'))
+ws.cos_restore()
+check('两处皆无则跳过不报错', not os.path.exists(_dbp))
+_shutil.rmtree(_cos, ignore_errors=True)
+ws.DB_PATH, ws.COS_DIR = _real_db, _real_cos
+ws.DB_PATH, ws.COS_DIR = _real_db, _real_cos
+_shutil.rmtree(_cos, ignore_errors=True)
 ws.db("UPDATE posts SET arch_state='' WHERE user_id=? AND id='a4'", (USER_ID,))
 
 # 23. 失败状态筛选 + 原因返回
