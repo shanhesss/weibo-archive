@@ -52,7 +52,7 @@ HTML_PATH = os.path.join(BUNDLE_DIR, 'weibo_web.html')
 TEMPLATE_PATH = os.path.join(BUNDLE_DIR, 'yuque-sync-template.md')
 YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:/[^\s/?#]+)*)/?$')
 SYNC_WORKERS = 2                 # 批内并发路数：2 路并行跑，墙钟约减半
-SYNC_TIMEOUT = 120               # 单条归档 AI 调用超时（秒）
+SYNC_TIMEOUT = 300               # 单条归档 AI 调用超时（秒）：思考型/编码模型生成整篇文档常超 2 分钟
 
 # 云托管形态（CloudBase，ADR-0011）：设了 WEIBO_BIND 才监听公网口；本机默认仍回环
 BIND_HOST = os.environ.get('WEIBO_BIND') or '127.0.0.1'
@@ -1180,7 +1180,7 @@ def _ai_complete(prompt, cfg):
     """直调一家中转的 Anthropic 兼容接口做单发内容生成，返回模型输出文本"""
     base = cfg['base_url'].strip().rstrip('/')
     key = cfg['key'].strip()
-    body = json.dumps({'model': cfg['model'].strip(), 'max_tokens': 4000,
+    body = json.dumps({'model': cfg['model'].strip(), 'max_tokens': 8000,
                        'messages': [{'role': 'user', 'content': prompt}]}).encode('utf-8')
     req = urllib.request.Request(base + '/v1/messages', data=body, method='POST',
                                  headers={'content-type': 'application/json',
@@ -1214,6 +1214,9 @@ def _ai_complete(prompt, cfg):
         if ch and isinstance(ch[0], dict):
             text = ((ch[0].get('message') or {}).get('content') or '').strip()
     if not text:
+        if data.get('stop_reason') == 'max_tokens':
+            raise ApiError('AI 输出被长度上限截断、没吐正文（思考占满了额度，响应摘要：%s）'
+                           % json.dumps(data, ensure_ascii=False)[:120])
         raise ApiError('AI 返回了空内容（stop_reason=%s，响应摘要：%s）'
                        % (data.get('stop_reason') or '?',
                           json.dumps(data, ensure_ascii=False)[:160]))
