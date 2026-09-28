@@ -1190,6 +1190,8 @@ $('bloggerList').addEventListener('click', function(e){
 function pickUid(uid){
   clearSelection();                   // 切换博主：之前勾选的清空，避免“已选 N 条”残留
   selUid = uid || '';
+  curPage = 1;                        // 切博主回第一页（筛选条件保留），并回到列表顶部
+  backToTop();
   loadState(); loadPosts();
   setChipSel();
   closeNav();
@@ -2052,11 +2054,17 @@ document.addEventListener('touchend', function(e){
     if(curPages > 1) gotoPage(curPage + s.dir);
   }
 });
+function backToTop(){                 // 切页/切博主后回顶：手机端整页滚动要显式归零，桌面端是网格内滚
+  $('grid').scrollTop = 0;
+  if(innerWidth <= 900) window.scrollTo(0, 0);
+}
 function gotoPage(n){
   if(!n || isNaN(n)) return;
   n = Math.min(curPages || 1, Math.max(1, n));
+  if(n === curPage) return;                   // 已到边界：不重发请求也不抖动
   if(n !== curPage && selMode === 'manual') clearSelection();   // 本页勾选翻页即清
   curPage = n;
+  backToTop();
   if(innerWidth <= 900 && !pgOpen) showPill();                 // 切页后短暂亮出页码浮层
   loadPosts();
 }
