@@ -2343,6 +2343,35 @@ def api_admin_invite(user, body=None):
     return {'ok': True, 'invite_code': code}
 
 
+# ----------------------------------------------------------- 备份下载验密 ----
+# 整库下载前先复核当前管理员密码，通过发一张短时效票据（内存态，副本恒 1，ADR-0011）；
+# 下载接口认「管理员会话 + 有效票据」双条件，票据在有效期内可复用（断点续传多次 Range）
+DL_TICKETS = {}                    # token -> (user_id, expire_ts)
+DL_TICKET_TTL = 300                # 秒
+
+
+def api_admin_backup_verify(user, body):
+    uname = 'dl:' + user['username']
+    wait = login_throttled(uname)
+    if wait:
+        return {'ok': False, 'error': '密码错误次数过多，请 %d 分钟后再试' % (wait // 60 + 1)}
+    if not _verify_password(user, str(body.get('password') or '')):
+        login_fail(uname)
+        return {'ok': False, 'error': '密码不正确'}
+    login_ok(uname)
+    now = time.time()
+    for k in [k for k, (_, exp) in DL_TICKETS.items() if exp <= now]:
+        DL_TICKETS.pop(k, None)
+    token = secrets.token_hex(16)
+    DL_TICKETS[token] = (user['id'], now + DL_TICKET_TTL)
+    return {'ok': True, 'ticket': token}
+
+
+def dl_ticket_valid(user_id, ticket):
+    ent = DL_TICKETS.get(ticket or '')
+    return bool(ent and ent[0] == user_id and ent[1] > time.time())
+
+
 def api_admin_ai_config(user, body=None):
     """AI 归档服务配置池（主用在前、备用在后，ADR-0013）：读取永不回显 key 原文，只回掩码"""
     pool = ai_pool()
@@ -2570,7 +2599,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(api_admin_ai_config(user))
             elif path == '/api/admin/db_backup':
                 if self._admin(user):
-                    self._send_db_backup()
+                    ticket = urllib.parse.parse_qs(qs).get('ticket', [''])[0]
+                    if dl_ticket_valid(user['id'], ticket):
+                        self._send_db_backup()
+                    else:
+                        self._json({'ok': False, 'error': '请先验证密码再下载'}, 403)
             elif path == '/img':
                 data, ctype = proxy_image(urllib.parse.parse_qs(qs).get('u', [''])[0])
                 self.send_response(200)
@@ -2667,6 +2700,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/snapshot':
                 if self._admin(user):
                     self._json(api_admin_snapshot(user))
+            elif path == '/api/admin/db_backup_verify':
+                if self._admin(user):
+                    self._json(api_admin_backup_verify(user, body))
             else:
                 self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:  # noqa: BLE001

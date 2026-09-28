@@ -252,6 +252,16 @@
   #modalMsg{font-size:14px; line-height:1.7; margin-bottom:16px; white-space:pre-wrap;}
   #modalBtns{display:flex; gap:10px; justify-content:flex-end;}
 
+  /* ── 备份下载验密弹窗 ─────────────────── */
+  #pwModal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
+           align-items:center; justify-content:center; z-index:120;}
+  #pwModal.show{display:flex;}
+  #pwBox{background:#fff; border-radius:10px; padding:18px 20px; width:360px;
+         max-width:90vw; box-shadow:0 8px 30px rgba(0,0,0,.2);}
+  #pwBox .pw-tip{font-size:13px; color:var(--sub); line-height:1.6; margin-bottom:10px;}
+  #pwBox input{width:100%; box-sizing:border-box; font-size:14px; margin-bottom:16px;}
+  #pwBox .pw-btns{display:flex; gap:10px; justify-content:flex-end;}
+
   /* ── 拉取范围弹窗（添加/重拉共用）───────── */
   #refullModal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
                align-items:center; justify-content:center; z-index:99;}
@@ -744,6 +754,12 @@
   </div>
 </div>
 <div id="modal"><div id="modalBox"><div id="modalMsg"></div><div id="modalBtns"></div></div></div>
+<div id="pwModal"><div id="pwBox">
+  <div class="s-title"><span>验证密码</span></div>
+  <div class="pw-tip">下载完整数据库备份前，请再输入一次本账号的登录密码。</div>
+  <input type="password" id="pwInput" placeholder="登录密码" autocomplete="current-password">
+  <div class="pw-btns"><button id="pwOk" class="primary">确认下载</button><button id="pwCancel">取消</button></div>
+</div></div>
 <div id="refullModal"><div id="refullBox">
   <div id="refullTitle"></div>
   <div id="refullDesc"></div>
@@ -2610,19 +2626,30 @@ $('aiSave').onclick = function(){
   });
 };
 
-/* ── 备份下载：二次确认后再触发浏览器下载 ─────────── */
+/* ── 备份下载：验管理员密码 → 拿票据 → 触发浏览器下载 ─────────── */
 $('dbBackup').onclick = function(ev){
   ev.preventDefault();
-  showModal('下载完整数据库备份？\n\n会把全部数据（所有账号的博主、微博、设置）另存一份到你自己的电脑。文件较大，下载可能需要一段时间；中断可续传。', [
-    {text:'开始下载', cls:'primary', fn: function(){
-      var a = document.createElement('a');
-      a.href = WB_BASE + '/api/admin/db_backup'; a.style.display = 'none';
-      document.body.appendChild(a); a.click(); a.remove();
-      toast('已开始下载，请查看浏览器下载列表');
-    }},
-    {text:'取消', cls:'', fn: null}
-  ]);
+  $('pwInput').value = '';
+  $('pwModal').classList.add('show');
+  $('pwInput').focus();
 };
+$('pwCancel').onclick = function(){ $('pwModal').classList.remove('show'); };
+function pwSubmit(){
+  var pw = $('pwInput').value;
+  if(!pw){ toast('请输入登录密码'); return; }
+  post('/api/admin/db_backup_verify', {password: pw}).then(function(r){
+    if(!r.ok){ toast(r.error || '验证失败'); return; }
+    $('pwInput').value = '';
+    $('pwModal').classList.remove('show');
+    var a = document.createElement('a');
+    a.href = WB_BASE + '/api/admin/db_backup?ticket=' + encodeURIComponent(r.ticket);
+    a.style.display = 'none';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('已开始下载，请查看浏览器下载列表');
+  });
+}
+$('pwOk').onclick = pwSubmit;
+$('pwInput').onkeydown = function(e){ if(e.key === 'Enter') pwSubmit(); };
 
 /* ── 启动 ────────────────────────────────── */
 loadState();                                    // 未登录时 401 会自动切到登录视图
