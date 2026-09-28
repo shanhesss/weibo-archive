@@ -1127,16 +1127,25 @@ def ai_pool():
         key = (kv_get('ai_key') or '').strip()
         model = (kv_get('ai_model') or '').strip()
         if base and key and model:
-            legacy = [{'name': '主用', 'base_url': base, 'key': key, 'model': model, 'enabled': True}]
+            legacy = [{'name': '主用', 'base_url': base, 'key': key, 'model': model, 'enabled': True,
+                       'id': secrets.token_hex(4)}]
             ai_pool_save(legacy)
             for k in ('ai_base_url', 'ai_key', 'ai_model'):
                 kv_set(k, '')
             return legacy
         return []
     try:
-        return json.loads(raw)
+        pool = json.loads(raw)
     except Exception:
         return []
+    changed = False
+    for c in pool:                                 # 旧池条目补发稳定 id（成功次数跟 id 走）
+        if not c.get('id'):
+            c['id'] = secrets.token_hex(4)
+            changed = True
+    if changed:
+        ai_pool_save(pool)
+    return pool
 
 
 def ai_pool_save(pool):
@@ -1147,6 +1156,9 @@ _ai_stats_lock = threading.Lock()
 
 
 def _ai_stat_key(cfg):
+    """成功次数归并键：优先条目稳定 id（编辑任何字段都保数）；无 id 的临时配置退回三字段"""
+    if cfg.get('id'):
+        return 'id:' + str(cfg['id'])
     return '%s|%s|%s' % (cfg.get('name') or '', cfg.get('base_url') or '', cfg.get('model') or '')
 
 
@@ -1260,7 +1272,8 @@ def _build_archive_prompt(row, template):
         '输出契约（严格遵守，禁止任何解释、禁止用代码块包裹整体输出）：\n'
         '第一行：TITLE: 后接文档标题（按模板「文档标题」规则）\n'
         '随后一行：BODY: 后接整篇 Markdown 正文\n'
-        '正文严格按模板结构生成：微博ID 必须保留；「微博正文」章节原样保留全文、不改写不省略。\n\n'
+        '正文严格按模板结构生成：微博ID 必须保留。\n'
+        '「微博正文」章节不要抄写原文（下方【微博正文】仅供你阅读理解），只在该章节写一行占位符：{{微博正文}}\n\n'
         '【模板】\n%s\n\n'
         '【微博信息】\n'
         '微博ID：%s\n博主：%s\n发布时间：%s\n原文链接：https://m.weibo.cn/detail/%s\n'
@@ -1268,6 +1281,14 @@ def _build_archive_prompt(row, template):
         '【微博正文】\n%s'
         % (template, row['id'], row['nickname'], when, row['bid'],
            row['reposts'], row['comments'], row['atts'], nimgs, row['text']))
+
+
+def _fill_body(body_md, text):
+    """方案A（ADR-0014）：正文由代码拼装、不耗 AI 输出——替换 {{微博正文}} 占位；
+    模型没按契约输出占位时兜底追加章节"""
+    if '{{微博正文}}' in body_md:
+        return body_md.replace('{{微博正文}}', text)
+    return body_md.rstrip() + '\n\n## 微博正文\n\n' + text
 
 
 def run_archive(user_id, ids, token, cfgs):
@@ -1305,6 +1326,7 @@ def run_archive(user_id, ids, token, cfgs):
                     last_err = e
             if title is None:
                 raise last_err
+            body_md = _fill_body(body_md, row['text'])
             is_update = bool(row['archived'])
             url = row['yuque_doc_url']
             doc = None
@@ -2355,7 +2377,8 @@ def api_admin_ai_config_save(user, body):
         if not (base_url and key and model):
             return {'ok': False, 'error': '地址、密钥、模型名三项都要填'}
         pool.append({'name': clean(body.get('name')) or '备用',
-                     'base_url': base_url, 'key': key, 'model': model, 'enabled': True})
+                     'base_url': base_url, 'key': key, 'model': model, 'enabled': True,
+                     'id': secrets.token_hex(4)})
     elif action == 'update':
         i = idx()
         if not (0 <= i < len(pool)):

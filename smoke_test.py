@@ -368,7 +368,18 @@ try:
 except ws.ApiError:
     pass
 check('失败不计数', ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1)
+check('池条目带稳定 id', bool(ws.ai_pool()[0].get('id')))
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 0, 'model': 'test-model-b'})
+check('改模型名后成功次数保留（按条目 id 归并）',
+      ws.api_admin_ai_config(USER)['configs'][0]['ok_count'] == n0 + 1)
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 0, 'model': 'test-model'})
 ws._ai_complete = _real_complete
+
+# 22f. 正文代码拼装（ADR-0014）：AI 只出占位，全文由 _fill_body 填入
+check('占位符替换为全文',
+      ws._fill_body('前\n\n## 微博正文\n\n{{微博正文}}\n', '原文多行') == '前\n\n## 微博正文\n\n原文多行\n')
+_filled = ws._fill_body('正文没给占位', '全文')
+check('缺占位兜底追加章节', _filled.endswith('## 微博正文\n\n全文') and _filled.startswith('正文没给占位'))
 
 # 22e. 数据库备份下载（断点续传）：200 全量 / Range 206 / 越界 416，临时副本用完即删
 import io as _io, email.message as _em
