@@ -339,7 +339,18 @@ try:
 except ws.ApiError:
     pass
 check('失败不计数', ws.ai_stats().get(ws._ai_stat_key(cfg0), 0) == n0 + 1)
+check('池条目带稳定 id', bool(ws.ai_pool()[0].get('id')))
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 0, 'model': 'test-model-b'})
+check('改模型名后成功次数保留（按条目 id 归并）',
+      ws.api_admin_ai_config(USER)['configs'][0]['ok_count'] == n0 + 1)
+ws.api_admin_ai_config_save(USER, {'action': 'update', 'index': 0, 'model': 'test-model'})
 ws._ai_complete = _real_complete
+
+# 22f. 正文代码拼装：AI 只出占位，全文由 _fill_body 填入
+check('占位符替换为全文',
+      ws._fill_body('前\n\n## 微博正文\n\n{{微博正文}}\n', '原文多行') == '前\n\n## 微博正文\n\n原文多行\n')
+_filled = ws._fill_body('正文没给占位', '全文')
+check('缺占位兜底追加章节', _filled.endswith('## 微博正文\n\n全文') and _filled.startswith('正文没给占位'))
 
 # 22e. 数据库备份下载（断点续传）：200 全量 / Range 206 / 越界 416，临时副本用完即删
 import io as _io, email.message as _em
@@ -367,6 +378,26 @@ head3, _ = _dl('bytes=99999999999-')
 check('起点越界返回 416', head3.startswith(b'HTTP/1.0 416')
       and ('bytes */%d' % len(full)).encode() in head3)
 check('临时副本用完即删', not os.path.exists(ws.DB_PATH + '.dl'))
+
+# 22g. 备份下载验密：错密码拒绝并限流；对密码发票据；票据认人、过期作废
+pw_salt = ws.secrets.token_hex(16)
+ws.db('UPDATE users SET pass_hash=?, pass_salt=? WHERE id=?',
+      (ws._hash_password('backuppw123', pw_salt), pw_salt, USER_ID))
+u_row = ws.db('SELECT * FROM users WHERE id=?', (USER_ID,)).fetchone()
+check('验密错密码拒绝', ws.api_admin_backup_verify(u_row, {'password': 'oops'})['ok'] is False)
+for _ in range(4):
+    ws.api_admin_backup_verify(u_row, {'password': 'oops'})
+r = ws.api_admin_backup_verify(u_row, {'password': 'backuppw123'})
+check('连错5次后即使密码对也限流', r['ok'] is False and '分钟后再试' in r['error'])
+ws.LOGIN_FAILS.pop('dl:' + u_row['username'], None)
+r = ws.api_admin_backup_verify(u_row, {'password': 'backuppw123'})
+check('正确密码发下载票据', r['ok'] and r['ticket'])
+check('票据有效且认人', ws.dl_ticket_valid(USER_ID, r['ticket'])
+      and not ws.dl_ticket_valid(USER_ID + 5, r['ticket']))
+check('空票或伪造票无效', not ws.dl_ticket_valid(USER_ID, '')
+      and not ws.dl_ticket_valid(USER_ID, 'deadbeef'))
+ws.DL_TICKETS[r['ticket']] = (USER_ID, time.time() - 1)
+check('过期票据作废', not ws.dl_ticket_valid(USER_ID, r['ticket']))
 
 # 23. 失败状态筛选 + 原因返回
 ws.db("UPDATE posts SET arch_fail='目录不存在' WHERE user_id=? AND id='a4'", (USER_ID,))

@@ -50,7 +50,7 @@ HTML_PATH = os.path.join(BUNDLE_DIR, 'weibo_web.html')
 TEMPLATE_PATH = os.path.join(BUNDLE_DIR, 'yuque-sync-template.md')
 YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:/[^\s/?#]+)*)/?$')
 SYNC_WORKERS = 2                 # 批内并发路数：2 路并行跑，墙钟约减半
-SYNC_TIMEOUT = 240               # 单条 AI 生成调用超时（秒）
+SYNC_TIMEOUT = 300               # 单条归档 AI 调用超时（秒）：思考型/编码模型生成整篇文档常超 2 分钟
 
 SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
@@ -1109,16 +1109,25 @@ def ai_pool():
         key = (kv_get('ai_key') or '').strip()
         model = (kv_get('ai_model') or '').strip()
         if base and key and model:
-            legacy = [{'name': '主用', 'base_url': base, 'key': key, 'model': model, 'enabled': True}]
+            legacy = [{'name': '主用', 'base_url': base, 'key': key, 'model': model, 'enabled': True,
+                       'id': secrets.token_hex(4)}]
             ai_pool_save(legacy)
             for k in ('ai_base_url', 'ai_key', 'ai_model'):
                 kv_set(k, '')
             return legacy
         return []
     try:
-        return json.loads(raw)
+        pool = json.loads(raw)
     except Exception:
         return []
+    changed = False
+    for c in pool:                                 # 旧池条目补发稳定 id（成功次数跟 id 走）
+        if not c.get('id'):
+            c['id'] = secrets.token_hex(4)
+            changed = True
+    if changed:
+        ai_pool_save(pool)
+    return pool
 
 
 def ai_pool_save(pool):
@@ -1129,11 +1138,14 @@ _ai_stats_lock = threading.Lock()
 
 
 def _ai_stat_key(cfg):
+    """成功次数归并键：优先条目稳定 id（编辑任何字段都保数）；无 id 的临时配置退回三字段"""
+    if cfg.get('id'):
+        return 'id:' + str(cfg['id'])
     return '%s|%s|%s' % (cfg.get('name') or '', cfg.get('base_url') or '', cfg.get('model') or '')
 
 
 def ai_stats():
-    """各中转的生成成功次数（kv `ai_stats`，按 备注名|地址|模型 归并；改这三项等于换身份重新计数）"""
+    """各中转的生成成功次数（kv `ai_stats`，按条目稳定 id 归并；编辑保数、删除才清零）"""
     try:
         return json.loads(kv_get('ai_stats') or '{}')
     except Exception:
@@ -1162,7 +1174,7 @@ def _ai_complete(prompt, cfg):
     """直调一家中转的 Anthropic 兼容接口做单发内容生成，返回模型输出文本"""
     base = cfg['base_url'].strip().rstrip('/')
     key = cfg['key'].strip()
-    body = json.dumps({'model': cfg['model'].strip(), 'max_tokens': 4000,
+    body = json.dumps({'model': cfg['model'].strip(), 'max_tokens': 8000,
                        'messages': [{'role': 'user', 'content': prompt}]}).encode('utf-8')
     req = urllib.request.Request(base + '/v1/messages', data=body, method='POST',
                                  headers={'content-type': 'application/json',
@@ -1196,6 +1208,9 @@ def _ai_complete(prompt, cfg):
         if ch and isinstance(ch[0], dict):
             text = ((ch[0].get('message') or {}).get('content') or '').strip()
     if not text:
+        if data.get('stop_reason') == 'max_tokens':
+            raise ApiError('AI 输出被长度上限截断、没吐正文（思考占满了额度，响应摘要：%s）'
+                           % json.dumps(data, ensure_ascii=False)[:120])
         raise ApiError('AI 返回了空内容（stop_reason=%s，响应摘要：%s）'
                        % (data.get('stop_reason') or '?',
                           json.dumps(data, ensure_ascii=False)[:160]))
@@ -1239,7 +1254,8 @@ def _build_archive_prompt(row, template):
         '输出契约（严格遵守，禁止任何解释、禁止用代码块包裹整体输出）：\n'
         '第一行：TITLE: 后接文档标题（按模板「文档标题」规则）\n'
         '随后一行：BODY: 后接整篇 Markdown 正文\n'
-        '正文严格按模板结构生成：微博ID 必须保留；「微博正文」章节原样保留全文、不改写不省略。\n\n'
+        '正文严格按模板结构生成：微博ID 必须保留。\n'
+        '「微博正文」章节不要抄写原文（下方【微博正文】仅供你阅读理解），只在该章节写一行占位符：{{微博正文}}\n\n'
         '【模板】\n%s\n\n'
         '【微博信息】\n'
         '微博ID：%s\n博主：%s\n发布时间：%s\n原文链接：https://m.weibo.cn/detail/%s\n'
@@ -1247,6 +1263,13 @@ def _build_archive_prompt(row, template):
         '【微博正文】\n%s'
         % (template, row['id'], row['nickname'], when, row['bid'],
            row['reposts'], row['comments'], row['atts'], nimgs, row['text']))
+
+
+def _fill_body(body_md, text):
+    """正文由代码拼装、不耗 AI 输出——替换 {{微博正文}} 占位；模型没按契约输出占位时兜底追加章节"""
+    if '{{微博正文}}' in body_md:
+        return body_md.replace('{{微博正文}}', text)
+    return body_md.rstrip() + '\n\n## 微博正文\n\n' + text
 
 
 def run_archive(user_id, ids, token, cfgs):
@@ -1284,6 +1307,7 @@ def run_archive(user_id, ids, token, cfgs):
                     last_err = e
             if title is None:
                 raise last_err
+            body_md = _fill_body(body_md, row['text'])
             is_update = bool(row['archived'])
             url = row['yuque_doc_url']
             doc = None
@@ -2300,6 +2324,35 @@ def api_admin_invite(user, body=None):
     return {'ok': True, 'invite_code': code}
 
 
+# ----------------------------------------------------------- 备份下载验密 ----
+# 整库下载前先复核当前管理员密码，通过发一张短时效票据（内存态，单进程服务够用）；
+# 下载接口认「管理员会话 + 有效票据」双条件，票据在有效期内可复用（断点续传多次 Range）
+DL_TICKETS = {}                    # token -> (user_id, expire_ts)
+DL_TICKET_TTL = 300                # 秒
+
+
+def api_admin_backup_verify(user, body):
+    uname = 'dl:' + user['username']
+    wait = login_throttled(uname)
+    if wait:
+        return {'ok': False, 'error': '密码错误次数过多，请 %d 分钟后再试' % (wait // 60 + 1)}
+    if not _verify_password(user, str(body.get('password') or '')):
+        login_fail(uname)
+        return {'ok': False, 'error': '密码不正确'}
+    login_ok(uname)
+    now = time.time()
+    for k in [k for k, (_, exp) in DL_TICKETS.items() if exp <= now]:
+        DL_TICKETS.pop(k, None)
+    token = secrets.token_hex(16)
+    DL_TICKETS[token] = (user['id'], now + DL_TICKET_TTL)
+    return {'ok': True, 'ticket': token}
+
+
+def dl_ticket_valid(user_id, ticket):
+    ent = DL_TICKETS.get(ticket or '')
+    return bool(ent and ent[0] == user_id and ent[1] > time.time())
+
+
 def api_admin_ai_config(user, body=None):
     """AI 归档服务配置池（主用在前、备用在后，ADR-0012）：读取永不回显 key 原文，只回掩码"""
     pool = ai_pool()
@@ -2334,7 +2387,8 @@ def api_admin_ai_config_save(user, body):
         if not (base_url and key and model):
             return {'ok': False, 'error': '地址、密钥、模型名三项都要填'}
         pool.append({'name': clean(body.get('name')) or '备用',
-                     'base_url': base_url, 'key': key, 'model': model, 'enabled': True})
+                     'base_url': base_url, 'key': key, 'model': model, 'enabled': True,
+                     'id': secrets.token_hex(4)})
     elif action == 'update':
         i = idx()
         if not (0 <= i < len(pool)):
@@ -2512,7 +2566,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(api_admin_ai_config(user))
             elif path == '/api/admin/db_backup':
                 if self._admin(user):
-                    self._send_db_backup()
+                    ticket = urllib.parse.parse_qs(qs).get('ticket', [''])[0]
+                    if dl_ticket_valid(user['id'], ticket):
+                        self._send_db_backup()
+                    else:
+                        self._json({'ok': False, 'error': '请先验证密码再下载'}, 403)
             elif path == '/img':
                 data, ctype = proxy_image(urllib.parse.parse_qs(qs).get('u', [''])[0])
                 self.send_response(200)
@@ -2605,6 +2663,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/ai_config':
                 if self._admin(user):
                     self._json(api_admin_ai_config_save(user, body))
+            elif path == '/api/admin/db_backup_verify':
+                if self._admin(user):
+                    self._json(api_admin_backup_verify(user, body))
             else:
                 self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:  # noqa: BLE001

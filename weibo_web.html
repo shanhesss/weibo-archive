@@ -252,6 +252,16 @@
   #modalMsg{font-size:14px; line-height:1.7; margin-bottom:16px; white-space:pre-wrap;}
   #modalBtns{display:flex; gap:10px; justify-content:flex-end;}
 
+  /* ── 备份下载验密弹窗 ─────────────────── */
+  #pwModal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
+           align-items:center; justify-content:center; z-index:120;}
+  #pwModal.show{display:flex;}
+  #pwBox{background:#fff; border-radius:10px; padding:18px 20px; width:360px;
+         max-width:90vw; box-shadow:0 8px 30px rgba(0,0,0,.2);}
+  #pwBox .pw-tip{font-size:13px; color:var(--sub); line-height:1.6; margin-bottom:10px;}
+  #pwBox input{width:100%; box-sizing:border-box; font-size:14px; margin-bottom:16px;}
+  #pwBox .pw-btns{display:flex; gap:10px; justify-content:flex-end;}
+
   /* ── 拉取范围弹窗（添加/重拉共用）───────── */
   #refullModal{position:fixed; inset:0; background:rgba(0,0,0,.4); display:none;
                align-items:center; justify-content:center; z-index:99;}
@@ -744,6 +754,12 @@
   </div>
 </div>
 <div id="modal"><div id="modalBox"><div id="modalMsg"></div><div id="modalBtns"></div></div></div>
+<div id="pwModal"><div id="pwBox">
+  <div class="s-title"><span>验证密码</span></div>
+  <div class="pw-tip">下载完整数据库备份前，请再输入一次本账号的登录密码。</div>
+  <input type="password" id="pwInput" placeholder="登录密码" autocomplete="current-password">
+  <div class="pw-btns"><button id="pwOk" class="primary">确认下载</button><button id="pwCancel">取消</button></div>
+</div></div>
 <div id="refullModal"><div id="refullBox">
   <div id="refullTitle"></div>
   <div id="refullDesc"></div>
@@ -1185,6 +1201,8 @@ $('bloggerList').addEventListener('click', function(e){
 function pickUid(uid){
   clearSelection();                   // 切换博主：之前勾选的清空，避免“已选 N 条”残留
   selUid = uid || '';
+  curPage = 1;                        // 切博主回第一页（筛选条件保留），并回到列表顶部
+  backToTop();
   loadState(); loadPosts();
   setChipSel();
   closeNav();
@@ -2047,11 +2065,17 @@ document.addEventListener('touchend', function(e){
     if(curPages > 1) gotoPage(curPage + s.dir);
   }
 });
+function backToTop(){                 // 切页/切博主后回顶：手机端整页滚动要显式归零，桌面端是网格内滚
+  $('grid').scrollTop = 0;
+  if(innerWidth <= 900) window.scrollTo(0, 0);
+}
 function gotoPage(n){
   if(!n || isNaN(n)) return;
   n = Math.min(curPages || 1, Math.max(1, n));
+  if(n === curPage) return;                   // 已到边界：不重发请求也不抖动
   if(n !== curPage && selMode === 'manual') clearSelection();   // 本页勾选翻页即清
   curPage = n;
+  backToTop();
   if(innerWidth <= 900 && !pgOpen) showPill();                 // 切页后短暂亮出页码浮层
   loadPosts();
 }
@@ -2597,19 +2621,30 @@ $('aiSave').onclick = function(){
   });
 };
 
-/* ── 备份下载：二次确认后再触发浏览器下载 ─────────── */
+/* ── 备份下载：验管理员密码 → 拿票据 → 触发浏览器下载 ─────────── */
 $('dbBackup').onclick = function(ev){
   ev.preventDefault();
-  showModal('下载完整数据库备份？\n\n会把全部数据（所有账号的博主、微博、设置）另存一份到你自己的电脑。文件较大，下载可能需要一段时间；中断可续传。', [
-    {text:'开始下载', cls:'primary', fn: function(){
-      var a = document.createElement('a');
-      a.href = '/api/admin/db_backup'; a.style.display = 'none';
-      document.body.appendChild(a); a.click(); a.remove();
-      toast('已开始下载，请查看浏览器下载列表');
-    }},
-    {text:'取消', cls:'', fn: null}
-  ]);
+  $('pwInput').value = '';
+  $('pwModal').classList.add('show');
+  $('pwInput').focus();
 };
+$('pwCancel').onclick = function(){ $('pwModal').classList.remove('show'); };
+function pwSubmit(){
+  var pw = $('pwInput').value;
+  if(!pw){ toast('请输入登录密码'); return; }
+  post('/api/admin/db_backup_verify', {password: pw}).then(function(r){
+    if(!r.ok){ toast(r.error || '验证失败'); return; }
+    $('pwInput').value = '';
+    $('pwModal').classList.remove('show');
+    var a = document.createElement('a');
+    a.href = '/api/admin/db_backup?ticket=' + encodeURIComponent(r.ticket);
+    a.style.display = 'none';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('已开始下载，请查看浏览器下载列表');
+  });
+}
+$('pwOk').onclick = pwSubmit;
+$('pwInput').onkeydown = function(e){ if(e.key === 'Enter') pwSubmit(); };
 
 /* ── 启动 ────────────────────────────────── */
 loadState();                                    // 未登录时 401 会自动切到登录视图
