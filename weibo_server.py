@@ -101,6 +101,17 @@ class ApiError(Exception):
     """接口异常 / 网络异常"""
 
 
+class AiTransportError(ApiError):
+    """AI 中转连不上/超时/网关故障：这家在本批次内视为死源（ADR-0015）"""
+
+
+class AiFormatError(ApiError):
+    """AI 输出不合契约（格式漂移/空内容/截断）：换一轮再试有意义"""
+
+
+CANCELLED_MSG = '已取消同步'
+
+
 # ------------------------------------------------------------------ db ----
 DB_LOCK = threading.RLock()
 CONN = None
@@ -1208,13 +1219,14 @@ def _ai_complete(prompt, cfg):
             detail = e.read().decode('utf-8', 'replace')[:150]
         except Exception:
             pass
-        raise ApiError('AI 服务请求失败（%d）%s' % (e.code, ('：' + detail) if detail else ''))
+        msg = 'AI 服务请求失败（%d）%s' % (e.code, ('：' + detail) if detail else '')
+        raise AiTransportError(msg) if e.code >= 500 else ApiError(msg)
     except (urllib.error.URLError, OSError) as e:
-        raise ApiError('连接 AI 服务失败：%s' % e)
+        raise AiTransportError('连接 AI 服务失败：%s' % e)
     except Exception as e:  # noqa: BLE001 返回不是 JSON（网关吐了页面/空体）
-        raise ApiError('AI 服务返回了看不懂的响应：%s' % str(e)[:80])
+        raise AiTransportError('AI 服务返回了看不懂的响应：%s' % str(e)[:80])
     if not isinstance(data, dict):
-        raise ApiError('AI 服务返回格式异常：%s' % str(data)[:120])
+        raise AiTransportError('AI 服务返回格式异常：%s' % str(data)[:120])
     if data.get('error'):                      # 有些中转把错误装进 200 响应体里
         raise ApiError('AI 服务返回错误：%s'
                        % json.dumps(data['error'], ensure_ascii=False)[:150])
@@ -1227,38 +1239,51 @@ def _ai_complete(prompt, cfg):
             text = ((ch[0].get('message') or {}).get('content') or '').strip()
     if not text:
         if data.get('stop_reason') == 'max_tokens':
-            raise ApiError('AI 输出被长度上限截断、没吐正文（思考占满了额度，响应摘要：%s）'
-                           % json.dumps(data, ensure_ascii=False)[:120])
-        raise ApiError('AI 返回了空内容（stop_reason=%s，响应摘要：%s）'
-                       % (data.get('stop_reason') or '?',
-                          json.dumps(data, ensure_ascii=False)[:160]))
+            raise AiFormatError('AI 输出被长度上限截断、没吐正文（思考占满了额度，响应摘要：%s）'
+                                % json.dumps(data, ensure_ascii=False)[:120])
+        raise AiFormatError('AI 返回了空内容（stop_reason=%s，响应摘要：%s）'
+                            % (data.get('stop_reason') or '?',
+                               json.dumps(data, ensure_ascii=False)[:160]))
     return text
 
 
-def _ai_generate(prompt, cfgs):
-    """主→备整链试一遍：任何一家没成功就换下一家（不区分失败原因、不做熔断，ADR-0013）。
-    某家成功后累加其成功次数（落 kv ai_stats，按 name|base_url|model 归并）"""
+def _ai_generate(prompt, cfgs, dead=None):
+    """主→备整链试一遍：任一失败即换下一家（ADR-0013）。
+    连不上/网关错的一家记入 dead —— 本批次内的后续条目直接跳过，不再重复等一遍超时（ADR-0015）；
+    拉黑只在批次内有效，下一批次重新现试。某家成功后累加其成功次数（落 kv ai_stats，按条目稳定 id 归并）"""
+    if dead is None:
+        dead = set()
     errs = []
-    for c in cfgs:
+    drift = False
+    for i, c in enumerate(cfgs):
+        tag = c.get('name') or '备用'
+        if i in dead:
+            errs.append('%s：本批次已连不上' % tag)
+            continue
         try:
             out = _parse_doc_md(_ai_complete(prompt, c))
         except ApiError as e:
-            errs.append('%s：%s' % (c.get('name') or '备用', str(e)[:60]))
+            if isinstance(e, AiTransportError):
+                dead.add(i)
+            drift = isinstance(e, AiFormatError) or drift
+            errs.append('%s：%s' % (tag, str(e)[:60]))
             continue
         _ai_count_ok(c)
         return out
-    raise ApiError('AI 归档服务全部没成功（%s）' % '；'.join(errs))
+    # 有一家是「输出不合契约」而败 → 抛可重试类型，让外层再走一轮（漂移是随机的）
+    exc = AiFormatError if drift else ApiError
+    raise exc('AI 归档服务全部没成功（%s）' % '；'.join(errs))
 
 
 def _parse_doc_md(out):
-    """解析模型输出的 TITLE:/BODY: 契约 → (标题, Markdown 正文)；漂移抛 ApiError 触发重试"""
+    """解析模型输出的 TITLE:/BODY: 契约 → (标题, Markdown 正文)；漂移抛 AiFormatError 触发重试"""
     m = re.match(r'\s*TITLE[:：]\s*(.+?)\s*\n+BODY[:：]\s*', out, re.S)
     if m:
         return m.group(1).strip(), out[m.end():].strip()
     m = re.match(r'\s*#\s+(.+?)\s*\n', out)      # 容错：直接给了带 H1 的 Markdown
     if m and len(out) > 80:
         return m.group(1).strip(), out
-    raise ApiError('AI 输出格式不对（没解析出标题/正文）：%s' % out[:120])
+    raise AiFormatError('AI 输出格式不对（没解析出标题/正文）：%s' % out[:120])
 
 
 def _build_archive_prompt(row, template):
@@ -1303,6 +1328,7 @@ def run_archive(user_id, ids, token, cfgs):
         clear_arch_state(user_id)
         return
     done_lock = threading.Lock()
+    dead = set()          # 本批次内已判死的 AI 配置下标（批次结束即失效，ADR-0015）
 
     def archive_one(pid):
         title = None
@@ -1318,12 +1344,14 @@ def run_archive(user_id, ids, token, cfgs):
             ns = '%s/%s' % (acc, book)
             prompt = _build_archive_prompt(row, template)
             last_err = None
-            for _ in range(2):               # 主→备整链试一遍，全败再走一轮（防格式漂移）
+            for _ in range(2):               # 主→备整链试一遍，只是输出不合契约才再走一轮（防漂移，ADR-0015）
                 try:
-                    title, body_md = _ai_generate(prompt, cfgs)
+                    title, body_md = _ai_generate(prompt, cfgs, dead)
                     break
                 except ApiError as e:
                     last_err = e
+                    if not isinstance(e, AiFormatError):
+                        break                # 连不上/网关错：再走一轮只会把超时再等一遍
             if title is None:
                 raise last_err
             body_md = _fill_body(body_md, row['text'])
