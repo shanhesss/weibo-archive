@@ -191,6 +191,8 @@
   #taskHints{flex:1; text-align:center; min-width:0;}
   #taskHints .busy{display:inline-block; padding:3px 14px; border-radius:999px; background:#fdf6ec;
                    color:#a1622a; border:1px solid #faecd8; font-size:13px; font-weight:600;}
+  #taskHints .quiet{display:inline-block; padding:3px 14px; border-radius:999px; background:var(--bg);
+                    color:var(--sub); border:1px solid var(--line); font-size:13px;}
   #taskHints .cancel-btn{background:none; border:1px solid #e3b4b4; color:#c45656;
                          border-radius:999px; padding:0 9px; margin-left:6px; font-size:12px;
                          font-weight:600; line-height:1.7;}
@@ -294,6 +296,9 @@
   #schedDesc{font-size:13px; color:var(--sub); line-height:1.7; margin-bottom:14px;}
   #schedBox input[type=number]{width:100%; padding:8px 10px;}
   #schedBox .rf-label{display:flex; align-items:center; gap:6px;}
+  #schedQuiet .rf-label{color:var(--sub); font-weight:600;}
+  #schedQuietList{font-size:13px; margin-top:4px; line-height:1.7;}
+  #schedQuietNow{font-size:13px; color:#a1622a; margin-top:6px;}
   #schedBtns{display:flex; gap:10px; justify-content:flex-end; margin-top:18px;}
 
   /* ── 轻提示 ───────────────────────────── */
@@ -380,6 +385,8 @@
   .ai-form{display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;}
   .ai-form input[type=text],.ai-form input[type=password]{font-size:13px; padding:5px 8px;
             border:1px solid var(--line); border-radius:6px; background:#fff; width:180px;}
+  .ai-form input[type=time]{font-size:13px; padding:4px 8px; border:1px solid var(--line);
+            border-radius:6px; background:#fff;}
   .ai-form .cleark{font-size:12px; color:var(--sub); display:flex; align-items:center; gap:3px;}
   a.mini{display:inline-block; padding:1px 8px; font-size:12px; color:var(--sub); line-height:1.6;
          border:1px solid var(--line); border-radius:6px; background:#fff; text-decoration:none; cursor:pointer;}
@@ -421,6 +428,8 @@
     #taskHints{order:9; flex:1 1 100%; min-width:0; margin:0;}
     #taskHints .busy{max-width:100%; overflow:hidden; text-overflow:ellipsis;
                      white-space:nowrap; vertical-align:middle;}
+    #taskHints .quiet{max-width:100%; overflow:hidden; text-overflow:ellipsis;
+                      white-space:nowrap; vertical-align:middle;}
     #cookiePill{width:34px; height:34px; padding:0; margin-left:auto;
                 display:inline-flex; align-items:center; justify-content:center; flex:none;}
     #cookiePill #cookiePillTxt{display:none;}
@@ -783,6 +792,11 @@
   <label class="rf-label"><input type="checkbox" id="schedOn"> 开启定时拉取</label>
   <div class="rf-label" style="margin-top:10px;">拉取间隔（分钟，30 ~ 1440）</div>
   <input type="number" id="schedMinutes" min="30" max="1440" step="30" value="60">
+  <div id="schedQuiet" style="display:none">
+    <div class="rf-label" style="margin-top:12px;">自动拉取静默时段（北京时间，管理员设置，对所有人生效）</div>
+    <div id="schedQuietList"></div>
+    <div id="schedQuietNow">现在正处于静默时段，自动拉取已暂停</div>
+  </div>
   <div id="schedBtns">
     <button id="schedOk" class="primary">保存</button>
     <button id="schedCancel">取消</button>
@@ -867,6 +881,21 @@
     </div>
   </div>
   <div class="admin-ai">
+    <div class="ai-head">
+      <span class="lbl">自动拉取静默时段</span>
+      <span class="hint">按北京时间，对所有人的定时拉取生效；手动拉取不受影响。跨过午夜写成 22:00 - 06:00 即可</span>
+      <button id="qwAdd" class="mini primary">添加时段</button>
+    </div>
+    <div id="qwList"></div>
+    <div class="ai-form" id="qwForm" style="display:none">
+      <input type="time" id="qwStart">
+      <span class="cleark">至</span>
+      <input type="time" id="qwEnd">
+      <button id="qwSave" class="mini primary">保存</button>
+      <button id="qwCancel" class="mini">取消</button>
+    </div>
+  </div>
+  <div class="admin-ai">
     <span class="lbl">数据备份</span>
     <a id="dbBackup" class="mini" href="#">下载完整备份</a>
     <span class="hint">把全部数据（所有账号的博主、微博、设置）下载一份，自己保存备份；中断可续传</span>
@@ -904,6 +933,7 @@ var selAllIds = [];               // 全选模式下获取的全部匹配 id
 var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
 var prevYuqueBusy = false;        // 归档批次是否在进行中，用于完成检测
 var schedCfg = {on: false, minutes: 60};   // 定时拉取配置（/api/state 下发）
+var quietCfg = {windows: [], inWindow: false};   // 自动拉取静默时段（全局，/api/state 下发，只读）
 var rfMeta = {};                  // uid -> {earliest, nickname}，重拉全量弹窗预填起始日期用
 var WEIBO_LAUNCH = new Date(2009, 7, 28);   // 微博上线日，作为"最早"兜底
 var authed = false;               // 是否已登录（未登录时跳过轮询，停在登录视图）
@@ -1305,9 +1335,21 @@ $('yuqueEditCancel').onclick = function(){
 };
 
 /* ── 定时拉取设置 ─────────────────────────── */
+function quietWinText(w){          // '22:00-06:00' -> '22:00 - 次日06:00'（跨午夜要说清，否则像填反了）
+  var p = w.split('-');
+  return p[0] + ' - ' + (p[0] > p[1] ? '次日' : '') + p[1];
+}
+function renderSchedQuiet(){
+  var has = quietCfg.windows.length > 0;
+  $('schedQuiet').style.display = has ? '' : 'none';
+  if(!has) return;
+  $('schedQuietList').textContent = quietCfg.windows.map(quietWinText).join('、');
+  $('schedQuietNow').style.display = quietCfg.inWindow ? '' : 'none';
+}
 function openSched(){
   $('schedOn').checked = schedCfg.on;
   $('schedMinutes').value = schedCfg.minutes;
+  renderSchedQuiet();
   $('schedModal').classList.add('show');
 }
 $('schedHeadBtn').onclick = openSched;
@@ -1627,7 +1669,10 @@ function renderTaskHints(updating, rd, rt, ybusy, yd, yt, bbusy, bd, bt){
   if(ybusy) h.push('语雀同步中：已处理 ' + yd + ' / ' + yt
     + '<button class="cancel-btn" data-cancel="sync" title="停止剩余同步，已归档的保留">取消</button>');
   if(bbusy) h.push('全部拉取中：已处理 ' + bd + ' / ' + bt);
-  $('taskHints').innerHTML = h.length ? '<span class="busy">' + h.join(' · ') + '</span>' : '';
+  var quiet = quietCfg.inWindow && quietCfg.windows.length
+    ? '自动拉取静默时段中（北京时间 ' + esc(quietCfg.windows.map(quietWinText).join('、')) + '），时段结束后自动接着跑' : '';
+  $('taskHints').innerHTML = (quiet ? '<span class="quiet">' + quiet + '</span>' : '')
+    + (h.length ? '<span class="busy">' + h.join(' · ') + '</span>' : '');
 }
 $('taskHints').addEventListener('click', function(e){
   var btn = e.target.closest('[data-cancel]');
@@ -1657,6 +1702,7 @@ function loadState(){
     applyMe();
     renderCookie(st.cookie_status);
     if(st.schedule) schedCfg = st.schedule;
+    quietCfg = {windows: st.stop_windows || [], inWindow: !!st.in_stop_window};
     renderBloggers(st.bloggers);
     renderChips(st.bloggers);
     for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒（一键批量时不逐条打扰）
@@ -2398,6 +2444,7 @@ function openAdmin(){
   loadAdminStats();
   loadAdminList();
   loadAiConfig();
+  loadQuietWindows();
 }
 function closeAdmin(){
   $('adminView').classList.remove('show');
@@ -2623,6 +2670,69 @@ $('aiSave').onclick = function(){
     if(!r.ok){ toast(r.error || '保存失败'); return; }
     toast(r.configured ? '已保存，AI 归档可用' : (r.note || '已保存'));
     loadAiConfig();
+  });
+};
+
+/* ── 管理后台：自动拉取静默时段（全局一份，改动即时对全站生效） ─────── */
+var qwWins = [];                  // [{start:'22:00', end:'06:00'}]，按北京时间
+
+function loadQuietWindows(){
+  fetchJson('/api/admin/stop_windows').then(function(r){
+    if(!r.ok) return;
+    qwWins = r.windows || [];
+    renderQuietWindows();
+  });
+}
+
+function renderQuietWindows(){
+  var list = $('qwList');
+  list.innerHTML = '';
+  if(!qwWins.length){
+    list.innerHTML = '<span class="hint">未设置：定时拉取全天都可能触发</span>';
+    $('qwForm').style.display = 'none';
+    return;
+  }
+  qwWins.forEach(function(w, i){
+    var row = document.createElement('div');
+    row.className = 'ai-row';
+    var nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = quietWinText(w.start + '-' + w.end);
+    row.appendChild(nm);
+    var acts = document.createElement('div');
+    acts.className = 'acts';
+    var del = document.createElement('button');
+    del.className = 'mini';
+    del.textContent = '删除';
+    del.onclick = function(){
+      post('/api/admin/stop_windows', {action: 'delete', index: i}).then(qwDone);
+    };
+    acts.appendChild(del);
+    row.appendChild(acts);
+    list.appendChild(row);
+  });
+}
+
+function qwDone(r){
+  if(!r.ok) toast(r.error || '操作失败');
+  loadQuietWindows();          // 成败都重拉：这份配置是全局的，可能已被别处改动
+}
+
+$('qwAdd').onclick = function(){
+  $('qwForm').style.display = '';
+  $('qwStart').value = '22:00';
+  $('qwEnd').value = '06:00';
+  $('qwStart').focus();
+};
+$('qwCancel').onclick = function(){ $('qwForm').style.display = 'none'; };
+$('qwSave').onclick = function(){
+  post('/api/admin/stop_windows',
+       {action: 'add', start: $('qwStart').value, end: $('qwEnd').value}).then(function(r){
+    if(!r.ok){ toast(r.error || '保存失败'); loadQuietWindows(); return; }
+    toast('已添加，对全站立即生效');
+    $('qwForm').style.display = 'none';
+    loadQuietWindows();
+    loadState();               // 顶栏提示与定时弹窗里那段说明跟着刷新
   });
 };
 
