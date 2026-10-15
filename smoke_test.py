@@ -2,6 +2,7 @@
 """进程内冒烟测试：灌测试数据 → 直接调 API 函数验证查询/筛选/删除/转义。
 多用户版（ADR-0010）：API 以 user 字典为首参，数据挂在测试账号名下，全程离线打桩。
 全程使用临时目录的独立数据库，绝不触碰真实 weibo.db（教训：2026-08-20 曾误删用户数据）。"""
+import json
 import os
 import sqlite3
 import sys
@@ -650,6 +651,90 @@ check('定时 配置落库', ws.sched_cfg(USER_ID) == (True, 60) and kv_last_is_
 check('定时 state 带配置', ws.api_state(USER)['schedule'] == {'on': True, 'minutes': 60})
 check('定时 关闭成功', ws.api_schedule(USER, {'on': False})['ok'] is True and ws.sched_cfg(USER_ID)[0] is False)
 check('定时 越界值夹回', (ws.ukv_set(USER_ID, 'sched_minutes', '5'), ws.sched_cfg(USER_ID)[1] == 30)[1])
+
+# 29b. 自动拉取静默时段（全局一份，ADR-0017）
+ws.kv_set('sched_stop_windows', '')
+check('静默 未配置不命中', ws.stop_windows() == [] and ws.in_stop_window() is False)
+check('静默 坏JSON容错', (ws.kv_set('sched_stop_windows', '｛坏数据'), ws.stop_windows() == [])[1])
+ws.kv_set('sched_stop_windows', json.dumps([{'start': 'abc', 'end': '06:00'},
+                                            {'start': '09:30', 'end': '09:30'},
+                                            '不是对象', {'start': '14:00', 'end': '15:00'}]))
+check('静默 读取跳过坏段', [w['start'] for w in ws.stop_windows()] == ['14:00'])
+r = ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '22:00', 'end': '06:00'})
+check('静默 坏数据上加一段被清洗', r['ok'] and [w['start'] for w in r['windows']] == ['14:00', '22:00'])
+p = ws.stop_windows()
+check('静默 顺序段边界', ws.stop_windows_hit(p, 14 * 60) and not ws.stop_windows_hit(p, 15 * 60)
+      and not ws.stop_windows_hit(p, 13 * 60 + 59))
+cross = [w for w in p if w['start'] == '22:00'][0]
+check('静默 跨午夜命中', ws.stop_windows_hit([cross], 23 * 60) and ws.stop_windows_hit([cross], 3 * 60)
+      and ws.stop_windows_hit([cross], 22 * 60))
+check('静默 跨午夜不命中', not ws.stop_windows_hit([cross], 6 * 60)
+      and not ws.stop_windows_hit([cross], 21 * 60 + 59))
+check('静默 起止相同拒绝', ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '00:00', 'end': '00:00'})['ok'] is False)
+check('静默 缺一半拒绝', ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '08:00'})['ok'] is False)
+check('静默 格式非法拒绝', ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '8点', 'end': '09:00'})['ok'] is False)
+check('静默 取值非法拒绝', ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '24:00', 'end': '01:00'})['ok'] is False)
+check('静默 未知操作拒绝', ws.api_admin_stop_windows(USER, {'action': 'toggle', 'index': 0})['ok'] is False)
+for _i in range(3):
+    ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '%02d:00' % (1 + _i), 'end': '0%d:30' % (_i + 2)})
+check('静默 满5段', len(ws.stop_windows()) == ws.STOP_WINDOW_MAX)
+check('静默 第6段拒绝', ws.api_admin_stop_windows(USER, {'action': 'add', 'start': '13:00', 'end': '13:30'})['ok'] is False)
+check('静默 删除越界拒绝', ws.api_admin_stop_windows(USER, {'action': 'delete', 'index': 99})['ok'] is False)
+check('静默 删一段成功', ws.api_admin_stop_windows(USER, {'action': 'delete', 'index': 0})['ok']
+      and len(ws.stop_windows()) == 4)
+st = ws.api_state(USER)
+check('静默 state 下发', st['stop_windows'] == ['%s-%s' % (w['start'], w['end']) for w in ws.stop_windows()]
+      and isinstance(st['in_stop_window'], bool))
+check('静默 读配置接口', ws.api_admin_stop_windows(USER)['ok'] and len(ws.api_admin_stop_windows(USER)['windows']) == 4)
+
+# 时段内只叫停定时那一轮，手动的不打断
+ws.kv_set('sched_stop_windows', '[]')
+ws.db("DELETE FROM bloggers WHERE user_id=?", (USER_ID,))
+for _u, _n in (('888888', 'B'), ('999999', 'C')):
+    ws.db('INSERT INTO bloggers(user_id,uid,nickname,state,note,created_at) VALUES(?,?,?,?,?,?)',
+          (USER_ID, _u, _n, 'done', '', '2026-08-19 00:00:00'))
+ws.TASKQ.clear()
+ws.AUTO.clear()
+ws.enqueue(USER_ID, '888888', 'full', auto=True)
+ws.enqueue(USER_ID, '999999', 'incr')
+check('静默 定时入队记名', (USER_ID, '888888') in ws.AUTO and (USER_ID, '999999') not in ws.AUTO)
+ws.quiet_interrupt()
+_row_b = ws.db('SELECT state, note, next_page FROM bloggers WHERE user_id=? AND uid=?', (USER_ID, '888888')).fetchone()
+check('静默 排队的定时任务出队落暂停', all(t[1] != '888888' for t in ws.TASKQ)
+      and _row_b['state'] == 'paused' and '静默暂停' in _row_b['note'] and _row_b['next_page'] == 1)
+check('静默 手动任务不受影响', any(t[1] == '999999' for t in ws.TASKQ)
+      and (USER_ID, '999999') not in ws.QUIET)
+# 正在跑（已出队、STOP 里有事件）：置事件 + 记 QUIET，由 run_sync 落到静默暂停
+ws.TASKQ.clear()
+ws.AUTO.clear()
+ws.AUTO.add((USER_ID, '888888'))
+ev = ws.STOP.setdefault((USER_ID, '888888'), ws.threading.Event())
+ws.quiet_interrupt()
+check('静默 在跑的置静默暂停标记', (USER_ID, '888888') in ws.QUIET and ev.is_set())
+ws.TASKQ.clear()
+ws.AUTO.clear()
+ws.QUIET.clear()
+ws.STOP.clear()
+ws.db('DELETE FROM bloggers WHERE user_id=? AND uid=?', (USER_ID, '999999'))
+# 到点撞上时段：不触发、也不刷时间；时段结束后下一轮自然补跑（顺延语义）
+_real_quiet = ws.in_stop_window
+ws.ukv_set(USER_ID, 'sched_on', '1')
+ws.ukv_set(USER_ID, 'sched_minutes', '60')
+ws.ukv_set(USER_ID, 'cookie', 'test-cookie')
+ws.ukv_set(USER_ID, 'sched_last', '100')          # 远古时间：早已超过间隔
+ws.in_stop_window = lambda: True
+ws.schedule_once()
+check('静默 到点不触发也不刷时间', len(ws.TASKQ) == 0 and ws.ukv_get(USER_ID, 'sched_last') == '100')
+ws.in_stop_window = _real_quiet
+ws.schedule_once()
+check('静默 时段结束后当轮补跑', [t[1] for t in ws.TASKQ] == ['888888']
+      and (USER_ID, '888888') in ws.AUTO and float(ws.ukv_get(USER_ID, 'sched_last')) > 100)
+ws.TASKQ.clear()
+ws.AUTO.clear()
+ws.ukv_set(USER_ID, 'sched_on', '0')
+ws.ukv_set(USER_ID, 'cookie', '')
+ws.db("UPDATE bloggers SET state='done', note='', next_page=NULL WHERE user_id=? AND uid='888888'", (USER_ID,))
+ws.kv_set('sched_stop_windows', '[]')
 
 check('文档链接解析', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1') == ('acc/book', 'slug1'))
 check('文档链接带参数', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1?a=1') == ('acc/book', 'slug1'))
