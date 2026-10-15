@@ -72,6 +72,8 @@ SEED_NAME = 'seed.db'            # 迁移播种库：恢复时优先于快照、
 
 SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
+STOP_WINDOW_MAX = 5              # 静默时段最多几段（再多多半是配错了，且弹窗放不下）
+BJ_TZ_OFFSET = 8 * 3600          # 静默时段一律按北京时间判断：用 epoch 偏移算，不依赖容器 TZ 是否生效
 
 API_BASE = 'https://m.weibo.cn'
 PAGE_COUNT = 50                 # 列表接口每页条数（上限 100）
@@ -684,6 +686,8 @@ TASKQ = deque()          # 元素 (user_id, uid, mode)
 Q_COND = threading.Condition()
 STOP = {}            # (user_id, uid) -> Event，置位表示请求暂停/取消当前任务
 CANCEL = set()        # 已请求「取消」的博主（区别于暂停：取消→保留数据、丢弃断点）
+AUTO = set()          # 本轮由定时触发（排队或正在跑）的博主：静默时段只叫停这些，手动的不打断
+QUIET = set()         # 因静默时段被叫停的博主：状态文案要与用户自己按的暂停区分开
 
 
 def set_blogger(user_id, uid, **fields):
@@ -694,8 +698,8 @@ def set_blogger(user_id, uid, **fields):
        tuple(fields.values()) + (user_id, uid))
 
 
-def enqueue(user_id, uid, mode):
-    """mode: 'full'（全量/续爬）或 'incr'（增量）；已在队列/拉取中则忽略"""
+def enqueue(user_id, uid, mode, auto=False):
+    """mode: 'full'（全量/续爬）或 'incr'（增量）；已在队列/拉取中则忽略。auto=True 表示由定时触发"""
     # 检查与入队必须同一把锁：并发请求都过了状态检查再先后入队，会两路拉同一页撞博文主键
     with Q_COND:
         if any(t[:2] == (user_id, uid) for t in TASKQ):
@@ -706,6 +710,8 @@ def enqueue(user_id, uid, mode):
         if row['state'] in ('queued', 'fulling'):
             return False
         TASKQ.append((user_id, uid, mode))
+        if auto:
+            AUTO.add((user_id, uid))
         set_blogger(user_id, uid, state='queued', note='排队中，等待开始')
         Q_COND.notify()
     return True
@@ -728,6 +734,9 @@ def purge_user_tasks(user_id):
     for key, ev in list(STOP.items()):
         if key[0] == user_id:
             ev.set()
+    for key in [k for k in AUTO | QUIET if k[0] == user_id]:
+        AUTO.discard(key)
+        QUIET.discard(key)
 
 
 def upsert_post(user_id, session, uid, mb, force=False, full=False):
@@ -826,6 +835,9 @@ def run_sync(user_id, uid, mode):
             CANCEL.discard(key)
             set_blogger(user_id, uid, state='done', next_page=None, pull_from=0,
                         note='已取消，保留已拉取数据', last_synced_at=now_str())
+        elif key in QUIET:
+            set_blogger(user_id, uid, state='paused', note='静默暂停，时段结束后自动继续',
+                        next_page=mode == 'full' and page or None)
         else:
             set_blogger(user_id, uid, state='paused', note='%s%s已暂停，点击继续接着拉' % (label, start_hint),
                         next_page=mode == 'full' and page or None)
@@ -974,6 +986,72 @@ def cookie_watcher():
                 pass                  # 网络抖动等：保持原状，下轮再试
 
 
+def _hm(value):
+    """'HH:MM' -> 当天第几分钟；格式或取值非法返回 None"""
+    m = re.match(r'^(\d{1,2}):(\d{2})$', str(value or '').strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return None if (h > 23 or mi > 59) else h * 60 + mi
+
+
+def bj_minutes():
+    """此刻是北京时间当天的第几分钟：epoch 直接偏移，容器 TZ 没生效也算得对"""
+    t = time.gmtime(time.time() + BJ_TZ_OFFSET)
+    return t.tm_hour * 60 + t.tm_min
+
+
+def stop_windows():
+    """全局静默时段（管理员配一份，对全站用户的定时拉取生效）：[{'start','end',...}]，按北京时间。
+    读取容错：坏段、起止相同的段跳过，其余照用"""
+    try:
+        raw = json.loads(kv_get('sched_stop_windows') or '[]')
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for w in raw if isinstance(raw, list) else []:
+        if not isinstance(w, dict):
+            continue
+        s, e = _hm(w.get('start')), _hm(w.get('end'))
+        if s is None or e is None or s == e:
+            continue
+        out.append({'start': '%02d:%02d' % (s // 60, s % 60),
+                    'end': '%02d:%02d' % (e // 60, e % 60), 's': s, 'e': e})
+    return out
+
+
+def stop_windows_hit(wins, m):
+    """给定静默时段列表与「北京时间当天第几分钟」，是否命中任一段（重叠段天然按并集生效）"""
+    for w in wins:
+        if w['s'] < w['e']:
+            if w['s'] <= m < w['e']:
+                return True
+        elif m >= w['s'] or m < w['e']:      # start>end 即跨午夜：当天 start 至次日 end
+            return True
+    return False
+
+
+def in_stop_window():
+    """此刻是否落在某个静默时段内。时间基准固定东八区（BJ_TZ_OFFSET），不依赖容器 TZ 是否生效"""
+    return stop_windows_hit(stop_windows(), bj_minutes())
+
+
+def quiet_interrupt():
+    """静默时段内叫停定时那一轮：还在排队的直接出队、正在跑的置暂停事件，都保留断点。
+    手动发起的拉取不在 AUTO 里，一律不打断"""
+    with Q_COND:
+        for i in range(len(TASKQ) - 1, -1, -1):
+            uu, u, mode = TASKQ[i]
+            if (uu, u) in AUTO:
+                del TASKQ[i]
+                AUTO.discard((uu, u))
+                set_blogger(uu, u, state='paused', note='静默暂停，时段结束后自动继续',
+                            next_page=mode == 'full' and 1 or None)
+    for key in list(AUTO):                    # 剩下的正在跑：等它在下个检查点自行落到静默暂停
+        QUIET.add(key)
+        STOP.setdefault(key, threading.Event()).set()
+
+
 def sched_cfg(user_id):
     """某用户的定时拉取配置：开关 + 间隔（分钟，越界自动夹回 30~1440）"""
     try:
@@ -983,16 +1061,16 @@ def sched_cfg(user_id):
     return ukv_get(user_id, 'sched_on') == '1', min(max(minutes, SCHED_MIN_MINUTES), SCHED_MAX_MINUTES)
 
 
-def enqueue_all(user_id):
+def enqueue_all(user_id, auto=False):
     """一键全部拉取的入队规则：逐个博主入队（有未完成全量的续拉，否则增量），在拉/排队的跳过。
-    返回 (实际入队的 uid 列表, 跳过数)。手动一键与定时触发共用。"""
+    返回 (实际入队的 uid 列表, 跳过数)。手动一键与定时触发共用；auto=True 表示这一轮由定时触发"""
     started, skipped = [], 0
     for r in db('SELECT uid, state, next_page FROM bloggers WHERE user_id=? '
                 'ORDER BY sort_order, created_at, rowid', (user_id,)).fetchall():
         if r['state'] in ('queued', 'fulling'):
             skipped += 1
             continue
-        enqueue(user_id, r['uid'], 'full' if r['next_page'] else 'incr')
+        enqueue(user_id, r['uid'], 'full' if r['next_page'] else 'incr', auto)
         started.append(r['uid'])
     return started, skipped
 
@@ -1000,27 +1078,36 @@ def enqueue_all(user_id):
 _LAST_PURGE = ''      # 上次过期清理的日期（注销超期账号 + 过期会话，每天一次）
 
 
+def schedule_once():
+    """定时调度的一个节拍：每日过期清理 + 逐用户到点触发 + 静默时段叫停。单独成函数便于测试"""
+    global _LAST_PURGE
+    today = datetime.date.today().isoformat()
+    if today != _LAST_PURGE:
+        _LAST_PURGE = today
+        purge_stale_users()
+    quiet = in_stop_window()
+    if quiet:
+        quiet_interrupt()                 # 时段中途新增/改短也要响应，故每轮都叫停一次
+    for u in db('SELECT id FROM users WHERE disabled=0 AND deactivated_at=0').fetchall():
+        user_id = u['id']
+        on, minutes = sched_cfg(user_id)
+        if not on or quiet:
+            continue                      # 静默时段：不触发也不刷时间，时段结束后自然补跑
+        if time.time() - float(ukv_get(user_id, 'sched_last') or 0) < minutes * 60:
+            continue
+        ukv_set(user_id, 'sched_last', str(int(time.time())))   # 先落时间再入队，防重复触发
+        if ukv_get(user_id, 'cookie'):                          # 没登录信息就不入队，等下个间隔
+            enqueue_all(user_id, auto=True)
+
+
 def schedule_worker():
     """定时拉取：按用户各算各的周期，到点按一键全部拉取规则跑一轮；上次执行时间落库，
-    工具重启后发现已超间隔会在首轮循环自然补跑一次（只补一次）"""
-    global _LAST_PURGE
+    工具重启后发现已超间隔会在首轮循环自然补跑一次（只补一次）。
+    静默时段内既不触发也不刷时间，时段结束后靠同一套「超间隔自然补跑」机制接上"""
     while True:
         time.sleep(20)
         try:
-            today = datetime.date.today().isoformat()
-            if today != _LAST_PURGE:
-                _LAST_PURGE = today
-                purge_stale_users()
-            for u in db('SELECT id FROM users WHERE disabled=0 AND deactivated_at=0').fetchall():
-                user_id = u['id']
-                on, minutes = sched_cfg(user_id)
-                if not on:
-                    continue
-                if time.time() - float(ukv_get(user_id, 'sched_last') or 0) < minutes * 60:
-                    continue
-                ukv_set(user_id, 'sched_last', str(int(time.time())))   # 先落时间再入队，防重复触发
-                if ukv_get(user_id, 'cookie'):                          # 没登录信息就不入队，等下个间隔
-                    enqueue_all(user_id)
+            schedule_once()
         except Exception:
             pass                  # 兜底：调度线程不能死
 
@@ -1472,10 +1559,14 @@ def sync_worker():
             while not TASKQ:
                 Q_COND.wait()
             user_id, uid, mode = TASKQ.popleft()
+        key = (user_id, uid)
         try:
             run_sync(user_id, uid, mode)
         except Exception as e:  # noqa: BLE001 —— 兜底：任何异常都要落到人话状态，不能卡死队列
             set_blogger(user_id, uid, state='error', note='拉取出错：%s' % e)
+        finally:
+            AUTO.discard(key)       # 跑完即不再是「定时那一轮」，下个静默时段不该再叫停它
+            QUIET.discard(key)
 
 
 # ---------------------------------------------------------------- API ----
@@ -1507,10 +1598,13 @@ def api_state(user):
     bloggers = blogger_rows(user_id)
     busy = any(b['state'] in ('queued', 'fulling') for b in bloggers)
     on, minutes = sched_cfg(user_id)
+    wins = stop_windows()
     rp, sp = refresh_prog(user_id), sync_prog(user_id)
     return {'ok': True, 'cookie_status': cookie_status, 'cookie_set': bool(ukv_get(user_id, 'cookie')),
             'bloggers': bloggers, 'busy': busy,
             'schedule': {'on': on, 'minutes': minutes},
+            'stop_windows': ['%s-%s' % (w['start'], w['end']) for w in wins],
+            'in_stop_window': stop_windows_hit(wins, bj_minutes()),
             'refresh_total': rp['total'], 'refresh_done': rp['done'],
             'yuque_total': sp['total'], 'yuque_done': sp['done'], 'yuque_msg': sp['msg'],
             'user': _user_public(user)}
@@ -2477,6 +2571,41 @@ def api_admin_ai_config_save(user, body):
     return out
 
 
+def api_admin_stop_windows(user, body=None):
+    """静默时段管理（全局一份，对所有用户的定时拉取生效）：action = add / delete；
+    不带 body 即读取当前配置。写入严格校验，读取（stop_windows）另有容错"""
+    wins = stop_windows()
+    if not body:
+        return {'ok': True, 'windows': [{'start': w['start'], 'end': w['end']} for w in wins],
+                'in_stop_window': stop_windows_hit(wins, bj_minutes())}
+    action = (body.get('action') or '').strip()
+
+    if action == 'add':
+        if len(wins) >= STOP_WINDOW_MAX:
+            return {'ok': False, 'error': '最多 %d 段，先删掉一段再加' % STOP_WINDOW_MAX}
+        s, e = _hm(body.get('start')), _hm(body.get('end'))
+        if s is None or e is None:
+            return {'ok': False, 'error': '开始和结束时间都要填，格式如 22:00'}
+        if s == e:
+            return {'ok': False, 'error': '起止时间相同等于全天不拉，请直接关掉定时拉取'}
+        wins.append({'start': '%02d:%02d' % (s // 60, s % 60),
+                     'end': '%02d:%02d' % (e // 60, e % 60), 's': s, 'e': e})
+    elif action == 'delete':
+        try:
+            i = int(body.get('index', -1))
+        except (TypeError, ValueError):
+            i = -1
+        if not (0 <= i < len(wins)):
+            return {'ok': False, 'error': '这一段已不存在，请刷新后重试'}
+        wins.pop(i)
+    else:
+        return {'ok': False, 'error': '未知操作'}
+    kv_set('sched_stop_windows', json.dumps(
+        [{'start': w['start'], 'end': w['end']} for w in wins], ensure_ascii=False))
+    return {'ok': True, 'windows': [{'start': w['start'], 'end': w['end']} for w in wins],
+            'in_stop_window': stop_windows_hit(wins, bj_minutes())}
+
+
 # -------------------------------------------------------------- HTTP ----
 COOKIE_NAME = 'wb_session'
 
@@ -2628,6 +2757,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/ai_config':
                 if self._admin(user):
                     self._json(api_admin_ai_config(user))
+            elif path == '/api/admin/stop_windows':
+                if self._admin(user):
+                    self._json(api_admin_stop_windows(user))
             elif path == '/api/admin/db_backup':
                 if self._admin(user):
                     ticket = urllib.parse.parse_qs(qs).get('ticket', [''])[0]
@@ -2728,6 +2860,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/ai_config':
                 if self._admin(user):
                     self._json(api_admin_ai_config_save(user, body))
+            elif path == '/api/admin/stop_windows':
+                if self._admin(user):
+                    self._json(api_admin_stop_windows(user, body))
             elif path == '/api/admin/snapshot':
                 if self._admin(user):
                     self._json(api_admin_snapshot(user))
