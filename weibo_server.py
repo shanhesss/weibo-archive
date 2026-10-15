@@ -1117,7 +1117,8 @@ def clear_arch_state(user_id=None):
     if user_id is None:
         db("UPDATE posts SET arch_state='' WHERE arch_state IN ('syncing','updating')")
     else:
-        clear_arch_state(user_id)
+        db("UPDATE posts SET arch_state='' WHERE user_id=? AND arch_state IN ('syncing','updating')",
+           (user_id,))
 
 
 def validate_yuque_dir(url):
@@ -1418,9 +1419,8 @@ def run_archive(user_id, ids, token, cfgs):
         prog['failed'] += len(reasons)
         if reasons:
             prog['reasons'] = (prog['reasons'] + reasons)[:5]
-    if cancelled:                            # 用户取消：清标记、清掉没跑到的瞬态、收尾
-        SYNC_CANCEL.discard(user_id)
-        clear_arch_state(user_id)
+    if cancelled:                            # 用户取消：清标记收尾（没跑到的瞬态已由取消接口当场落态，
+        SYNC_CANCEL.discard(user_id)         # 这里不再整批清，免得误抹掉取消后又新入队那批的「同步中」）
         prog['msg'] = '已取消：已归档 %d 条，其余未同步' % (created + updated)
         prog['done'] = prog['total']
         return
@@ -1792,7 +1792,8 @@ def api_update_cancel(user, body=None):
 
 
 def api_yuque_cancel(user, body=None):
-    """取消正在进行的语雀同步：清排队、停新任务、清掉没跑到的「同步中」瞬态"""
+    """取消正在进行的语雀同步：停新任务、清排队，没跑到的当场落「同步失败（已取消）」可重试；
+    在途那几条（批内最多 2 路）中断不掉，跑完后按真实结果写回 —— 成功即已归档，失败记真因"""
     user_id = user['id']
     with SYNC_COND:
         SYNC_CANCEL.add(user_id)
@@ -1800,11 +1801,13 @@ def api_yuque_cancel(user, body=None):
             if SYNC_QUEUE[i][0] == user_id:
                 del SYNC_QUEUE[i]
         SYNC_COND.notify_all()
-    clear_arch_state(user_id)
+    cur = db("UPDATE posts SET arch_state='', arch_fail=? "
+             "WHERE user_id=? AND arch_state IN ('syncing','updating')",
+             (CANCELLED_MSG, user_id))
     prog = sync_prog(user_id)
     prog['total'] = prog['done'] = 0
-    prog['msg'] = '已取消'
-    return {'ok': True}
+    prog['msg'] = '已取消：%d 条没同步' % cur.rowcount if cur.rowcount else '已取消'
+    return {'ok': True, 'cancelled': cur.rowcount}
 
 
 def api_blogger_yuque_dir(user, body):
@@ -1989,7 +1992,7 @@ def yuque_mount_doc(namespace, folder_slug, doc_slug, token):
                    {'action': 'appendNode', 'action_mode': 'child',
                     'target_uuid': target.get('uuid'), 'node_uuid': docnode.get('uuid')})
         return True
-    except ApiError:
+    except Exception:  # noqa: BLE001 —— 含响应形状意外（如 toc 不是列表）：文档已建好，不该因此判归档失败
         return False
 
 

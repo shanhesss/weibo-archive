@@ -1633,9 +1633,9 @@ $('taskHints').addEventListener('click', function(e){
   var btn = e.target.closest('[data-cancel]');
   if(!btn) return;
   post('/api/' + (btn.dataset.cancel === 'update' ? 'update/cancel' : 'yuque/cancel'), {}).then(function(r){
-    if(r.ok) toast('已取消');
-    loadState();
-  });
+    if(r.ok) toast('已取消'); else toast(r.error || '取消失败');
+    loadState(); loadPosts();          // 卡片上的「同步中…」要当场变回可重试，光刷状态不够
+  }).catch(function(){ toast('取消失败：网络异常'); });
 });
 function applyMe(){
   if(!me) return;

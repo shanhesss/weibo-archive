@@ -381,6 +381,64 @@ check('占位符替换为全文',
 _filled = ws._fill_body('正文没给占位', '全文')
 check('缺占位兜底追加章节', _filled.endswith('## 微博正文\n\n全文') and _filled.startswith('正文没给占位'))
 
+# 22g. 批次内死源拉黑（ADR-0015）：连不上的一家本批次后续条目不再重复等超时
+_pool = [{'name': '主用'}, {'name': '备用'}]
+_tries = []
+def _fake_timeout(prompt, c):
+    _tries.append(c['name'])
+    if c['name'] == '主用':
+        raise ws.AiTransportError('连接 AI 服务失败：timed out')
+    return 'TITLE: 标题\nBODY: 正文'
+ws._ai_complete = _fake_timeout
+_dead = set()
+ws._ai_generate('p', _pool, _dead)
+ws._ai_generate('p', _pool, _dead)
+check('首条两家都试、后续条目跳过死源', _tries == ['主用', '备用', '备用'] and 0 in _dead)
+ws._ai_complete = lambda prompt, c: 'TITLE: 只有标题没有正文'
+try:
+    ws._ai_generate('p', _pool, set())
+    _err = None
+except ws.ApiError as e:
+    _err = e
+check('输出不合契约判为可重试', isinstance(_err, ws.AiFormatError))
+def _fake_502(prompt, c):
+    raise ws.AiTransportError('AI 服务请求失败（502）')
+ws._ai_complete = _fake_502
+try:
+    ws._ai_generate('p', _pool, set())
+    _err2 = None
+except ws.ApiError as e:
+    _err2 = e
+check('网关 5xx 全败判为不可重试', isinstance(_err2, ws.AiFormatError) is False)
+ws._ai_complete = _real_complete
+
+# 22h. 取消同步当场落态（clear_arch_state 曾无限递归：点取消没反应，还会把归档线程弄死）
+OTHER = 'u-other'
+ws.db("INSERT INTO posts(user_id,id,uid,bid,text,created_ts,reposts,comments,atts,"
+      "media_json,retweeted_json,raw_json,fetched_at) "
+      "VALUES(?,?,'1234567890','o1','别人的微博',0,0,0,0,'{}','','{}','')", (OTHER, 'o1'))
+ws.db("UPDATE posts SET arch_state='syncing' WHERE user_id IN (?,?)", (USER_ID, OTHER))
+r = ws.api_yuque_cancel(USER)
+mine = ws.db('SELECT arch_state, arch_fail FROM posts WHERE user_id=?', (USER_ID,)).fetchall()
+check('取消同步返回成功（不再抛递归异常）', r['ok'] is True)
+check('没跑到的当场落「同步失败（已取消）」',
+      mine and all(x['arch_state'] == '' and x['arch_fail'] == ws.CANCELLED_MSG for x in mine))
+check('取消不动别人的瞬态',
+      ws.db("SELECT arch_state FROM posts WHERE user_id=?", (OTHER,)).fetchone()['arch_state'] == 'syncing')
+ws.clear_arch_state(USER_ID)   # 只清本人，且不炸栈
+check('clear_arch_state 按人清理生效',
+      all(x['arch_state'] == '' for x in
+          ws.db('SELECT arch_state FROM posts WHERE user_id=?', (USER_ID,)).fetchall())
+      and ws.db("SELECT arch_state FROM posts WHERE user_id=?", (OTHER,)).fetchone()['arch_state'] == 'syncing')
+ws.db("UPDATE posts SET arch_fail='' WHERE user_id=?", (USER_ID,))
+ws.db("DELETE FROM posts WHERE user_id=?", (OTHER,))
+
+# 22i. 挂目录兜底：语雀返回形状意外也只当作「没挂上」，不能把已建好的文档判成同步失败
+_real_yq = ws._yuque_api
+ws._yuque_api = lambda *a, **k: ({'data': ['不是列表项']}, 200)
+check('挂目录遇意外形状返回未挂上不抛错', ws.yuque_mount_doc('a/b', 'c', 'd', 'tk') is False)
+ws._yuque_api = _real_yq
+
 # 22e. 数据库备份下载（断点续传）：200 全量 / Range 206 / 越界 416，临时副本用完即删
 import io as _io, email.message as _em
 def _dl(range_hdr=None):
