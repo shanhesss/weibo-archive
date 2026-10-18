@@ -26,4 +26,5 @@ echo "已生成云托管部署目录 $DIST/（只含代码 + Dockerfile，无 we
 ls -lh "$DIST"
 echo "下一步（本机已装并登录 cloudbase CLI；prod-xxxxxxxxxxxxxxxx 换成你的环境 ID）："
 echo "  printf 'n\ny\n' | cloudbase cloudrun deploy -e prod-xxxxxxxxxxxxxxxx -s weibo-archive \\"
-echo "    --source $DIST --port 8766 --min-num 1 --max-num 1 --force --wait"
+echo "    --source $DIST --port 8766 --force --wait"
+echo "  （不要带 --min-num/--max-num：副本数与运行模式归控制台，命令行带上会覆盖，详见 deploy/cloudbase/README.md）"

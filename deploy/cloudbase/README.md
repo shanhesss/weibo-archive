@@ -50,11 +50,20 @@ CLI 侧（仓库根，git-bash）：
 ```bash
 bash deploy/pack.sh                      # 产出 cloudbase-dist/（代码 + Dockerfile，无库）
 printf 'n\ny\n' | cloudbase cloudrun deploy -e prod-xxxxxxxxxxxxxxxx -s weibo-archive \
-  --source cloudbase-dist --port 8766 --min-num 1 --max-num 1 --force --wait
+  --source cloudbase-dist --port 8766 --force --wait
 ```
 
 > `printf 'n\ny\n'` 是应答 CLI 的两个交互提示（不切流量 / 确认覆盖进行中的部署）；
 > `--force` 并不会跳过它们。
+>
+> ⚠️ **部署命令不要带 `--min-num/--max-num`**：副本数与运行模式归控制台管
+> （现在是「自定义 + 定时扩缩容」：08:00-21:59 常驻 1 实例，其余时间最小 0），
+> 命令行带上这两个参数会覆盖控制台设置。改完部署后用
+> `cloudbase cloudrun detail -e <环境ID> -s weibo-archive` 复核 `MinNum/MaxNum` 没被动过。
+>
+> 最小实例为 0 的含义：夜间实例被回收 → 定时拉取与 cookie 复验都不跑（比应用内静默时段更彻底），
+> 早上第一个请求会触发冷启动（含从挂载盘拷回整库，几秒到十几秒），随后调度线程发现「已超过间隔」
+> 自然补跑一轮。代价换空闲时段不计费；平台侧对「定时任务靠外部请求维持」的告诫见 ADR-0018。
 
 ## 数据迁移（把已有库播种进快照通道）
 
@@ -79,11 +88,13 @@ printf 'n\ny\n' | cloudbase cloudrun deploy -e prod-xxxxxxxxxxxxxxxx -s weibo-ar
 ```bash
 bash deploy/pack.sh
 printf 'n\ny\n' | cloudbase cloudrun deploy -e prod-xxxxxxxxxxxxxxxx -s weibo-archive \
-  --source cloudbase-dist --port 8766 --min-num 1 --max-num 1 --force --wait
+  --source cloudbase-dist --port 8766 --force --wait
 ```
 
+- **不带 `--min-num/--max-num`**（同上：副本与运行模式归控制台，命令行带上会覆盖）。
 - 旧实例收到停止信号时会**自动做最后一次快照**（SIGTERM 处理器），丢失窗口≈0；
   想更保险可在部署前于登录后 curl 一次 `POST /api/admin/snapshot`（管理员）。
+  最小实例为 0 时实例还会因「空闲 30 分钟」被回收，同样走停止信号快照，语义一致。
 - 回滚 = 用上一版代码再部署一次（数据始终在挂载盘，不动）。控制台也有版本/流量切换。
 
 ## 访问入口（共享域名 `/weibo` 子路径）
