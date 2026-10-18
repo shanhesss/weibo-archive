@@ -731,9 +731,23 @@ check('静默 时段结束后当轮补跑', [t[1] for t in ws.TASKQ] == ['888888
       and (USER_ID, '888888') in ws.AUTO and float(ws.ukv_get(USER_ID, 'sched_last')) > 100)
 ws.TASKQ.clear()
 ws.AUTO.clear()
+ws.db("UPDATE bloggers SET state='done', note='', next_page=NULL WHERE user_id=?", (USER_ID,))
+# 时段内连 cookie 复验也不打微博接口（它同样是拿小号真发一次请求）
+_vc = ws.validate_cookie
+_vq = ws.in_stop_window
+_calls = []
+ws.validate_cookie = lambda s: (_calls.append(1), True)[1]
+ws.ukv_set(USER_ID, 'cookie', 'test-cookie')
+ws.in_stop_window = lambda: True          # 用桩固定「在时段内」，避免用例随真实时刻飘
+ws.cookie_check_once()
+check('静默 cookie 复验不打接口', _calls == [])
+ws.in_stop_window = lambda: False
+ws.cookie_check_once()
+check('非静默 cookie 复验照跑', len(_calls) >= 1 and ws.ukv_get(USER_ID, 'cookie_status') == 'ok')
+ws.validate_cookie = _vc
+ws.in_stop_window = _vq
 ws.ukv_set(USER_ID, 'sched_on', '0')
 ws.ukv_set(USER_ID, 'cookie', '')
-ws.db("UPDATE bloggers SET state='done', note='', next_page=NULL WHERE user_id=? AND uid='888888'", (USER_ID,))
 ws.kv_set('sched_stop_windows', '[]')
 
 check('文档链接解析', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1') == ('acc/book', 'slug1'))

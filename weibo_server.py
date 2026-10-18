@@ -961,29 +961,39 @@ def run_sync(user_id, uid, mode):
 COOKIE_CHECK_INTERVAL = 300        # 后台每几分钟复验一次 cookie
 
 
+def cookie_check_once():
+    """复验一轮各用户的 cookie：真失效就把状态翻成过期，前端轮询会自动看到。
+    静默时段内整轮跳过 —— 它也是拿小号真打一次微博接口，属于「这段时间不该有微博请求」"""
+    if in_stop_window():
+        return
+    for u in db('SELECT id FROM users WHERE disabled=0 AND deactivated_at=0').fetchall():
+        user_id = u['id']
+        try:
+            if not ukv_get(user_id, 'cookie'):
+                continue
+            if db("SELECT 1 FROM bloggers WHERE user_id=? AND state IN ('queued','fulling')",
+                  (user_id,)).fetchone():
+                continue          # 正在拉取就交给拉取流程去更新，不抢请求
+            ok = validate_cookie(MSession(user_id))
+            if ok:
+                ukv_set(user_id, 'cookie_status', 'ok')
+            elif ok is False:
+                mark_cookie_expired(user_id)
+        except CookieExpired:
+            mark_cookie_expired(user_id)
+        except Blocked:
+            ukv_set(user_id, 'cookie_status', 'limited')
+        except Exception:
+            pass                  # 网络抖动等：保持原状，下轮再试
+
+
 def cookie_watcher():
-    """后台定期验证各用户的 cookie：真失效就把状态翻成过期，前端轮询会自动看到"""
     while True:
         time.sleep(COOKIE_CHECK_INTERVAL)
-        for u in db('SELECT id FROM users WHERE disabled=0 AND deactivated_at=0').fetchall():
-            user_id = u['id']
-            try:
-                if not ukv_get(user_id, 'cookie'):
-                    continue
-                if db("SELECT 1 FROM bloggers WHERE user_id=? AND state IN ('queued','fulling')",
-                      (user_id,)).fetchone():
-                    continue          # 正在拉取就交给拉取流程去更新，不抢请求
-                ok = validate_cookie(MSession(user_id))
-                if ok:
-                    ukv_set(user_id, 'cookie_status', 'ok')
-                elif ok is False:
-                    mark_cookie_expired(user_id)
-            except CookieExpired:
-                mark_cookie_expired(user_id)
-            except Blocked:
-                ukv_set(user_id, 'cookie_status', 'limited')
-            except Exception:
-                pass                  # 网络抖动等：保持原状，下轮再试
+        try:
+            cookie_check_once()
+        except Exception:
+            pass                  # 兜底：看门狗线程不能死
 
 
 def _hm(value):
