@@ -312,6 +312,8 @@ _real_db, _real_cos = ws.DB_PATH, ws.COS_DIR
 _cos = _tf.mkdtemp(prefix='wb-cos-')
 _dbp = os.path.join(_cos, 'run', 'weibo.db')
 ws.COS_DIR, ws.DB_PATH = _cos, _dbp
+_mounted = ws.cos_mounted
+ws.cos_mounted = lambda: True      # 本段测的是「挂载已就绪」下的恢复语义：临时目录当作已挂载盘（ADR-0018 后普通目录会被判未就绪）
 open(os.path.join(_cos, 'weibo.db'), 'wb').write(b'SNAP')
 open(os.path.join(_cos, 'seed.db'), 'wb').write(b'SEED')
 ws.cos_restore()
@@ -331,8 +333,7 @@ ws.cos_restore()
 check('两处皆无则跳过不报错', not os.path.exists(_dbp))
 _shutil.rmtree(_cos, ignore_errors=True)
 ws.DB_PATH, ws.COS_DIR = _real_db, _real_cos
-ws.DB_PATH, ws.COS_DIR = _real_db, _real_cos
-_shutil.rmtree(_cos, ignore_errors=True)
+ws.cos_mounted = _mounted
 ws.db("UPDATE posts SET arch_state='' WHERE user_id=? AND id='a4'", (USER_ID,))
 
 # 22d. 主备降级（ADR-0013）：主用任何失败自动试下一家，整链失败才报错
@@ -749,6 +750,19 @@ ws.in_stop_window = _vq
 ws.ukv_set(USER_ID, 'sched_on', '0')
 ws.ukv_set(USER_ID, 'cookie', '')
 ws.kv_set('sched_stop_windows', '[]')
+
+# 29c. 云托管挂载就绪守卫（ADR-0018）：「挂载没就绪」绝不能当成「云端没有快照」
+_cos, _wait = ws.COS_DIR, ws.COS_MOUNT_WAIT
+_mnt = tempfile.mkdtemp(prefix='weibo_cos_')          # 普通目录 = 未挂载的挂载点
+ws.COS_DIR, ws.COS_MOUNT_WAIT = _mnt, 0               # 等待上限置 0，免测例真等 45 秒
+check('挂载 未就绪判否', ws.cos_mounted() is False)
+check('挂载 未就绪拒绝启动', ws.cos_restore() is False)
+r = ws.cos_snapshot()
+check('挂载 未就绪快照跳过且不落文件', r['ok'] is False and '未就绪' in r['error']
+      and not os.path.exists(os.path.join(_mnt, ws.SNAPSHOT_NAME)))
+ws.COS_DIR = ''
+check('挂载 本地形态照常起', ws.cos_restore() is True)
+ws.COS_DIR, ws.COS_MOUNT_WAIT = _cos, _wait
 
 check('文档链接解析', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1') == ('acc/book', 'slug1'))
 check('文档链接带参数', ws.parse_yuque_doc_url('https://www.yuque.com/acc/book/slug1?a=1') == ('acc/book', 'slug1'))

@@ -69,6 +69,10 @@ COS_DIR = os.environ.get('WEIBO_COS_DIR') or ''
 SNAPSHOT_INTERVAL = 300          # 快照周期（秒）：库有变更才真正上传
 SNAPSHOT_NAME = 'weibo.db'       # 挂载盘上的快照文件名
 SEED_NAME = 'seed.db'            # 迁移播种库：恢复时优先于快照、一次性消费（防被空库快照覆盖）
+# cosfs 是 FUSE 挂载，容器重启后挂载建立前挂载点表现为「空目录」——此时读不到快照
+# 不等于云端没有快照。启动必须等挂载就绪，等不到就拒绝启动（详见 ADR-0018）。
+COS_MOUNT_WAIT = 45              # 启动等挂载就绪的上限（秒）：再长会拖住部署健康检查
+COS_MOUNT_POLL = 3               # 轮询间隔（秒）
 
 SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
@@ -2889,14 +2893,53 @@ class Handler(BaseHTTPRequestHandler):
 # 形态（ADR-0011，闸门实测 2026-09-26）：运行库在容器本地盘（真 SQLite 语义），
 # 定期 / 部署前 / 收到停止信号时把库经 backup API 出快照，原子拷到挂载盘；
 # 新实例启动时若本地无库则从挂载盘拉回。未配 WEIBO_COS_DIR = 纯本地形态，全部跳过。
+def cos_mounted():
+    """挂载盘是否真的挂上了。cosfs（FUSE）挂载建立前，挂载点只是个空目录、与父目录同设备；
+    真挂上后 st_dev 不同。用它区分「还没挂上」与「云端确实没有快照」——两者以前长得一模一样。
+    两个信号取或：设备号不同 = 那路径上确实是另一个文件系统；/proc/mounts 命中 = 平台确实挂了。"""
+    try:
+        parent = os.path.dirname(COS_DIR.rstrip('/')) or '/'
+        if os.stat(COS_DIR).st_dev != os.stat(parent).st_dev:
+            return True
+    except OSError:
+        pass
+    try:
+        want = os.path.realpath(COS_DIR).rstrip('/')
+        with open('/proc/mounts') as f:
+            return any(len(p) > 1 and p[1].rstrip('/') == want for p in
+                       (line.split() for line in f))
+    except OSError:
+        return False
+
+
+def cos_wait_mount():
+    """等挂载建立就绪（最多 COS_MOUNT_WAIT 秒），返回是否就绪"""
+    waited = 0
+    while not cos_mounted():
+        if waited >= COS_MOUNT_WAIT:
+            return False
+        time.sleep(COS_MOUNT_POLL)
+        waited += COS_MOUNT_POLL
+    return True
+
+
 def cos_restore():
-    if not COS_DIR or os.path.exists(DB_PATH):
-        return
+    """云托管形态：启动时从挂载盘拉回库。返回 False = 挂载没就绪或快照拉取失败，
+    调用方必须拒绝启动 —— 带着空库起来，随后第一份快照就把云端真数据覆盖了（2026-10 实际丢过一次，ADR-0018）"""
+    if not COS_DIR:
+        return True
+    if not cos_wait_mount():
+        print('挂载盘 %s 在 %d 秒内未就绪，拒绝启动：此时读不到快照不代表云端没有，'
+              '起来会把云端数据覆盖成空库' % (COS_DIR, COS_MOUNT_WAIT))
+        return False
+    if os.path.exists(DB_PATH):
+        return True
     seed = os.path.join(COS_DIR, SEED_NAME)
     src = seed if os.path.exists(seed) else os.path.join(COS_DIR, SNAPSHOT_NAME)
     try:
         if not os.path.exists(src):
-            return
+            print('挂载已就绪、云端无快照：按新库启动（首次部署）')
+            return True
         os.makedirs(os.path.dirname(DB_PATH) or '.', exist_ok=True)
         tmp = DB_PATH + '.restoring'
         shutil.copyfile(src, tmp)
@@ -2907,8 +2950,10 @@ def cos_restore():
             except OSError:
                 pass
         print('已从云存储快照恢复库：%s（%d 字节）' % (src, os.path.getsize(DB_PATH)))
-    except Exception as e:  # noqa: BLE001 —— 恢复失败仍照常起（宁可空库也要保证服务起得来）
-        print('快照恢复失败，按新库启动：%s' % e)
+        return True
+    except Exception as e:  # noqa: BLE001 —— 拉不到就是拉不到，绝不能当「没有快照」继续起
+        print('快照恢复失败，拒绝启动：云端有快照却没拉成功，带空库起来会覆盖它（%s）' % e)
+        return False
 
 
 def db_change_sig():
@@ -2926,6 +2971,9 @@ def cos_snapshot():
     """backup API 出一致性快照（WAL 下安全）→ tmp+rename 原子落挂载盘"""
     if not COS_DIR:
         return {'ok': False, 'error': '未启用云存储挂载（WEIBO_COS_DIR 未设置）'}
+    if not cos_mounted():
+        # 挂载掉了/没建好时，写下去的这份会覆盖云端；本地库还在，等下一轮挂载就绪再写
+        return {'ok': False, 'error': '挂载盘未就绪，本次快照已跳过（写下去会覆盖云端数据）'}
     tmp = DB_PATH + '.snap'
     try:
         src = sqlite3.connect(DB_PATH)
@@ -2994,7 +3042,8 @@ def main():
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
-    cos_restore()               # 云托管形态：先从挂载盘拉回库，再走本地启动流程
+    if not cos_restore():         # 云托管形态：先从挂载盘拉回库，再走本地启动流程
+        sys.exit(1)               # 拉不到就退出，交给平台重启重试；带空库起来会覆盖云端那份真数据
     backup_db()                     # 先备份现有数据，再初始化
     init_db()
     # 工具重启：把上次没跑完的任务标记为「已暂停」，用户点继续即断点续爬
