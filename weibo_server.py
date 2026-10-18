@@ -73,6 +73,9 @@ SEED_NAME = 'seed.db'            # 迁移播种库：恢复时优先于快照、
 # 不等于云端没有快照。启动必须等挂载就绪，等不到就拒绝启动（详见 ADR-0018）。
 COS_MOUNT_WAIT = 45              # 启动等挂载就绪的上限（秒）：再长会拖住部署健康检查
 COS_MOUNT_POLL = 3               # 轮询间隔（秒）
+# 守卫本身的应急出口：万一判据在某个平台版本上误判（会把服务卡在起不来），
+# 控制台加环境变量 WEIBO_COS_MOUNT_GUARD=0 重启即可绕过。默认开，不是常规配置项。
+COS_MOUNT_GUARD = (os.environ.get('WEIBO_COS_MOUNT_GUARD') or '1') != '0'
 
 SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
@@ -2894,22 +2897,29 @@ class Handler(BaseHTTPRequestHandler):
 # 定期 / 部署前 / 收到停止信号时把库经 backup API 出快照，原子拷到挂载盘；
 # 新实例启动时若本地无库则从挂载盘拉回。未配 WEIBO_COS_DIR = 纯本地形态，全部跳过。
 def cos_mounted():
-    """挂载盘是否真的挂上了。cosfs（FUSE）挂载建立前，挂载点只是个空目录、与父目录同设备；
-    真挂上后 st_dev 不同。用它区分「还没挂上」与「云端确实没有快照」——两者以前长得一模一样。
-    两个信号取或：设备号不同 = 那路径上确实是另一个文件系统；/proc/mounts 命中 = 平台确实挂了。"""
+    """挂载盘是否真的挂上了。cosfs（FUSE）挂载建立前，挂载点只是个普通空目录，和运行库所在的
+    容器本地盘属于同一个文件系统；真挂上后是另一个设备。两个信号取或，任一命中即算就绪。
+    基准取运行库所在目录（本地盘），不取父目录：平台可能挂在 /mnt 而 WEIBO_COS_DIR 是
+    /mnt/weibo，比父目录会在生产上恒判「未就绪」把服务锁死。挂载点匹配同理必须走前缀。"""
     try:
-        parent = os.path.dirname(COS_DIR.rstrip('/')) or '/'
-        if os.stat(COS_DIR).st_dev != os.stat(parent).st_dev:
+        local = os.path.dirname(DB_PATH) or os.path.curdir
+        if os.stat(COS_DIR).st_dev != os.stat(os.path.abspath(local)).st_dev:
             return True
     except OSError:
         pass
     try:
         want = os.path.realpath(COS_DIR).rstrip('/')
         with open('/proc/mounts') as f:
-            return any(len(p) > 1 and p[1].rstrip('/') == want for p in
-                       (line.split() for line in f))
+            for line in f:
+                p = line.split()
+                if len(p) < 2:
+                    continue
+                mp = p[1].rstrip('/')
+                if mp and (want == mp or want.startswith(mp + '/')):
+                    return True
     except OSError:
-        return False
+        pass
+    return False
 
 
 def cos_wait_mount():
@@ -2928,7 +2938,9 @@ def cos_restore():
     调用方必须拒绝启动 —— 带着空库起来，随后第一份快照就把云端真数据覆盖了（2026-10 实际丢过一次，ADR-0018）"""
     if not COS_DIR:
         return True
-    if not cos_wait_mount():
+    if not COS_MOUNT_GUARD:
+        print('挂载就绪守卫已被 WEIBO_COS_MOUNT_GUARD=0 关闭：按挂载点当前内容直接判定')
+    elif not cos_wait_mount():
         print('挂载盘 %s 在 %d 秒内未就绪，拒绝启动：此时读不到快照不代表云端没有，'
               '起来会把云端数据覆盖成空库' % (COS_DIR, COS_MOUNT_WAIT))
         return False
@@ -2971,7 +2983,7 @@ def cos_snapshot():
     """backup API 出一致性快照（WAL 下安全）→ tmp+rename 原子落挂载盘"""
     if not COS_DIR:
         return {'ok': False, 'error': '未启用云存储挂载（WEIBO_COS_DIR 未设置）'}
-    if not cos_mounted():
+    if COS_MOUNT_GUARD and not cos_mounted():
         # 挂载掉了/没建好时，写下去的这份会覆盖云端；本地库还在，等下一轮挂载就绪再写
         return {'ok': False, 'error': '挂载盘未就绪，本次快照已跳过（写下去会覆盖云端数据）'}
     tmp = DB_PATH + '.snap'
