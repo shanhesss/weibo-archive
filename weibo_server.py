@@ -1053,6 +1053,23 @@ def in_stop_window():
     return stop_windows_hit(stop_windows(), bj_minutes())
 
 
+def quiet_resume_at(wins=None):
+    """此刻若处于静默时段，返回「时段结束」的 epoch 秒（多段重叠自动取最晚结束）；不在时段返回 0。
+    逐分钟往后扫，比按段算结束点再取 max 省事，重叠与跨午夜都自动处理。
+    前端靠它在时段内安心停轮询（省下的请求才让云托管能缩到 0，ADR-0019）。"""
+    wins = stop_windows() if wins is None else wins
+    if not wins:
+        return 0
+    now = int(time.time())
+    m0 = bj_minutes()
+    if not stop_windows_hit(wins, m0):
+        return 0
+    for i in range(1, 1441):
+        if not stop_windows_hit(wins, (m0 + i) % 1440):
+            return now + i * 60 - now % 60 + 1     # 边界在整分钟，多给 1 秒避免前端卡在边界上自唤醒
+    return 0
+
+
 def quiet_interrupt():
     """静默时段内叫停定时那一轮：还在排队的直接出队、正在跑的置暂停事件，都保留断点。
     手动发起的拉取不在 AUTO 里，一律不打断"""
@@ -1622,6 +1639,7 @@ def api_state(user):
             'schedule': {'on': on, 'minutes': minutes},
             'stop_windows': ['%s-%s' % (w['start'], w['end']) for w in wins],
             'in_stop_window': stop_windows_hit(wins, bj_minutes()),
+            'quiet_resume_at': quiet_resume_at(wins),
             'refresh_total': rp['total'], 'refresh_done': rp['done'],
             'yuque_total': sp['total'], 'yuque_done': sp['done'], 'yuque_msg': sp['msg'],
             'user': _user_public(user)}

@@ -688,6 +688,24 @@ check('静默 state 下发', st['stop_windows'] == ['%s-%s' % (w['start'], w['en
       and isinstance(st['in_stop_window'], bool))
 check('静默 读配置接口', ws.api_admin_stop_windows(USER)['ok'] and len(ws.api_admin_stop_windows(USER)['windows']) == 4)
 
+# 时段结束时刻：前端靠它安心停轮询（ADR-0019）
+_bjmin = lambda ts: (lambda t: t.tm_hour * 60 + t.tm_min)(time.gmtime(ts + ws.BJ_TZ_OFFSET))
+_allday = [{'s': 0, 'e': 1439}]
+_r = ws.quiet_resume_at(_allday)
+check('静默 结束时刻落在时段外', _r > time.time() and _r <= time.time() + 1441 * 60
+      and not ws.stop_windows_hit(_allday, _bjmin(_r))
+      and ws.stop_windows_hit(_allday, _bjmin(_r - 60)))
+_m = ws.bj_minutes()
+check('静默 不在时段返回0', ws.quiet_resume_at([{'s': (_m + 120) % 1440, 'e': (_m + 180) % 1440}]) == 0)
+ws.kv_set('sched_stop_windows', '[]')
+check('静默 无时段不报结束时刻', ws.quiet_resume_at() == 0)
+check('静默 state 带结束时刻', isinstance(ws.api_state(USER)['quiet_resume_at'], int))
+ws.kv_set('sched_stop_windows', json.dumps([{'start': '22:00', 'end': '06:00'}]))
+_cross = ws.stop_windows()
+check('静默 跨午夜段结束时刻不超过24小时',
+      (ws.quiet_resume_at(_cross) == 0) or (ws.quiet_resume_at(_cross) <= time.time() + 1441 * 60))
+ws.kv_set('sched_stop_windows', '[]')
+
 # 时段内只叫停定时那一轮，手动的不打断
 ws.kv_set('sched_stop_windows', '[]')
 ws.db("DELETE FROM bloggers WHERE user_id=?", (USER_ID,))
