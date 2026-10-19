@@ -2732,7 +2732,8 @@ $('aiSave').onclick = function(){
 };
 
 /* ── 管理后台：自动拉取静默时段（全局一份，改动即时对全站生效） ─────── */
-var qwWins = [];                  // [{start:'22:00', end:'06:00'}]，按北京时间
+var qwWins = [];          // [{start:'22:00', end:'06:00'}]，按北京时间
+var qwEdit = -1;          // -1 无编辑态；-2 新增中；>=0 正在编辑第几段
 
 function loadQuietWindows(){
   fetchJson('/api/admin/stop_windows').then(function(r){
@@ -2747,8 +2748,6 @@ function renderQuietWindows(){
   list.innerHTML = '';
   if(!qwWins.length){
     list.innerHTML = '<span class="hint">未设置：定时拉取全天都可能触发</span>';
-    $('qwForm').style.display = 'none';
-    return;
   }
   qwWins.forEach(function(w, i){
     var row = document.createElement('div');
@@ -2759,36 +2758,43 @@ function renderQuietWindows(){
     row.appendChild(nm);
     var acts = document.createElement('div');
     acts.className = 'acts';
-    var del = document.createElement('button');
-    del.className = 'mini';
-    del.textContent = '删除';
-    del.onclick = function(){
-      post('/api/admin/stop_windows', {action: 'delete', index: i}).then(qwDone);
-    };
-    acts.appendChild(del);
     row.appendChild(acts);
+    function btn(txt, fn){ var b = document.createElement('button'); b.className = 'mini';
+      b.textContent = txt; b.onclick = fn; acts.appendChild(b); }
+    btn('编辑', function(){ qwEdit = i; showQwForm(w); });
+    btn('删除', function(){
+      post('/api/admin/stop_windows', {action: 'delete', index: i}).then(qwDone);
+    });
     list.appendChild(row);
   });
+  if(qwEdit === -1){ $('qwForm').style.display = 'none'; }
+}
+
+function showQwForm(w){
+  $('qwForm').style.display = '';
+  $('qwStart').value = w ? w.start : '22:00';
+  $('qwEnd').value = w ? w.end : '06:00';
+  $('qwSave').textContent = qwEdit === -2 ? '保存' : '保存修改';
+  $('qwStart').focus();
 }
 
 function qwDone(r){
   if(!r.ok) toast(r.error || '操作失败');
+  qwEdit = -1;
   loadQuietWindows();          // 成败都重拉：这份配置是全局的，可能已被别处改动
 }
 
-$('qwAdd').onclick = function(){
-  $('qwForm').style.display = '';
-  $('qwStart').value = '22:00';
-  $('qwEnd').value = '06:00';
-  $('qwStart').focus();
-};
-$('qwCancel').onclick = function(){ $('qwForm').style.display = 'none'; };
+$('qwAdd').onclick = function(){ qwEdit = -2; showQwForm(null); };
+$('qwCancel').onclick = function(){ qwEdit = -1; renderQuietWindows(); };
 $('qwSave').onclick = function(){
-  post('/api/admin/stop_windows',
-       {action: 'add', start: $('qwStart').value, end: $('qwEnd').value}).then(function(r){
+  var adding = qwEdit === -2;
+  var body = {action: adding ? 'add' : 'update',
+              start: $('qwStart').value, end: $('qwEnd').value};
+  if(!adding && qwEdit >= 0) body.index = qwEdit;
+  post('/api/admin/stop_windows', body).then(function(r){
     if(!r.ok){ toast(r.error || '保存失败'); loadQuietWindows(); return; }
-    toast('已添加，对全站立即生效');
-    $('qwForm').style.display = 'none';
+    toast(adding ? '已添加，对全站立即生效' : '已修改，对全站立即生效');
+    qwEdit = -1;
     loadQuietWindows();
     loadState();               // 顶栏提示与定时弹窗里那段说明跟着刷新
   });

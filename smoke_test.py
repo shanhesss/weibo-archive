@@ -683,6 +683,14 @@ check('静默 第6段拒绝', ws.api_admin_stop_windows(USER, {'action': 'add', 
 check('静默 删除越界拒绝', ws.api_admin_stop_windows(USER, {'action': 'delete', 'index': 99})['ok'] is False)
 check('静默 删一段成功', ws.api_admin_stop_windows(USER, {'action': 'delete', 'index': 0})['ok']
       and len(ws.stop_windows()) == 4)
+r = ws.api_admin_stop_windows(USER, {'action': 'update', 'index': 0, 'start': '1:05', 'end': '02:30'})
+check('静默 改一段成功且归一化', r['ok'] and r['windows'][0] == {'start': '01:05', 'end': '02:30'}
+      and len(r['windows']) == 4)
+check('静默 改后其它段不动', r['windows'][1]['start'] == '01:00')
+check('静默 改一段起止相同拒绝', ws.api_admin_stop_windows(USER, {'action': 'update', 'index': 0, 'start': '05:00', 'end': '05:00'})['ok'] is False)
+check('静默 改一段取值非法拒绝', ws.api_admin_stop_windows(USER, {'action': 'update', 'index': 0, 'start': '25:00', 'end': '06:00'})['ok'] is False)
+check('静默 改一段越界拒绝', ws.api_admin_stop_windows(USER, {'action': 'update', 'index': 99, 'start': '05:00', 'end': '06:00'})['ok'] is False)
+check('静默 拒绝后原值未变', ws.stop_windows()[0]['start'] == '01:05')
 st = ws.api_state(USER)
 check('静默 state 下发', st['stop_windows'] == ['%s-%s' % (w['start'], w['end']) for w in ws.stop_windows()]
       and isinstance(st['in_stop_window'], bool))

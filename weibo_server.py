@@ -2607,7 +2607,7 @@ def api_admin_ai_config_save(user, body):
 
 
 def api_admin_stop_windows(user, body=None):
-    """静默时段管理（全局一份，对所有用户的定时拉取生效）：action = add / delete；
+    """静默时段管理（全局一份，对所有用户的定时拉取生效）：action = add / update / delete；
     不带 body 即读取当前配置。写入严格校验，读取（stop_windows）另有容错"""
     wins = stop_windows()
     if not body:
@@ -2615,24 +2615,40 @@ def api_admin_stop_windows(user, body=None):
                 'in_stop_window': stop_windows_hit(wins, bj_minutes())}
     action = (body.get('action') or '').strip()
 
+    def norm():
+        """取并校验起止时间，返回 (时段, 错误提示)"""
+        s, e = _hm(body.get('start')), _hm(body.get('end'))
+        if s is None or e is None:
+            return None, '开始和结束时间都要填，格式如 22:00'
+        if s == e:
+            return None, '起止时间相同等于全天不拉，请直接关掉定时拉取'
+        return {'start': '%02d:%02d' % (s // 60, s % 60),
+                'end': '%02d:%02d' % (e // 60, e % 60), 's': s, 'e': e}, ''
+
+    def at():
+        try:
+            return int(body.get('index', -1))
+        except (TypeError, ValueError):
+            return -1
+
     if action == 'add':
         if len(wins) >= STOP_WINDOW_MAX:
             return {'ok': False, 'error': '最多 %d 段，先删掉一段再加' % STOP_WINDOW_MAX}
-        s, e = _hm(body.get('start')), _hm(body.get('end'))
-        if s is None or e is None:
-            return {'ok': False, 'error': '开始和结束时间都要填，格式如 22:00'}
-        if s == e:
-            return {'ok': False, 'error': '起止时间相同等于全天不拉，请直接关掉定时拉取'}
-        wins.append({'start': '%02d:%02d' % (s // 60, s % 60),
-                     'end': '%02d:%02d' % (e // 60, e % 60), 's': s, 'e': e})
-    elif action == 'delete':
-        try:
-            i = int(body.get('index', -1))
-        except (TypeError, ValueError):
-            i = -1
+        w, err = norm()
+        if err:
+            return {'ok': False, 'error': err}
+        wins.append(w)
+    elif action in ('update', 'delete'):
+        i = at()
         if not (0 <= i < len(wins)):
             return {'ok': False, 'error': '这一段已不存在，请刷新后重试'}
-        wins.pop(i)
+        if action == 'delete':
+            wins.pop(i)
+        else:
+            w, err = norm()
+            if err:
+                return {'ok': False, 'error': err}
+            wins[i] = w
     else:
         return {'ok': False, 'error': '未知操作'}
     kv_set('sched_stop_windows', json.dumps(
