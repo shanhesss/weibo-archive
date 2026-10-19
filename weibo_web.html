@@ -933,7 +933,9 @@ var selAllIds = [];               // 全选模式下获取的全部匹配 id
 var prevUpdating = false;         // 批量更新是否在进行中，用于完成检测
 var prevYuqueBusy = false;        // 归档批次是否在进行中，用于完成检测
 var schedCfg = {on: false, minutes: 60};   // 定时拉取配置（/api/state 下发）
-var quietCfg = {windows: [], inWindow: false};   // 自动拉取静默时段（全局，/api/state 下发，只读）
+var quietCfg = {windows: [], inWindow: false, resumeAt: 0};   // 自动拉取静默时段（全局，/api/state 下发，只读）
+var pollPaused = false, pollResumeTimer = null, lastActAt = 0;
+var ACT_KEEP_MS = 30 * 60 * 1000;   // 静默期内：最后一次操作后 30 分钟内仍保持轮询（人在用就别让实例缩走）
 var rfMeta = {};                  // uid -> {earliest, nickname}，重拉全量弹窗预填起始日期用
 var WEIBO_LAUNCH = new Date(2009, 7, 28);   // 微博上线日，作为"最早"兜底
 var authed = false;               // 是否已登录（未登录时跳过轮询，停在登录视图）
@@ -1042,14 +1044,28 @@ function copyId(id, ev){
   copyText(id);
   toast('已复制博文 ID：' + id);
 }
-function fetchJson(url, opts){
+/* 静默期内实例可能已被回收，第一个请求会撞上冷启动（网关回 502/503/504 或直接连不上）。
+   这类失败重试等待，用户才看得到「服务被叫醒」而不是一个莫名其妙的报错。 */
+var WAKE_TRIES = 12, WAKE_WAIT_MS = 3000;
+function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function fetchJson(url, opts, tries){
   if(WB_BASE && url.charAt(0) === '/') url = WB_BASE + url;    // 子路径部署：接口自动挂前缀
+  if(tries === undefined) tries = WAKE_TRIES;
   return fetch(url, opts).then(function(r){
     if(r.status === 401) showAuthView();    // 会话失效 → 统一回登录视图
+    if(r.status === 502 || r.status === 503 || r.status === 504) return waking(url, opts, tries);
     return r.json();
+  }, function(){
+    return waking(url, opts, tries);        // fetch 本身失败：容器还没起来
   });
 }
+function waking(url, opts, tries){
+  if(tries <= 0) return {ok:false, error:'服务没有响应，可能正在唤醒中，请过一会儿再试'};
+  if(tries === WAKE_TRIES) toast('服务正在唤醒（静默时段后第一次操作约需十几秒）…');
+  return sleep(WAKE_WAIT_MS).then(function(){ return fetchJson(url, opts, tries - 1); });
+}
 function post(url, body){
+  markActivity();
   return fetchJson(url, {method:'POST', headers:{'Content-Type':'application/json'},
                          body: JSON.stringify(body || {})});
 }
@@ -1662,15 +1678,54 @@ $('refullCancel').onclick = function(){ $('refullModal').classList.remove('show'
 $('refullModal').onclick = function(e){ if(e.target === $('refullModal')) $('refullModal').classList.remove('show'); };
 
 /* ── 状态轮询 ─────────────────────────────── */
+/* 静默时段内暂停轮询（ADR-0019）：云托管按「30 分钟无请求」才缩容到 0，
+   页面挂着每 2.5 秒一问就永远不缩。暂停后靠 /api/state 下发的时段结束时刻自己醒来；
+   用户任何操作都会立刻恢复轮询（请求本身也会把休眠的实例叫醒，见 fetchJson 的唤醒重试）。 */
+function markActivity(){
+  lastActAt = Date.now();
+  if(pollPaused) resumePoll();
+}
+function pausePoll(){
+  pollPaused = true;
+  var ms = quietCfg.resumeAt * 1000 - Date.now();
+  if(ms < 15000) ms = 15000;              // 访客设备时钟偏差兜底：至少歇 15 秒，别卡在边界自唤醒
+  pollResumeTimer = setTimeout(function(){ pollPaused = false; repaintHints(); }, ms);
+  repaintHints();
+}
+function resumePoll(){
+  pollPaused = false;
+  if(pollResumeTimer){ clearTimeout(pollResumeTimer); pollResumeTimer = null; }
+  // 不在这儿主动 loadState：节拍一直在跑，下一拍（≤2.5 秒）自然接上，避免回调里再套一层请求
+  repaintHints();
+}
+function repaintHints(){ if(hintArgs) renderTaskHints.apply(null, hintArgs); }
+function applyQuietGate(){
+  if(!authed) return;
+  var active = Date.now() - lastActAt < ACT_KEEP_MS;
+  var endAt = quietCfg.resumeAt * 1000;
+  // 结束时刻只认「1 分钟前 ~ 24 小时内」：越界说明后端算错或访客设备时钟离谱，
+  // 此时宁可继续轮询多占一会儿实例，也不能把界面冻成看起来坏了
+  var sane = quietCfg.resumeAt && endAt > Date.now() - 60000 && endAt < Date.now() + 24 * 3600 * 1000;
+  if(quietCfg.inWindow && !active && sane && !pollPaused) pausePoll();
+  else if(pollPaused && (!quietCfg.inWindow || active)) resumePoll();
+}
+var hintArgs = null;
 function renderTaskHints(updating, rd, rt, ybusy, yd, yt, bbusy, bd, bt){
+  hintArgs = arguments;          // 暂停/恢复轮询时要照原样重画一次，否则文案会定格在旧状态
   var h = [];
   if(updating) h.push('批量更新中：已更新 ' + rd + ' / ' + rt
     + '<button class="cancel-btn" data-cancel="update" title="停止剩余更新，已更新的保留">取消</button>');
   if(ybusy) h.push('语雀同步中：已处理 ' + yd + ' / ' + yt
     + '<button class="cancel-btn" data-cancel="sync" title="停止剩余同步，已归档的保留">取消</button>');
   if(bbusy) h.push('全部拉取中：已处理 ' + bd + ' / ' + bt);
-  var quiet = quietCfg.inWindow && quietCfg.windows.length
-    ? '自动拉取静默时段中（北京时间 ' + esc(quietCfg.windows.map(quietWinText).join('、')) + '），时段结束后自动接着跑' : '';
+  var quiet = '';
+  if(quietCfg.inWindow && quietCfg.windows.length){
+    quiet = pollPaused
+      ? '静默时段中（北京时间 ' + esc(quietCfg.windows.map(quietWinText).join('、'))
+        + '），服务已休眠、页面不再自动刷新；点任意操作会把它叫醒，第一次约等十几秒'
+      : '自动拉取静默时段中（北京时间 ' + esc(quietCfg.windows.map(quietWinText).join('、'))
+        + '），时段结束后自动接着跑';
+  }
   $('taskHints').innerHTML = (quiet ? '<span class="quiet">' + quiet + '</span>' : '')
     + (h.length ? '<span class="busy">' + h.join(' · ') + '</span>' : '');
 }
@@ -1702,7 +1757,9 @@ function loadState(){
     applyMe();
     renderCookie(st.cookie_status);
     if(st.schedule) schedCfg = st.schedule;
-    quietCfg = {windows: st.stop_windows || [], inWindow: !!st.in_stop_window};
+    quietCfg = {windows: st.stop_windows || [], inWindow: !!st.in_stop_window,
+                resumeAt: st.quiet_resume_at || 0};
+    applyQuietGate();
     renderBloggers(st.bloggers);
     renderChips(st.bloggers);
     for(var i=0;i<st.bloggers.length;i++){                 // 有人刚拉完 → 刷新列表并提醒（一键批量时不逐条打扰）
@@ -1789,6 +1846,7 @@ function postsQuery(page, allIds){
         + ($('archSel').value ? '&arch=' + $('archSel').value : '');
 }
 function loadPosts(){
+  markActivity();          // 用户在翻列表/筛选 = 人在用，静默期也该把服务叫醒并保持轮询
   fetchJson(postsQuery(curPage, false)).then(renderPosts);
 }
 function buildYears(years){
@@ -2764,7 +2822,7 @@ $('pwInput').onkeydown = function(e){ if(e.key === 'Enter') pwSubmit(); };
 /* ── 启动 ────────────────────────────────── */
 loadState();                                    // 未登录时 401 会自动切到登录视图
 loadPosts();
-setInterval(function(){ if(authed) loadState(); }, 2500);
+setInterval(function(){ if(authed && !pollPaused) loadState(); }, 2500);
 </script>
 </body>
 </html>
