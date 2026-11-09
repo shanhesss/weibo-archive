@@ -26,6 +26,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import sqlite3
 import sys
 import threading
@@ -2704,12 +2705,13 @@ def backup_db():
             return
         stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         dest = os.path.join(BASE_DIR, 'weibo-backup-%s.db' % stamp)
+        # 分块复制：整库 read() 在大库上会把全部字节一次读进内存，低配服务器直接 OOM
         with open(DB_PATH, 'rb') as src, open(dest, 'wb') as out:
-            out.write(src.read())
+            shutil.copyfileobj(src, out, 1024 * 1024)
         wal = DB_PATH + '-wal'
         if os.path.exists(wal) and os.path.getsize(wal) > 0:
             with open(wal, 'rb') as src, open(dest + '-wal', 'wb') as out:
-                out.write(src.read())
+                shutil.copyfileobj(src, out, 1024 * 1024)
         baks = sorted(f for f in os.listdir(BASE_DIR)
                       if re.match(r'weibo-backup-\d{8}-\d{6}\.db$', f))
         for f in baks[:-3]:
