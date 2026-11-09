@@ -53,7 +53,7 @@ YUQUE_URL_RE = re.compile(r'^https://www\.yuque\.com/([^\s/?#]+)/([^\s/?#]+)((?:
 SYNC_WORKERS = 2                 # 批内并发路数：2 路并行跑，墙钟约减半
 SYNC_TIMEOUT = 300               # 单条归档 AI 调用超时（秒）：思考型/编码模型生成整篇文档常超 2 分钟
 
-SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
+SCHED_MIN_MINUTES = 10           # 定时拉取间隔下限：再密会显著增加触发 432 的风险
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
 
 API_BASE = 'https://m.weibo.cn'
@@ -955,7 +955,7 @@ def cookie_watcher():
 
 
 def sched_cfg(user_id):
-    """某用户的定时拉取配置：开关 + 间隔（分钟，越界自动夹回 30~1440）"""
+    """某用户的定时拉取配置：开关 + 间隔（分钟，越界自动夹回 10~1440）"""
     try:
         minutes = int(ukv_get(user_id, 'sched_minutes') or '60')
     except ValueError:

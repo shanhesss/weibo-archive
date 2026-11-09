@@ -17,7 +17,7 @@
 - `weibo_server.py` 保持**纯标准库**（http.server + sqlite3），尽量零第三方依赖；PyInstaller 打包 `weibo_archive.exe`。
 - 数据全部在 `weibo.db`（SQLite 单文件）；接口原始 JSON 留底（ADR-0003）。
 - 拉取走 m.weibo.cn 非官方接口 + 小号 cookie（ADR-0002）；432 退避、断点续爬、增量 / 全量 / 重拉语义见 ADR-0006 / 0007。
-- 定时拉取 = 一键全部拉取的定时版：配置存 kv 表（开关 + 间隔，30~1440 分钟），调度线程到点入队，重启后超间隔补跑一次。
+- 定时拉取 = 一键全部拉取的定时版：配置存 kv 表（开关 + 间隔，10~1440 分钟），调度线程到点入队，重启后超间隔补跑一次。
 - 语雀归档 = 直调 AI 接口 + 语雀 OpenAPI（ADR-0011，取代 ADR-0008 的 claude+MCP 链路）：模板驱动 AI 总结（Anthropic 兼容 `/v1/messages`，TITLE:/BODY: 契约）+ OpenAPI 建档/更新/挂目录/删除，纯 urllib 零外部二进制；AI 中转支持多家配置池（ADR-0012）：kv `ai_pool` 有序 JSON（每项 备注名/地址/密钥/模型名/启用），数组序即优先级主→备，每次生成现走一遍链、任一失败即换下一家；失败按类型分流（ADR-0014）：连不上/超时/网关 5xx 的家在**本批次内**拉黑不再重复等超时（批次结束即失效，不做跨批熔断），只有输出不合契约才走第二轮重试；管理员后台增删改/停用/排序、行末展示各家累计生成成功次数（kv `ai_stats`，按条目稳定 id 归并，编辑保数、删除才清零）（密钥只显掩码，无环境变量兜底）；「微博正文」章节由代码拼装、AI 只写 `{{微博正文}}` 占位（提速，ADR-0013）；语雀 token 按用户存 `weibo.db` 的 `user_kv` 表（ADR-0010），不入 git；旧库迁移时一次性从 `~/.claude/settings.json` 导入。
 - 语雀删除 = OpenAPI 直连（ADR-0009）：删除走 `DELETE /api/v2/repos/:namespace/docs/:id`，token 从该用户的 `user_kv` 读取（ADR-0010）。
 - 备份下载 = 管理后台（仅管理员）下载整库，验密制：先 `POST /api/admin/db_backup_verify` 复核登录密码发 5 分钟票据（复用登录限流、独立 `dl:` 计数，连错 5 次限 15 分钟），`GET /api/admin/db_backup` 需管理员会话 + 有效票据；sqlite backup 出临时副本（不碰运行库），单段 Range 断点续传，用完即删。
