@@ -79,7 +79,7 @@ COS_MOUNT_GUARD = (os.environ.get('WEIBO_COS_MOUNT_GUARD') or '1') != '0'
 # 本次启动是否刚从云端快照恢复：是则不再做启动备份（快照本身就是备份），省一次整库读写
 RESTORED_FROM_COS = False
 
-SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
+SCHED_MIN_MINUTES = 10           # 定时拉取间隔下限：再密会显著增加触发 432 的风险
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
 STOP_WINDOW_MAX = 5              # 静默时段最多几段（再多多半是配错了，且弹窗放不下）
 BJ_TZ_OFFSET = 8 * 3600          # 静默时段一律按北京时间判断：用 epoch 偏移算，不依赖容器 TZ 是否生效
@@ -1089,7 +1089,7 @@ def quiet_interrupt():
 
 
 def sched_cfg(user_id):
-    """某用户的定时拉取配置：开关 + 间隔（分钟，越界自动夹回 30~1440）"""
+    """某用户的定时拉取配置：开关 + 间隔（分钟，越界自动夹回 10~1440）"""
     try:
         minutes = int(ukv_get(user_id, 'sched_minutes') or '60')
     except ValueError:

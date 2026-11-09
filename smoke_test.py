@@ -649,14 +649,14 @@ check('无登录信息拒绝', r['ok'] is False and '登录信息' in r['error']
 def kv_last_is_now():
     v = ws.ukv_get(USER_ID, 'sched_last')
     return bool(v) and abs(float(v) - time.time()) < 10
-check('定时 低于30分钟拒绝', ws.api_schedule(USER, {'on': True, 'minutes': 10})['ok'] is False)
+check('定时 低于10分钟拒绝', ws.api_schedule(USER, {'on': True, 'minutes': 9})['ok'] is False)
 check('定时 超1440拒绝', ws.api_schedule(USER, {'on': True, 'minutes': 2000})['ok'] is False)
 check('定时 非数字拒绝', ws.api_schedule(USER, {'on': True, 'minutes': 'abc'})['ok'] is False)
 check('定时 开启成功', ws.api_schedule(USER, {'on': True, 'minutes': 60})['ok'] is True)
 check('定时 配置落库', ws.sched_cfg(USER_ID) == (True, 60) and kv_last_is_now())
 check('定时 state 带配置', ws.api_state(USER)['schedule'] == {'on': True, 'minutes': 60})
 check('定时 关闭成功', ws.api_schedule(USER, {'on': False})['ok'] is True and ws.sched_cfg(USER_ID)[0] is False)
-check('定时 越界值夹回', (ws.ukv_set(USER_ID, 'sched_minutes', '5'), ws.sched_cfg(USER_ID)[1] == 30)[1])
+check('定时 越界值夹回', (ws.ukv_set(USER_ID, 'sched_minutes', '5'), ws.sched_cfg(USER_ID)[1] == 10)[1])
 
 # 29b. 自动拉取静默时段（全局一份，ADR-0017）
 ws.kv_set('sched_stop_windows', '')
