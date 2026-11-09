@@ -316,17 +316,21 @@ _mounted = ws.cos_mounted
 ws.cos_mounted = lambda: True      # 本段测的是「挂载已就绪」下的恢复语义：临时目录当作已挂载盘（ADR-0018 后普通目录会被判未就绪）
 open(os.path.join(_cos, 'weibo.db'), 'wb').write(b'SNAP')
 open(os.path.join(_cos, 'seed.db'), 'wb').write(b'SEED')
+ws.RESTORED_FROM_COS = False
 ws.cos_restore()
 check('恢复优先用 seed.db', os.path.exists(_dbp) and open(_dbp, 'rb').read() == b'SEED'
       and os.path.exists(os.path.join(_cos, 'seed.db.used'))
       and not os.path.exists(os.path.join(_cos, 'seed.db')))
+check('快照恢复后打标记（启动不再重复备份）', ws.RESTORED_FROM_COS is True)
 os.remove(_dbp)
 ws.cos_restore()
 check('无 seed 时走快照', open(_dbp, 'rb').read() == b'SNAP')
 open(_dbp, 'wb').write(b'LOCAL')
 open(os.path.join(_cos, 'weibo.db'), 'wb').write(b'SNAP2')
+ws.RESTORED_FROM_COS = False
 ws.cos_restore()
 check('本地已有库不动', open(_dbp, 'rb').read() == b'LOCAL')
+check('本地已有库不打恢复标记', ws.RESTORED_FROM_COS is False)
 os.remove(_dbp)
 os.remove(os.path.join(_cos, 'weibo.db'))
 ws.cos_restore()
@@ -334,6 +338,7 @@ check('两处皆无则跳过不报错', not os.path.exists(_dbp))
 _shutil.rmtree(_cos, ignore_errors=True)
 ws.DB_PATH, ws.COS_DIR = _real_db, _real_cos
 ws.cos_mounted = _mounted
+ws.RESTORED_FROM_COS = False
 ws.db("UPDATE posts SET arch_state='' WHERE user_id=? AND id='a4'", (USER_ID,))
 
 # 22d. 主备降级（ADR-0013）：主用任何失败自动试下一家，整链失败才报错

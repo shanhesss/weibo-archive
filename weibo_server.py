@@ -76,6 +76,8 @@ COS_MOUNT_POLL = 3               # 轮询间隔（秒）
 # 守卫本身的应急出口：万一判据在某个平台版本上误判（会把服务卡在起不来），
 # 控制台加环境变量 WEIBO_COS_MOUNT_GUARD=0 重启即可绕过。默认开，不是常规配置项。
 COS_MOUNT_GUARD = (os.environ.get('WEIBO_COS_MOUNT_GUARD') or '1') != '0'
+# 本次启动是否刚从云端快照恢复：是则不再做启动备份（快照本身就是备份），省一次整库读写
+RESTORED_FROM_COS = False
 
 SCHED_MIN_MINUTES = 30           # 定时拉取间隔边界：低于半小时没意义还容易触发反爬
 SCHED_MAX_MINUTES = 1440         # 上限 24 小时，防止手滑填出天文数字
@@ -2970,6 +2972,7 @@ def cos_wait_mount():
 def cos_restore():
     """云托管形态：启动时从挂载盘拉回库。返回 False = 挂载没就绪或快照拉取失败，
     调用方必须拒绝启动 —— 带着空库起来，随后第一份快照就把云端真数据覆盖了（2026-10 实际丢过一次，ADR-0018）"""
+    global RESTORED_FROM_COS
     if not COS_DIR:
         return True
     if not COS_MOUNT_GUARD:
@@ -2995,6 +2998,7 @@ def cos_restore():
                 os.replace(seed, seed + '.used')
             except OSError:
                 pass
+        RESTORED_FROM_COS = True
         print('已从云存储快照恢复库：%s（%d 字节）' % (src, os.path.getsize(DB_PATH)))
         return True
     except Exception as e:  # noqa: BLE001 —— 拉不到就是拉不到，绝不能当「没有快照」继续起
@@ -3067,12 +3071,13 @@ def backup_db():
             return
         stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         dest = os.path.join(BASE_DIR, 'weibo-backup-%s.db' % stamp)
+        # 分块复制：整库 read() 在 0.5G 容器上会把大库一次性读进内存直接 OOM
         with open(DB_PATH, 'rb') as src, open(dest, 'wb') as out:
-            out.write(src.read())
+            shutil.copyfileobj(src, out, 1024 * 1024)
         wal = DB_PATH + '-wal'
         if os.path.exists(wal) and os.path.getsize(wal) > 0:
             with open(wal, 'rb') as src, open(dest + '-wal', 'wb') as out:
-                out.write(src.read())
+                shutil.copyfileobj(src, out, 1024 * 1024)
         baks = sorted(f for f in os.listdir(BASE_DIR)
                       if re.match(r'weibo-backup-\d{8}-\d{6}\.db$', f))
         for f in baks[:-3]:
@@ -3090,7 +3095,8 @@ def main():
         pass
     if not cos_restore():         # 云托管形态：先从挂载盘拉回库，再走本地启动流程
         sys.exit(1)               # 拉不到就退出，交给平台重启重试；带空库起来会覆盖云端那份真数据
-    backup_db()                     # 先备份现有数据，再初始化
+    if not RESTORED_FROM_COS:     # 刚由快照恢复：快照本身就是备份，再整库拷一份只会拖慢启动、吃磁盘
+        backup_db()
     init_db()
     # 工具重启：把上次没跑完的任务标记为「已暂停」，用户点继续即断点续爬
     for r in db("SELECT user_id, uid FROM bloggers WHERE state IN ('queued','fulling')").fetchall():
