@@ -399,6 +399,37 @@ check('空票或伪造票无效', not ws.dl_ticket_valid(USER_ID, '')
 ws.DL_TICKETS[r['ticket']] = (USER_ID, time.time() - 1)
 check('过期票据作废', not ws.dl_ticket_valid(USER_ID, r['ticket']))
 
+# 22h. 批次内死源拉黑（ADR-0014）：连不上的一家本批次后续条目不再重复等超时
+_pool = [{'name': '主用'}, {'name': '备用'}]
+_tries = []
+def _fake_timeout(prompt, c):
+    _tries.append(c['name'])
+    if c['name'] == '主用':
+        raise ws.AiTransportError('连接 AI 服务失败：timed out')
+    return 'TITLE: 标题\nBODY: 正文'
+ws._ai_complete = _fake_timeout
+_dead = set()
+ws._ai_generate('p', _pool, _dead)
+ws._ai_generate('p', _pool, _dead)
+check('首条两家都试、后续条目跳过死源', _tries == ['主用', '备用', '备用'] and 0 in _dead)
+ws._ai_complete = lambda prompt, c: 'TITLE: 只有标题没有正文'
+try:
+    ws._ai_generate('p', _pool, set())
+    _err = None
+except ws.ApiError as e:
+    _err = e
+check('输出不合契约判为可重试', isinstance(_err, ws.AiFormatError))
+def _fake_502(prompt, c):
+    raise ws.AiTransportError('AI 服务请求失败（502）')
+ws._ai_complete = _fake_502
+try:
+    ws._ai_generate('p', _pool, set())
+    _err2 = None
+except ws.ApiError as e:
+    _err2 = e
+check('网关 5xx 全败判为不可重试', isinstance(_err2, ws.AiFormatError) is False)
+ws._ai_complete = _real_complete
+
 # 23. 失败状态筛选 + 原因返回
 ws.db("UPDATE posts SET arch_fail='目录不存在' WHERE user_id=? AND id='a4'", (USER_ID,))
 ws.db("UPDATE posts SET arch_fail='超时', arch_skip=0, archived=0 WHERE user_id=? AND id='a2'", (USER_ID,))
