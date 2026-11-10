@@ -210,7 +210,7 @@ ws.db("UPDATE bloggers SET state='paused', next_page=NULL WHERE user_id=? AND ui
 
 # 18. 语雀归档：目录链接格式校验
 check('目录格式 账号/库/目录', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb/ddd') == ('aaa', 'bbb', 'ddd'))
-check('目录格式 多层路径', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb/1/2/ddd') == ('aaa', 'bbb', '1/2/ddd'))
+check('目录格式 多层路径取末段', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb/1/2/ddd') == ('aaa', 'bbb', 'ddd'))
 check('目录格式 仅知识库', ws.validate_yuque_dir('https://www.yuque.com/aaa/bbb') == ('aaa', 'bbb', ''))
 check('目录格式 非法协议', ws.validate_yuque_dir('http://yuque.com/aaa/bbb') is None)
 check('目录格式 缺知识库', ws.validate_yuque_dir('https://www.yuque.com/aaa') is None)
@@ -440,11 +440,53 @@ check('clear_arch_state 按人清理生效',
 ws.db("UPDATE posts SET arch_fail='' WHERE user_id=?", (USER_ID,))
 ws.db("DELETE FROM posts WHERE user_id=?", (OTHER,))
 
-# 22i. 挂目录兜底：语雀返回形状意外也只当作「没挂上」，不能把已建好的文档判成同步失败
+# 22i. 挂目录：语雀建文档不会自动进目录，按「创建节点」语义（type + doc_ids）挂载；
+#      已挂则跳过、挂别处则移动，响应形状意外只当作「没挂上」
 _real_yq = ws._yuque_api
+calls = []
+
+def _fake_toc(nodes):
+    def f(path, token, method='GET', payload=None):
+        calls.append((method, payload))
+        return ({'data': nodes}, 200) if method == 'GET' else ({}, 200)
+    return f
+
 ws._yuque_api = lambda *a, **k: ({'data': ['不是列表项']}, 200)
-check('挂目录遇意外形状返回未挂上不抛错', ws.yuque_mount_doc('a/b', 'c', 'd', 'tk') is False)
+check('挂目录遇意外形状返回未挂上不抛错', ws.yuque_mount_doc('a/b', 'dir', 42, 'doc', 'tk') is False)
+
+calls.clear()
+ws._yuque_api = _fake_toc([
+    {'type': 'TITLE', 'slug': '#', 'uuid': 'g1', 'parent_uuid': ''},
+    {'type': 'DOC', 'slug': 'dir', 'uuid': 't1', 'parent_uuid': ''},
+])
+check('未入目录的新文档按创建节点挂载',
+      ws.yuque_mount_doc('a/b', 'dir', 42, 'doc', 'tk') is True
+      and calls[-1] == ('PUT', {'action': 'appendNode', 'action_mode': 'child',
+                                'target_uuid': 't1', 'type': 'DOC', 'doc_ids': [42]}))
+
+calls.clear()
+ws._yuque_api = _fake_toc([
+    {'type': 'DOC', 'slug': 'dir', 'uuid': 't1', 'parent_uuid': ''},
+    {'type': 'DOC', 'slug': 'doc', 'uuid': 'n1', 'parent_uuid': 't1'},
+])
+check('已挂在目标目录下不重复挂',
+      ws.yuque_mount_doc('a/b', 'dir', 42, 'doc', 'tk') is True
+      and not [c for c in calls if c[0] == 'PUT'])
+
+calls.clear()
+ws._yuque_api = _fake_toc([
+    {'type': 'DOC', 'slug': 'dir', 'uuid': 't1', 'parent_uuid': ''},
+    {'type': 'DOC', 'slug': 'other', 'uuid': 'o1', 'parent_uuid': ''},
+    {'type': 'DOC', 'slug': 'doc', 'uuid': 'n1', 'parent_uuid': 'o1'},
+])
+check('已在目录别处则移动节点',
+      ws.yuque_mount_doc('a/b', 'dir', 42, 'doc', 'tk') is True
+      and calls[-1] == ('PUT', {'action': 'appendNode', 'action_mode': 'child',
+                                'target_uuid': 't1', 'node_uuid': 'n1'}))
 ws._yuque_api = _real_yq
+check('嵌套文档链接取最后一段为 slug',
+      ws.parse_yuque_doc_url('https://www.yuque.com/a/b/c/d') == ('a/b', 'd')
+      and ws.validate_yuque_dir('https://www.yuque.com/a/b/c/d') == ('a', 'b', 'd'))
 
 # 22e. 数据库备份下载（断点续传）：200 全量 / Range 206 / 越界 416，临时副本用完即删
 import io as _io, email.message as _em
