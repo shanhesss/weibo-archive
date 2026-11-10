@@ -175,6 +175,18 @@
   button.mini.yuque-btn.yq-update{background:#fff; color:var(--yuque); border-color:var(--yuque);}
   button.mini.yuque-btn.yq-update:hover{opacity:.88; color:var(--yuque);}
   .yuque-ok{flex:none; color:var(--yuque); font-size:12px; margin-left:4px; cursor:pointer;}
+  .vault-btn{flex:none; font-size:12px; padding:1px 8px; background:#7c6ee6; border-color:#7c6ee6;}
+  button.mini.vault-btn{color:#fff;}
+  button.mini.vault-btn:hover{opacity:.88; color:#fff;}
+  button.mini.vault-btn[disabled]{opacity:.5; cursor:not-allowed; background:var(--grey); border-color:var(--grey); color:#fff;}
+  button.mini.vault-btn.yq-off{background:var(--grey); border-color:var(--grey); color:#fff; cursor:pointer;}
+  button.mini.vault-btn.yq-off:hover{opacity:.88; color:#fff;}
+  .vault-ok{flex:none; color:#7c6ee6; font-size:12px; margin-left:4px; cursor:pointer;}
+  button.mini.vault-del{flex:none; color:var(--red); padding:1px 8px;}
+  button.mini.vault-del:hover{border-color:var(--red);}
+  .btn-vault{background:#7c6ee6; border-color:#7c6ee6;}
+  button.mini.btn-vault{color:#fff;}
+  button.mini.btn-vault:hover{opacity:.88; color:#fff;}
   button.mini.arch-del{flex:none; color:var(--red); padding:1px 8px;}
   button.mini.arch-del:hover{border-color:var(--red);}
   .b-yuque{color:var(--sub); font-size:12px; margin-top:2px; display:flex; align-items:center; gap:6px; min-width:0;}
@@ -708,6 +720,11 @@
         <option value="update_fail">更新失败</option>
         <option value="skip">无需归档</option>
       </select>
+      <select id="vaultSel">
+        <option value="">全部存库</option>
+        <option value="0">未存库</option>
+        <option value="1">已存库</option>
+      </select>
       <button id="clearF" class="mini">清空筛选</button>
       <button id="fltDone" class="mini primary">完成</button>
       </div>
@@ -724,7 +741,9 @@
       </div>
       <div class="bb-acts">
         <button id="batchYuque" class="mini btn-yuque" title="AI 总结后同步到语雀，可随时在顶部取消">同步到语雀</button>
+        <button id="batchVault" class="mini btn-vault" title="把选中微博的正文导出到 vault 收件箱，不经 AI">存入收件箱</button>
         <button id="batchArchDel" class="mini danger" title="删除选中有语雀文档的微博对应的语雀文档，微博重置为待归档">删语雀档</button>
+        <button id="batchVaultDel" class="mini danger" title="删除选中微博在 vault 收件箱里的导出文件，微博改回未存库">删导出</button>
         <button id="batchUpdate" class="mini primary">批量更新</button>
         <button id="batchDelete" class="mini danger">批量删除</button>
         <button id="batchMarkSkip" class="mini btn-skip" title="选中微博转为无需归档，不再参与语雀同步">转无需归档</button>
@@ -867,6 +886,17 @@
     </div>
   </div>
   <div class="admin-ai">
+    <div class="ai-head">
+      <span class="lbl">存库目录（vault）</span>
+      <span class="hint" id="vaultHint"></span>
+    </div>
+    <div class="ai-form" style="display:flex">
+      <input type="text" id="vaultPathInput" placeholder="vault 根目录，如 D:\hklfile\vault（需含 00-收件箱）" style="flex:1">
+      <button id="vaultSave" class="mini primary">保存</button>
+    </div>
+    <span class="hint">微博「存库」把正文导出到该目录的 00-收件箱/，留给库内 agent 提炼；搬家（NAS 等）改这里即可</span>
+  </div>
+  <div class="admin-ai">
     <span class="lbl">数据备份</span>
     <a id="dbBackup" class="mini" href="#">下载完整备份</a>
     <span class="hint">把全部数据（所有账号的博主、微博、设置）下载一份，自己保存备份；中断可续传</span>
@@ -992,6 +1022,17 @@ function syncBtnHtml(p){
     return '<button class="mini yuque-btn yq-off" data-rt="1" title="转发微博不支持同步">同步</button>';
   }
   return '<button class="mini yuque-btn" data-sync="'+esc(p.id)+'" title="AI 总结后同步到语雀">同步</button>';
+}
+function vaultBtnHtml(p){
+  if(p.retweeted){
+    return '<button class="mini vault-btn yq-off" data-vrt="1" title="转发微博不支持存库">存库</button>';
+  }
+  if(p.vault_exported){
+    return '<span class="vault-ok" title="正文已导出到 vault 收件箱：'+esc(p.vault_path||'')+'">已存库</span>'
+      + '<button class="mini vault-del" data-vdel="'+esc(p.id)
+      + '" title="删除收件箱里的导出文件，微博改回未存库">删导出</button>';
+  }
+  return '<button class="mini vault-btn" data-vexport="'+esc(p.id)+'" title="把正文导出到 vault 收件箱（不经过 AI，库内 agent 再提炼）">存库</button>';
 }
 function archDelHtml(p){
   if(p.yuque_doc_url && p.arch_state !== 'syncing' && p.arch_state !== 'updating'){
@@ -1403,6 +1444,31 @@ $('grid').addEventListener('change', function(e){
 });
 $('grid').addEventListener('click', function(e){
   if(e.target.closest('[data-rt]')){ showAlert('转发微博不支持同步'); return; }
+  if(e.target.closest('[data-vrt]')){ showAlert('转发微博不支持存库'); return; }
+  var vdelBtn = e.target.closest('[data-vdel]');
+  if(vdelBtn){
+    showModal('删除这条微博的导出文件？\n\n将删除 vault 收件箱里的该文件，微博改回「未存库」（微博本身不删）。若文件已被库内 agent 移走，则只重置状态。', [
+      {text:'删除', cls:'danger', fn: function(){
+        post('/api/vault/delete', {ids: [vdelBtn.dataset.vdel]}).then(function(r){
+          if(!r.ok){ showAlert(r.error); return; }
+          toast(r.failed ? '删除失败 ' + r.failed + ' 条' : (r.missing ? '文件已不在收件箱，状态已重置' : '已删除导出文件'));
+          loadPosts();
+        });
+      }},
+      {text:'取消', cls:'', fn: null}
+    ]);
+    return;
+  }
+  var vexpBtn = e.target.closest('[data-vexport]');
+  if(vexpBtn){
+    vexpBtn.disabled = true;
+    post('/api/vault/export', {ids: [vexpBtn.dataset.vexport]}).then(function(r){
+      if(!r.ok){ showAlert(r.error); vexpBtn.disabled = false; return; }
+      toast(r.failed ? '存库失败：' + (r.error_sample || '') : '已导出到 vault 收件箱');
+      loadPosts();
+    });
+    return;
+  }
   var delBtn = e.target.closest('[data-del]');
   if(delBtn){
     showModal('删除这条微博的语雀文档？\n\n将从语雀删掉该文档，微博改回「待归档」（微博本身不删），之后可重新同步。文档删除不可恢复。', [
@@ -1500,6 +1566,36 @@ $('batchArchDel').onclick = function(){
           : '已删除 ' + r.deleted + ' 条语雀文档');
         clearSelection();
         loadPosts(); loadState();
+      });
+    }},
+    {text:'取消', cls:'', fn: null}
+  ]);
+};
+$('batchVault').onclick = function(){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  toast('正在导出到收件箱，请稍候…');
+  post('/api/vault/export', {ids: ids}).then(function(r){
+    if(!r.ok){ showAlert(r.error); return; }
+    toast(r.failed
+      ? '已存 ' + r.exported + ' 条，失败 ' + r.failed + ' 条：' + (r.error_sample || '')
+      : '已导出 ' + r.exported + ' 条到 vault 收件箱');
+    clearSelection();
+    loadPosts();
+  });
+};
+$('batchVaultDel').onclick = function(){
+  var ids = Array.from(currentSelected());
+  if(!ids.length){ toast('没有选中微博'); return; }
+  showModal('删除选中 ' + ids.length + ' 条微博在 vault 收件箱里的导出文件？\n\n只有导出过的会被删，微博改回「未存库」；微博本身不删。若文件已被库内 agent 移走，则只重置状态。', [
+    {text:'删除', cls:'danger', fn: function(){
+      post('/api/vault/delete', {ids: ids}).then(function(r){
+        if(!r.ok){ showAlert(r.error); return; }
+        toast(r.failed
+          ? '已删 ' + r.deleted + ' 条，失败 ' + r.failed + ' 条'
+          : (r.missing ? r.missing + ' 条文件已不在收件箱，状态已重置' : '已删除 ' + r.deleted + ' 条导出文件'));
+        clearSelection();
+        loadPosts();
       });
     }},
     {text:'取消', cls:'', fn: null}
@@ -1735,7 +1831,8 @@ function postsQuery(page, allIds){
         + ($('from').value ? '&from=' + $('from').value : '')
         + ($('to').value ? '&to=' + $('to').value : '')
         + ($('statusSel').value ? '&deleted=' + $('statusSel').value : '')
-        + ($('archSel').value ? '&arch=' + $('archSel').value : '');
+        + ($('archSel').value ? '&arch=' + $('archSel').value : '')
+        + ($('vaultSel').value ? '&vexp=' + $('vaultSel').value : '');
 }
 function loadPosts(){
   fetchJson(postsQuery(curPage, false)).then(renderPosts);
@@ -1914,6 +2011,7 @@ function renderPosts(r){
       +   '<span class="p-time">'+fmtTime(p.created_ts)+'</span>'
       +   syncBtnHtml(p)
       +   archDelHtml(p)
+      +   vaultBtnHtml(p)
       +   '<a class="p-src" href="https://m.weibo.cn/detail/'+esc(p.bid)+'" target="_blank">原文</a>'
       + '</div>'
       + delBadge + '<div class="p-text">'+richText(p.text)+rt+'</div>'
@@ -2210,6 +2308,7 @@ $('from').addEventListener('change', resetAndLoad);
 $('to').addEventListener('change', resetAndLoad);
 $('statusSel').addEventListener('change', resetAndLoad);
 $('archSel').addEventListener('change', resetAndLoad);
+$('vaultSel').addEventListener('change', resetAndLoad);
 $('clearF').onclick = function(){
   $('kw').value = '';
   $('yearSel').value = '';
@@ -2218,6 +2317,7 @@ $('clearF').onclick = function(){
   $('to').value = '';
   $('statusSel').value = '';
   $('archSel').value = '';
+  $('vaultSel').value = '';
   resetAndLoad();
   markFlt();
 };
@@ -2227,7 +2327,7 @@ function markFlt(){
   var f = $('filters');
   var has = !!(f.querySelector('#yearSel').value || f.querySelector('#from').value
     || f.querySelector('#to').value || f.querySelector('#statusSel').value
-    || f.querySelector('#archSel').value);
+    || f.querySelector('#archSel').value || f.querySelector('#vaultSel').value);
   var open = f.classList.contains('flt-open');
   $('fltToggle').classList.toggle('on', has || open);
 }
@@ -2393,10 +2493,25 @@ function openAdmin(){
   loadAdminStats();
   loadAdminList();
   loadAiConfig();
+  loadVaultConfig();
 }
 function closeAdmin(){
   $('adminView').classList.remove('show');
 }
+function loadVaultConfig(){
+  fetchJson('/api/admin/vault_config').then(function(r){
+    if(!r.ok) return;
+    $('vaultPathInput').value = r.vault_path || '';
+    $('vaultHint').textContent = r.available ? '✓ 目录有效' : (r.vault_path ? '⚠ 目录下没有 00-收件箱' : '未配置');
+  });
+}
+$('vaultSave').onclick = function(){
+  post('/api/admin/vault_config', {path: $('vaultPathInput').value}).then(function(r){
+    if(!r.ok){ toast(r.error); return; }
+    toast('已保存');
+    loadVaultConfig();
+  });
+};
 $('adminBtn').onclick = openAdmin;
 $('adminBack').onclick = closeAdmin;
 $('adminView').onclick = function(e){ if(e.target === $('adminView')) closeAdmin(); };

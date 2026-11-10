@@ -163,6 +163,8 @@ def init_db():
       arch_fail TEXT DEFAULT '',      -- 归档失败原因（同步失败/更新失败，空=无失败）
       arch_skip INTEGER DEFAULT 0,    -- 1=无需归档（用户手动标记）
       arch_state TEXT DEFAULT '',     -- 瞬态：syncing 同步中 / updating 更新中（空=无）
+      vault_exported INTEGER DEFAULT 0,  -- 1=已导出到 vault 收件箱（独立于语雀归档通道）
+      vault_path TEXT DEFAULT '',      -- 导出文件名（00-收件箱/ 下）
       PRIMARY KEY (user_id, id));
     CREATE TABLE IF NOT EXISTS pull_seen (
       user_id INTEGER NOT NULL, uid TEXT NOT NULL, id TEXT NOT NULL,
@@ -180,7 +182,9 @@ def init_db():
                                  ('posts', 'archived_at', "TEXT DEFAULT ''"),
                                  ('posts', 'arch_fail', "TEXT DEFAULT ''"),
                                  ('posts', 'arch_skip', 'INTEGER DEFAULT 0'),
-                                 ('posts', 'arch_state', "TEXT DEFAULT ''")):
+                                 ('posts', 'arch_state', "TEXT DEFAULT ''"),
+                                 ('posts', 'vault_exported', 'INTEGER DEFAULT 0'),
+                                 ('posts', 'vault_path', "TEXT DEFAULT ''")):
             cols = [r[1] for r in CONN.execute('PRAGMA table_info(%s)' % table).fetchall()]
             if col not in cols:
                 CONN.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
@@ -190,6 +194,14 @@ def init_db():
                 CONN.execute('UPDATE bloggers SET sort_order=? WHERE uid=?', (k, r[0]))
         CONN.commit()
         _migrate_multiuser(_seed_admin())
+    else:
+        # 多用户库补新列（vault 导出通道）：无条件幂等补列，缺了才加
+        for table, col, decl in (('posts', 'vault_exported', 'INTEGER DEFAULT 0'),
+                                 ('posts', 'vault_path', "TEXT DEFAULT ''")):
+            cols = [r[1] for r in CONN.execute('PRAGMA table_info(%s)' % table).fetchall()]
+            if col not in cols:
+                CONN.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
+        CONN.commit()
     CONN.executescript('''
     CREATE INDEX IF NOT EXISTS idx_posts_uid_ts ON posts(user_id, uid, created_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_posts_ts ON posts(user_id, created_ts DESC);
@@ -1079,6 +1091,121 @@ def refresh_worker():
             prog['done'] = prog['total']
 
 
+# ------------------------------------------------------------- vault 导出 ----
+VAULT_DIR_KEY = 'vault_path'       # kv 表全局设置：Obsidian vault 根目录（管理员配置）
+VAULT_INBOX = '00-收件箱'
+
+
+def vault_root():
+    """配置的 vault 根目录（未配置返回 None）"""
+    p = (kv_get(VAULT_DIR_KEY) or '').strip()
+    return p or None
+
+
+def vault_inbox_dir():
+    root = vault_root()
+    return os.path.join(root, VAULT_INBOX) if root else None
+
+
+def text_to_markdown(h):
+    """库内 clean_text 产出的 HTML（wlink 超链接 + wemoji 表情）→ Markdown 文本。
+    超链接转 [文字](url)；表情只留 [名] 文本（表情图片 URL 会过期，不引用）"""
+    if not h:
+        return ''
+
+    def repl_link(m):
+        href = _safe_href(m.group(1))
+        inner = _clean_link_inner(m.group(2)).replace('[', '［').replace(']', '］')
+        if not href:
+            return inner
+        if inner == href:
+            return '<%s>' % href
+        return '[%s](%s)' % (inner, href)
+
+    s = LINK_RE.sub(repl_link, h)
+    s = EMOJI_IMG_RE.sub(lambda m: (m.group(1) or m.group(4) or '').strip('[]'), s)
+    s = re.sub(r'<br\s*/?>', '\n', s)
+    s = re.sub(r'<img[^>]*>', '', s)      # 其余 img（图注占位等）直接丢
+    s = re.sub(r'</?[^>]+>', '', s)
+    s = html_mod.unescape(s)
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n{3,}', '\n\n', s).strip()
+    return s
+
+
+FILENAME_BAD = r'[\\/:*?"<>|\r\n\t]'
+
+
+def _vault_filename(row, body_md):
+    """导出文件名：YYYY-MM-DD_微博-<主题>.md；主题取正文前 40 字（库宪法约定），冲突加 -2 序号"""
+    dt = datetime.datetime.fromtimestamp(row['created_ts'] or 0)
+    topic = re.sub(FILENAME_BAD, '', text_to_markdown(body_md))[:40].strip(' .-——')
+    if not topic:
+        topic = row['id']
+    base = '%s_微博-%s' % (dt.strftime('%Y-%m-%d'), topic)
+    inbox = vault_inbox_dir()
+    name, i = base, 1
+    while os.path.exists(os.path.join(inbox, name + '.md')):
+        i += 1
+        name = '%s-%d' % (base, i)
+    return name + '.md'
+
+
+def _vault_doc(row):
+    """导出内容：stub frontmatter（缺 type/domain 留收件箱，由库内 agent 补全）+ 元信息 + 正文"""
+    text_md = text_to_markdown(row['text'])
+    dt = datetime.datetime.fromtimestamp(row['created_ts'] or 0)
+    m = json.loads(row['media_json'] or '{}')
+    n_imgs = len(m.get('imgs') or [])
+    head = [
+        '---',
+        'date: %s' % dt.strftime('%Y-%m-%d'),
+        'author: %s' % (row['nickname'] or row['uid']),
+        'source: 微博存档',
+        'weibo_id: %s' % row['id'],      # 幂等锚点（库宪法 §3：微博来源必填，双通道去重靠它）
+        'tags: [微博]',
+        '---',
+        '',
+        '**微博ID**：%s' % row['id'],
+        '**原文链接**：https://m.weibo.cn/status/%s' % row['id'],
+        '**发布时间**：%s' % dt.strftime('%Y-%m-%d %H:%M'),
+        '**互动**：转发 %d · 评论 %d · 赞 %d%s' % (
+            row['reposts'] or 0, row['comments'] or 0, row['atts'] or 0,
+            (' · 图片 %d 张' % n_imgs) if n_imgs else ''),
+        '',
+        '',
+    ]
+    return text_md, '\n'.join(head) + text_md + '\n'
+
+
+def vault_export_posts(user_id, ids):
+    """勾选导出到 vault 收件箱（同步执行，纯本地写文件）：跳过转发；已导出的重导=覆盖更新。
+    返回 (成功数, 失败列表[(id, 原因)])"""
+    ph = ','.join('?' * len(ids))
+    rows = db('SELECT p.*, b.nickname FROM posts p '
+              'LEFT JOIN bloggers b ON b.user_id=p.user_id AND b.uid=p.uid '
+              'WHERE p.user_id=? AND p.id IN (%s)' % ph, (user_id,) + tuple(ids)).fetchall()
+    ok, fails = 0, []
+    for r in rows:
+        try:
+            if r['retweeted_json']:
+                fails.append((r['id'], '转发微博不支持导出'))
+                continue
+            text_md, doc = _vault_doc(r)
+            name = r['vault_path'] or _vault_filename(r, r['text'])
+            path = os.path.join(vault_inbox_dir(), name)
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(doc)
+            os.replace(tmp, path)
+            db('UPDATE posts SET vault_exported=1, vault_path=? WHERE user_id=? AND id=?',
+               (name, user_id, r['id']))
+            ok += 1
+        except Exception as e:  # noqa: BLE001 —— 单条失败不阻断其余
+            fails.append((r['id'], str(e)))
+    return ok, fails
+
+
 # ----------------------------------------------------------- 语雀归档 ----
 SYNC = {}      # user_id -> 进度与结果消息字典（供前端展示），按用户隔离
 SYNC_QUEUE = deque()               # 元素 (user_id, todo)
@@ -1880,6 +2007,63 @@ def api_yuque_mark(user, body):
     return {'ok': True, 'updated': cur.rowcount}
 
 
+def api_vault_export(user, body):
+    """导出勾选微博正文到 vault 收件箱（同步执行）；不要求归档权限，不碰语雀状态"""
+    user_id = user['id']
+    if not vault_root():
+        return {'ok': False, 'error': '还没有配置 vault 目录，请联系管理员在管理后台设置里填写'}
+    if not os.path.isdir(vault_inbox_dir()):
+        return {'ok': False, 'error': 'vault 目录不对：%s 下没有 %s' % (vault_root(), VAULT_INBOX)}
+    ids = _clean_ids(body)
+    if not ids:
+        return {'ok': False, 'error': '没有选中要存库的微博'}
+    ok, fails = vault_export_posts(user_id, ids)
+    res = {'ok': True, 'exported': ok, 'failed': len(fails)}
+    if fails:
+        res['error_sample'] = '%s：%s' % (fails[0][0], fails[0][1])
+    return res
+
+
+def api_vault_delete(user, body):
+    """删除导出：删收件箱文件，微博回到「未存库」；文件已不在（被库内 agent 移走/手动删）也放行重置状态"""
+    user_id = user['id']
+    ids = _clean_ids(body)
+    if not ids:
+        return {'ok': False, 'error': '没有选中要删导出的微博'}
+    ph = ','.join('?' * len(ids))
+    rows = db('SELECT id, vault_path FROM posts WHERE user_id=? AND id IN (%s)' % ph,
+              (user_id,) + tuple(ids)).fetchall()
+    todo = [r for r in rows if r['vault_path']]
+    if not todo:
+        return {'ok': False, 'error': '选中的微博没有导出过（或已删除导出）'}
+    ok = miss = failed = 0
+    for r in todo:
+        try:
+            path = os.path.join(vault_inbox_dir(), r['vault_path'])
+            if os.path.exists(path):
+                os.remove(path)
+                ok += 1
+            else:
+                miss += 1            # 文件已被库内 agent 移走或手动删除：直接重置状态
+            db('UPDATE posts SET vault_exported=0, vault_path=\'\' WHERE user_id=? AND id=?',
+               (user_id, r['id']))
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+    return {'ok': True, 'deleted': ok, 'missing': miss, 'failed': failed}
+
+
+def api_admin_vault_config(user, body=None):
+    """管理后台：读取 vault 目录设置（GET）/保存（POST，path 空=清除）"""
+    if body is None:
+        return {'ok': True, 'vault_path': vault_root() or '',
+                'available': bool(vault_root() and os.path.isdir(vault_inbox_dir()))}
+    p = str(body.get('path') or '').strip()
+    if p and not os.path.isdir(os.path.join(p, VAULT_INBOX)):
+        return {'ok': False, 'error': '这个目录下找不到 %s，请确认填的是 vault 根目录' % VAULT_INBOX}
+    kv_set(VAULT_DIR_KEY, p)
+    return {'ok': True}
+
+
 YUQUE_API = 'https://www.yuque.com/api/v2'
 
 
@@ -2099,6 +2283,11 @@ def api_posts(user, query):
         where.append("p.archived=1 AND p.arch_fail<>''")
     elif arch == 'skip':
         where.append('p.arch_skip=1')
+    vexp = query.get('vexp', [''])[0].strip()
+    if vexp == '1':
+        where.append('p.vault_exported=1')
+    elif vexp == '0':
+        where.append('p.vault_exported=0')
     w = ('WHERE ' + ' AND '.join(where)) if where else ''
     wid = query.get('id', [''])[0].strip()
     if wid:                              # 微博ID直达：忽略其他筛选，精确匹配状态id或bid
@@ -2120,6 +2309,7 @@ def api_posts(user, query):
             'deleted': r['deleted'],
             'archived': r['archived'], 'yuque_doc_url': r['yuque_doc_url'],
             'arch_fail': r['arch_fail'], 'arch_skip': r['arch_skip'], 'arch_state': r['arch_state'],
+            'vault_exported': r['vault_exported'], 'vault_path': r['vault_path'],
         })
     years = [r[0] for r in db("SELECT DISTINCT strftime('%Y', created_ts, 'unixepoch') y "
                               'FROM posts WHERE user_id=? ORDER BY y DESC', (user_id,)).fetchall()]
@@ -2613,6 +2803,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/ai_config':
                 if self._admin(user):
                     self._json(api_admin_ai_config(user))
+            elif path == '/api/admin/vault_config':
+                if self._admin(user):
+                    self._json(api_admin_vault_config(user))
             elif path == '/api/admin/db_backup':
                 if self._admin(user):
                     ticket = urllib.parse.parse_qs(qs).get('ticket', [''])[0]
@@ -2689,6 +2882,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(api_yuque_sync(user, body))
             elif path == '/api/yuque/mark':
                 self._json(api_yuque_mark(user, body))
+            elif path == '/api/vault/export':
+                self._json(api_vault_export(user, body))
+            elif path == '/api/vault/delete':
+                self._json(api_vault_delete(user, body))
             elif path == '/api/yuque/delete':
                 self._json(api_yuque_delete(user, body))
             elif path == '/api/yuque/cancel':
@@ -2712,6 +2909,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/admin/ai_config':
                 if self._admin(user):
                     self._json(api_admin_ai_config_save(user, body))
+            elif path == '/api/admin/vault_config':
+                if self._admin(user):
+                    self._json(api_admin_vault_config(user, body))
             elif path == '/api/admin/db_backup_verify':
                 if self._admin(user):
                     self._json(api_admin_backup_verify(user, body))
