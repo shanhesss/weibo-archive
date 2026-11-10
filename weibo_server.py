@@ -1101,12 +1101,14 @@ def clear_arch_state(user_id=None):
 
 
 def validate_yuque_dir(url):
-    """校验语雀目录链接格式，返回 (账号, 知识库slug, 目录路径) 或 None"""
+    """校验语雀目录链接格式，返回 (账号, 知识库slug, 目录节点slug) 或 None。
+    目录可以是文档，其链接可能带父级路径，取最后一段即节点 slug"""
     url = (url or '').strip()
     m = YUQUE_URL_RE.match(url)
     if not m:
         return None
-    return m.group(1), m.group(2), m.group(3).strip('/')
+    parts = [p for p in m.group(3).split('/') if p]
+    return m.group(1), m.group(2), (parts[-1] if parts else '')
 
 
 def ai_pool():
@@ -1337,16 +1339,18 @@ def run_archive(user_id, ids, token, cfgs):
             is_update = bool(row['archived'])
             url = row['yuque_doc_url']
             doc = None
+            doc_ns = ns
             if is_update and url:
                 parsed = parse_yuque_doc_url(url)
                 doc = _yuque_find_doc(parsed[0], parsed[1], token) if parsed else None
                 if doc:
-                    yuque_update_doc(parsed[0], doc['id'], title, body_md, token)
+                    doc_ns = parsed[0]
+                    yuque_update_doc(doc_ns, doc['id'], title, body_md, token)
             if not doc:                      # 新建；更新时旧文档已不存在也落到这里重建
                 doc = yuque_create_doc(ns, title, body_md, token)
                 url = 'https://www.yuque.com/%s/%s' % (ns, doc['slug'])
-                if folder:
-                    yuque_mount_doc(ns, folder, doc['slug'], token)   # 挂不上不拦截归档
+            if folder and doc_ns == ns:      # 新建/更新都补挂一次：老文档重新同步即可补上目录
+                yuque_mount_doc(ns, folder, doc['id'], doc['slug'], token)   # 挂不上不拦截归档
             db('UPDATE posts SET archived=1, yuque_doc_url=?, archived_at=?, '
                "arch_fail='', arch_state='' WHERE user_id=? AND id=?",
                (url, now_str(), user_id, pid))
@@ -1953,29 +1957,48 @@ def yuque_update_doc(namespace, doc_id, title, body_md, token):
                {'title': title, 'public': 0, 'format': 'markdown', 'body': body_md})
 
 
-def yuque_mount_doc(namespace, folder_slug, doc_slug, token):
-    """把新文档挂到目录节点下。挂载是锦上添花：节点找不到或接口失败都不拦截归档，返回是否挂上"""
+def yuque_mount_doc(namespace, folder_slug, doc_id, doc_slug, token):
+    """把文档挂到目录节点下（语雀建文档不会自动进目录，需显式创建节点）。
+    已挂在目标下则跳过；已在目录树别处则移动；不在目录树则按创建场景新建节点。
+    挂载是锦上添花：节点找不到或接口失败都不拦截归档，返回是否挂上"""
     try:
         data, st = _yuque_api('/repos/%s/toc' % namespace, token)
         if st != 200:
             return False
         nodes = (data or {}).get('data') or []
-        target = next((n for n in nodes if n.get('slug') == folder_slug), None)
-        docnode = next((n for n in nodes if n.get('slug') == doc_slug), None)
-        if not target or not docnode:
+        target = next((n for n in nodes
+                       if n.get('type') == 'DOC' and n.get('slug') == folder_slug), None)
+        if not target:
             return False
-        _yuque_api('/repos/%s/toc' % namespace, token, 'PUT',
-                   {'action': 'appendNode', 'action_mode': 'child',
-                    'target_uuid': target.get('uuid'), 'node_uuid': docnode.get('uuid')})
-        return True
-    except ApiError:
+        node = next((n for n in nodes
+                     if n.get('type') == 'DOC' and n.get('slug') == doc_slug), None)
+        if node:
+            if node.get('parent_uuid') == target.get('uuid'):
+                return True
+            _, st = _yuque_api('/repos/%s/toc' % namespace, token, 'PUT',
+                               {'action': 'appendNode', 'action_mode': 'child',
+                                'target_uuid': target.get('uuid'), 'node_uuid': node.get('uuid')})
+            return st == 200
+        _, st = _yuque_api('/repos/%s/toc' % namespace, token, 'PUT',
+                           {'action': 'appendNode', 'action_mode': 'child',
+                            'target_uuid': target.get('uuid'),
+                            'type': 'DOC', 'doc_ids': [doc_id]})
+        return st == 200
+    except Exception:  # noqa: BLE001 —— 含响应形状意外（如 toc 不是列表）：文档已建好，不该因此判归档失败
         return False
 
 
 def parse_yuque_doc_url(url):
-    """语雀文档链接 → (账号/知识库, 文档slug)；认不出返回 None"""
-    m = re.match(r'^https://www\.yuque\.com/([^/?#\s]+)/([^/?#\s]+)/([^/?#\s]+)', (url or '').strip())
-    return ('%s/%s' % (m.group(1), m.group(2)), m.group(3)) if m else None
+    """语雀文档链接 → (账号/知识库, 文档slug)；认不出返回 None。
+    嵌套文档的链接带父级路径，文档 slug 取最后一段"""
+    u = re.split(r'[?#]', (url or '').strip())[0].rstrip('/')
+    m = re.match(r'^https://www\.yuque\.com/([^/]+)/([^/]+)/(.+)$', u)
+    if not m:
+        return None
+    parts = [p for p in m.group(3).split('/') if p]
+    if not parts:
+        return None
+    return '%s/%s' % (m.group(1), m.group(2)), parts[-1]
 
 
 def yuque_delete_doc(url, token):
